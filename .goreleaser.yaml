@@ -1,0 +1,165 @@
+# nollama's release config. Cut a release with ./release.sh vX.Y.Z (see the script).
+version: 2
+
+project_name: nollama
+
+dist: .builds
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: build_noncgo
+    main: ./cmd/nollama
+    binary: nollama
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+      - arm
+      - s390x
+      - ppc64le
+    goarm:
+      - 7
+    ignore:
+      - goos: windows
+        goarch: arm
+      - goos: windows
+        goarch: s390x
+      - goos: windows
+        goarch: ppc64le
+      - goos: darwin
+        goarch: arm
+      - goos: darwin
+        goarch: s390x
+      - goos: darwin
+        goarch: ppc64le
+
+release:
+  draft: true
+  # a tag with a prerelease part (v0.0.1-alpha.1) is published as a GitHub prerelease, so it's never "Latest"
+  prerelease: auto
+  name_template: 'nollama {{ .Tag }}'
+  header: |
+    ## Install or upgrade
+
+    **macOS or Linux, with Homebrew:**
+
+    ```bash
+    brew tap benallfree/nollama https://github.com/benallfree/nollama
+    brew install nollama
+    ```
+
+    **Windows, with [Scoop](https://scoop.sh):**
+
+    ```powershell
+    scoop bucket add nollama https://github.com/benallfree/nollama
+    scoop install nollama
+    ```
+
+    **macOS or Linux, without Homebrew:**
+
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/benallfree/nollama/main/install.sh | sh
+    ```
+
+    On Linux it installs the `.deb`, `.rpm` or `.apk` package below for your system, which adds a systemd service; on macOS it puts `nollama` in `/usr/local/bin`.
+
+    **Upgrade:** `brew upgrade nollama`, `scoop update nollama`, or run the install script again.
+
+    ## What's in this release
+
+# The Homebrew formula and the Scoop manifest live in this repo (Formula/, bucket/), updated on every release,
+# prereleases included. brews is deprecated in favor of homebrew_casks, but casks are macOS-only and quarantine
+# unsigned binaries; the formula works on macOS and Linux.
+brews:
+  - name: nollama
+    ids: [archive_noncgo]
+    repository:
+      owner: benallfree
+      name: nollama
+      branch: main
+    directory: Formula
+    homepage: https://github.com/benallfree/nollama
+    description: An embeddable, Ollama-compatible LLM engine and server, in Go
+    license: MIT
+    commit_author:
+      name: Ben Allfree
+      email: noreply@github.com
+    commit_msg_template: 'Formula: nollama {{ .Tag }}'
+    install: |
+      bin.install "nollama"
+    test: |
+      system "#{bin}/nollama", "version"
+
+scoops:
+  - name: nollama
+    ids: [archive_noncgo]
+    repository:
+      owner: benallfree
+      name: nollama
+      branch: main
+    directory: bucket
+    homepage: https://github.com/benallfree/nollama
+    description: An embeddable, Ollama-compatible LLM engine and server, in Go
+    license: MIT
+    commit_author:
+      name: Ben Allfree
+      email: noreply@github.com
+    commit_msg_template: 'bucket: nollama {{ .Tag }}'
+
+archives:
+  - id: archive_noncgo
+    ids: [build_noncgo]
+    formats: [zip]
+    files:
+      - LICENSE.md
+      - README.md
+      - CHANGELOG.md
+
+# Linux packages: the binary in /usr/bin and a systemd unit (deb, rpm) that runs `nollama serve` as the nollama user,
+# with models in /var/lib/nollama/models and settings in /etc/nollama/nollama.env (kept on upgrade). Named like the
+# zips (nollama_<version>_linux_<arch>.deb), which is what install.sh downloads.
+nfpms:
+  - id: packages
+    ids: [build_noncgo]
+    package_name: nollama
+    file_name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ with .Arm }}v{{ . }}{{ end }}'
+    formats: [deb, rpm, apk]
+    vendor: Ben Allfree
+    maintainer: Ben Allfree <noreply@github.com>
+    homepage: https://github.com/benallfree/nollama
+    description: An embeddable, Ollama-compatible LLM engine and server, in Go
+    license: MIT
+    bindir: /usr/bin
+    contents:
+      - src: packaging/nollama.service
+        dst: /usr/lib/systemd/system/nollama.service
+        packager: deb
+      - src: packaging/nollama.service
+        dst: /usr/lib/systemd/system/nollama.service
+        packager: rpm
+      - src: packaging/nollama.env
+        dst: /etc/nollama/nollama.env
+        type: config|noreplace
+    scripts:
+      postinstall: packaging/postinstall.sh
+      preremove: packaging/preremove.sh
+      postremove: packaging/postremove.sh
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  version_template: '{{ incpatch .Version }}-next'
+
+# GitHub renders every newline in release notes as a line break: never hard-wrap the header above or the notes.
+# release.sh passes the version's section of CHANGELOG.md as --release-notes; the header above is prepended.

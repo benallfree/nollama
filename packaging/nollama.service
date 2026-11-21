@@ -1,0 +1,18 @@
+[Unit]
+Description=nollama
+Documentation=https://github.com/benallfree/nollama
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=nollama
+Group=nollama
+WorkingDirectory=/var/lib/nollama
+# NOLLAMA_HOST, NOLLAMA_MODELS and SERVE_ARGS; see the file
+EnvironmentFile=-/etc/nollama/nollama.env
+ExecStart=/usr/bin/nollama serve $SERVE_ARGS
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
