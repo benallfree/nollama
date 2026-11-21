@@ -404,11 +404,19 @@ func TestClassify(t *testing.T) {
 	}
 }
 
-// TestDraft serves a model with a draft beside it: GGUF=<qwen3-1.7b.gguf> DRAFT_GGUF=<qwen3-0.6b.gguf> go test ./server
+// TestDraft serves a model with a draft beside it: two tiny random-weight models, or real ones with
+// GGUF=<qwen3-1.7b.gguf> DRAFT_GGUF=<qwen3-0.6b.gguf> go test ./server
 func TestDraft(t *testing.T) {
 	p, dp := os.Getenv("GGUF"), os.Getenv("DRAFT_GGUF")
 	if p == "" || dp == "" {
-		t.Skip("GGUF and DRAFT_GGUF not set")
+		dir := t.TempDir()
+		p, dp = filepath.Join(dir, "target.gguf"), filepath.Join(dir, "draft.gguf")
+		if err := tinymodel.Write(p, tinymodel.Config{Seed: 1, Dim: 128, Layers: 3}); err != nil {
+			t.Fatal(err)
+		}
+		if err := tinymodel.Write(dp, tinymodel.Config{Seed: 2}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	var mu sync.Mutex
 	var logs []string
@@ -435,7 +443,9 @@ func TestDraft(t *testing.T) {
 		t.Errorf("with the draft %q, without %q", with, without)
 	}
 	var v struct{ Colors []string }
-	if err := json.Unmarshal([]byte(with), &v); err != nil || len(v.Colors) == 0 {
+	if os.Getenv("GGUF") == "" {
+		// random weights wander inside a string until num_predict runs out; the same answer either way is the check
+	} else if err := json.Unmarshal([]byte(with), &v); err != nil || len(v.Colors) == 0 {
 		t.Errorf("structured answer %q: %v", with, err)
 	}
 	mu.Lock()
