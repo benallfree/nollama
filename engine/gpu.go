@@ -60,6 +60,7 @@ type gpuBatch interface {
 	rope(x, cs, sn gpuRef, tokens, heads, headDim int)
 	swiglu(gate, up, out gpuRef, n int) // out = silu(gate) * up
 	add(x, y gpuRef, n int)             // x += y
+	copy(dst, src gpuRef, n int)        // n floats
 	// storeKV writes n tokens' keys and values (each [n][kvd]) into a layer's f32 cache at positions pos..
 	storeKV(k, v, kc, vc gpuRef, n, pos, kvd, ctxP int)
 	attention(a gpuAttention)

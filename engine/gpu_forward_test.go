@@ -180,3 +180,65 @@ func TestGPUScoreEmbed(t *testing.T) {
 	}
 	maxRelDiff(t, "Embed hidden state vs float reference", eg.hidden, ef.hidden, 1e-3)
 }
+
+// TestGPUForwardDiscrete runs the discrete-GPU KV path (device cache, keys and values copied back to kc/vc,
+// re-upload when a call doesn't continue the last) on this GPU, in lockstep with the unified path: prompt in two
+// batches, decode, then a rewind into the prompt (which forces the upload). Logits and caches must match.
+func TestGPUForwardDiscrete(t *testing.T) {
+	m, err := Load(testGGUF(t), LoadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	gu, err := newGPUModel(m)
+	if err != nil {
+		t.Skip(err)
+	}
+	defer gu.close()
+	gpuForceDiscrete = true
+	gd, err := newGPUModel(m)
+	gpuForceDiscrete = false
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gd.close()
+	if gd.shared {
+		t.Fatal("not in discrete mode")
+	}
+	ids := m.Tokenize(ChatPrompt([]Message{{Role: "user", Content: "Write a haiku about rain on a tin roof."}}))
+	su, sd := m.newState(256, 64), m.newState(256, 64)
+	step := func(name string, toks []int, pos int) {
+		t.Helper()
+		if err := gu.forward(su, toks, pos); err != nil {
+			t.Fatal(err)
+		}
+		if err := gd.forward(sd, toks, pos); err != nil {
+			t.Fatal(err)
+		}
+		if d := logitDiff(su.logits, sd.logits); d > 1e-6 {
+			t.Errorf("%s: unified vs discrete logits differ by %.2e", name, d)
+		}
+	}
+	split := len(ids) / 2
+	step("prompt 1", ids[:split], 0)
+	step("prompt 2", ids[split:], split)
+	pos := len(ids)
+	for i := 0; i < 4; i++ {
+		step("decode", []int{argmax(su.logits)}, pos)
+		pos++
+	}
+	// Rewind: re-read the last 3 prompt tokens. The discrete state must upload kc/vc (its device cache
+	// holds the decoded tokens too, and the call doesn't continue the last one).
+	step("rewind", ids[len(ids)-3:], len(ids)-3)
+	step("decode after rewind", []int{argmax(su.logits)}, len(ids))
+	var kd float64
+	for li := range su.kc {
+		for i := range su.kc[li] {
+			kd = max(kd, math.Abs(float64(su.kc[li][i]-sd.kc[li][i])), math.Abs(float64(su.vc[li][i]-sd.vc[li][i])))
+		}
+	}
+	t.Logf("caches, unified vs discrete: max diff %.1e", kd)
+	if kd > 1e-4 {
+		t.Errorf("caches differ by %.2e", kd)
+	}
+}

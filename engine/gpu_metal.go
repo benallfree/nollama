@@ -14,7 +14,7 @@ import (
 var metalSource string
 
 // metalKernels are the kernels metalSource defines.
-var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "attention_f32", "kv_store_f32"}
+var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "attention_f32", "kv_store_f32", "copy_f32"}
 
 // metalBackend is the gpuBackend for Apple GPUs (unified memory only).
 type metalBackend struct {
@@ -190,6 +190,8 @@ func (b *metalBatch) swiglu(gate, up, out gpuRef, n int) {
 }
 
 func (b *metalBatch) add(x, y gpuRef, n int) { b.elementwise("add_f32", n, marg(x), marg(y)) }
+
+func (b *metalBatch) copy(dst, src gpuRef, n int) { b.elementwise("copy_f32", n, marg(dst), marg(src)) }
 
 func (b *metalBatch) attention(a gpuAttention) {
 	if a.kvType != typeF32 {

@@ -403,3 +403,13 @@ kernel void kv_store_f32(device const float *k [[buffer(0)]],
 	kT[(ulong)i * a.ctxP + a.pos + t] = k[(ulong)t * a.kvd + i];
 	vc[((ulong)a.pos + t) * a.kvd + i] = v[(ulong)t * a.kvd + i];
 }
+
+// copy: dst[i] = src[i].
+kernel void copy_f32(device float *dst [[buffer(0)]],
+                     device const float *src [[buffer(1)]],
+                     constant uint &n [[buffer(2)]],
+                     uint i [[thread_position_in_grid]]) {
+	if (i < n) {
+		dst[i] = src[i];
+	}
+}

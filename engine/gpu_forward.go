@@ -12,8 +12,12 @@ import (
 // gpuModel runs a Model's forward pass on a GPU backend: the same steps as forward, recorded into one batch per
 // call, with the CPU doing only the embedding lookup, the RoPE tables and reading back the logits.
 //
-// First cut: unified memory only (the KV cache is shared with the CPU, so the prompt cache and threads work
-// unchanged), the f32 KV cache and weights the backend supports. Compact caches return errGPUUnsupported, and the
+// The KV cache stays in the state's kc/vc slices as the CPU's source of truth, so the prompt cache and threads work
+// unchanged. On unified memory those slices point at the GPU's buffers. On a discrete GPU the cache lives on the
+// device too: each call copies its new keys and values back into kc/vc (one small read per layer), and a call that
+// doesn't continue where the state's last one ended (a restored prefix, a rewind) uploads kc/vc first.
+//
+// First cut: the f32 KV cache and weights the backend supports. Compact caches return errGPUUnsupported, and the
 // caller uses forward.
 type gpuModel struct {
 	m        *Model
@@ -24,6 +28,7 @@ type gpuModel struct {
 	qNorm    []gpuRef
 	kNorm    []gpuRef
 	outNorm  gpuRef
+	shared   bool // the KV cache is the GPU's memory (unified memory)
 
 	mu     sync.Mutex
 	states map[*state]*gpuState
@@ -44,9 +49,6 @@ func newGPUModel(m *Model) (*gpuModel, error) {
 		b.close()
 		return nil, err
 	}
-	if !b.unified() {
-		return fail(fmt.Errorf("engine: %s: discrete GPUs aren't supported yet", b.name()))
-	}
 	ws := []*weight{m.out}
 	for _, l := range m.layers {
 		ws = append(ws, l.wq, l.wk, l.wv, l.wo, l.wgate, l.wup, l.wdown)
@@ -58,7 +60,7 @@ func newGPUModel(m *Model) (*gpuModel, error) {
 	}
 
 	// All norm weights in one buffer.
-	g := &gpuModel{m: m, b: b, states: map[*state]*gpuState{}}
+	g := &gpuModel{m: m, b: b, states: map[*state]*gpuState{}, shared: b.unified() && !gpuForceDiscrete}
 	var all []float32
 	var offs []int
 	add := func(v []float32) {
@@ -91,7 +93,10 @@ func newGPUModel(m *Model) (*gpuModel, error) {
 	return g, nil
 }
 
-// gpuState is a state's buffers on the GPU. Its KV cache buffers back the state's kc/vc slices.
+// gpuForceDiscrete makes gpuModel treat a unified-memory GPU as discrete (tests run the discrete path on a Mac).
+var gpuForceDiscrete = false
+
+// gpuState is a state's buffers on the GPU. On unified memory its KV cache buffers back the state's kc/vc slices.
 type gpuState struct {
 	bufs                       []gpuBuf
 	x, an, q, k, v, att, tmp   gpuRef
@@ -99,7 +104,9 @@ type gpuState struct {
 	scratch, logits            gpuRef
 	allLogits                  gpuRef // maxN*vocab, allocated on the first Score
 	kc, vc                     []gpuRef
+	kStage, vStage             gpuRef // discrete GPUs: each layer's new keys and values, [layers][maxN][kvd]
 	maxN, ctxP, attnChunk      int
+	lastEnd                    int // discrete GPUs: where the last call ended (-1: the device cache is stale)
 }
 
 // attnScratchFloats bounds the attention scores' scratch; longer batches run attention in chunks of tokens.
@@ -113,7 +120,7 @@ func (g *gpuModel) stateFor(s *state) (*gpuState, error) {
 	}
 	hp := g.m.hp
 	qd, kvd := hp.heads*hp.headDim, hp.kvHeads*hp.headDim
-	gs := &gpuState{maxN: s.maxN, ctxP: s.ctxP}
+	gs := &gpuState{maxN: s.maxN, ctxP: s.ctxP, lastEnd: -1}
 	gs.attnChunk = max(1, min(s.maxN, attnScratchFloats/(hp.heads*s.ctxP)))
 	alloc := func(floats int) (gpuRef, error) {
 		b, err := g.b.alloc(4 * max(floats, 1))
@@ -140,7 +147,16 @@ func (g *gpuModel) stateFor(s *state) (*gpuState, error) {
 		}
 		*a.r = r
 	}
-	// The KV cache moves into GPU memory; the state's slices then point at it.
+	if !g.shared {
+		for _, r := range []*gpuRef{&gs.kStage, &gs.vStage} {
+			var err error
+			if *r, err = alloc(len(g.m.layers) * n * kvd); err != nil {
+				gs.release()
+				return nil, err
+			}
+		}
+	}
+	// The KV cache in GPU memory; on unified memory the state's slices then point at it.
 	for li := range g.m.layers {
 		for _, c := range []struct {
 			refs *[]gpuRef
@@ -151,10 +167,12 @@ func (g *gpuModel) stateFor(s *state) (*gpuState, error) {
 				gs.release()
 				return nil, err
 			}
-			mem := g.b.mapped(r.buf)
-			f := unsafe.Slice((*float32)(unsafe.Pointer(unsafe.SliceData(mem))), len(c.host[li]))
-			copy(f, c.host[li])
-			c.host[li] = f
+			if g.shared {
+				mem := g.b.mapped(r.buf)
+				f := unsafe.Slice((*float32)(unsafe.Pointer(unsafe.SliceData(mem))), len(c.host[li]))
+				copy(f, c.host[li])
+				c.host[li] = f
+			}
 			*c.refs = append(*c.refs, r)
 		}
 	}
@@ -175,6 +193,9 @@ func (g *gpuModel) close() {
 	defer g.mu.Unlock()
 	for s, gs := range g.states {
 		for li := range s.kc {
+			if !g.shared {
+				break
+			}
 			s.kc[li] = append([]float32(nil), s.kc[li]...)
 			s.vc[li] = append([]float32(nil), s.vc[li]...)
 		}
@@ -234,6 +255,12 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 	b.write(gs.cs, floatBytes(cs))
 	b.write(gs.sn, floatBytes(sn))
 	b.write(gs.mask, mask)
+	if !g.shared && pos != gs.lastEnd { // the device cache may not match kc/vc: upload them
+		for li := range m.layers {
+			b.write(gs.kc[li], floatBytes(s.kc[li]))
+			b.write(gs.vc[li], floatBytes(s.vc[li]))
+		}
+	}
 
 	bt := b.batch()
 	for li := range m.layers {
@@ -247,6 +274,10 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 		bt.rope(gs.q, gs.cs, gs.sn, n, hp.heads, hd)
 		bt.rope(gs.k, gs.cs, gs.sn, n, hp.kvHeads, hd)
 		bt.storeKV(gs.k, gs.v, gs.kc[li], gs.vc[li], n, pos, kvd, gs.ctxP)
+		if !g.shared {
+			bt.copy(gs.kStage.at(4*li*gs.maxN*kvd), gs.k, n*kvd)
+			bt.copy(gs.vStage.at(4*li*gs.maxN*kvd), gs.v, n*kvd)
+		}
 		for t0 := 0; t0 < n; t0 += gs.attnChunk {
 			c := min(gs.attnChunk, n-t0)
 			bt.attention(gpuAttention{
@@ -265,20 +296,36 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 		bt.add(gs.x, gs.tmp, n*dim)
 	}
 	last := gs.x.at(4 * (n - 1) * dim)
+	defer func() {
+		if !g.shared { // bring kc/vc up to date with the keys and values this call wrote
+			k, v := make([]float32, n*kvd), make([]float32, n*kvd)
+			for li := range m.layers {
+				g.readFloats(gs.kStage.at(4*li*gs.maxN*kvd), k)
+				g.readFloats(gs.vStage.at(4*li*gs.maxN*kvd), v)
+				for t := 0; t < n; t++ {
+					for i := 0; i < kvd; i++ {
+						s.kc[li][i*gs.ctxP+pos+t] = k[t*kvd+i]
+					}
+				}
+				copy(s.vc[li][pos*kvd:(pos+n)*kvd], v)
+			}
+			gs.lastEnd = pos + n
+		}
+	}()
 	switch {
 	case s.hidden != nil: // Embed: the last token's normed hidden state, no LM head
 		bt.rmsnorm(last, g.outNorm, gs.an, 1, dim, hp.eps)
 		if err := bt.submit(); err != nil {
 			return err
 		}
-		readFloats(b, gs.an, s.hidden[:dim])
+		g.readFloats(gs.an, s.hidden[:dim])
 	case s.allLogits != nil: // Score: every position's logits
 		bt.rmsnorm(gs.x, g.outNorm, gs.an, n, dim, hp.eps)
 		bt.matmul(m.out, gs.an, gs.allLogits, n)
 		if err := bt.submit(); err != nil {
 			return err
 		}
-		readFloats(b, gs.allLogits, s.allLogits[:n*hp.vocab])
+		g.readFloats(gs.allLogits, s.allLogits[:n*hp.vocab])
 		copy(s.logits, s.allLogits[(n-1)*hp.vocab:n*hp.vocab])
 	default:
 		bt.rmsnorm(last, g.outNorm, gs.an, 1, dim, hp.eps)
@@ -286,14 +333,15 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 		if err := bt.submit(); err != nil {
 			return err
 		}
-		readFloats(b, gs.logits, s.logits)
+		g.readFloats(gs.logits, s.logits)
 	}
 	return nil
 }
 
 // readFloats copies len(dst) floats from the device.
-func readFloats(b gpuBackend, src gpuRef, dst []float32) {
-	if b.unified() { // straight from the shared memory
+func (g *gpuModel) readFloats(src gpuRef, dst []float32) {
+	b := g.b
+	if g.shared { // straight from the shared memory
 		mem := b.mapped(src.buf)[src.off:]
 		copy(dst, unsafe.Slice((*float32)(unsafe.Pointer(unsafe.SliceData(mem))), len(dst)))
 		return
