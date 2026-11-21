@@ -36,11 +36,15 @@ api() { # METHOD PATH [JSON]
 	[ -n "${VULTR_API_KEY:-}" ] || die "no API key: set VULTR_API_KEY or add Keychain item vultr-api-key"
 	if [ $# -ge 3 ]; then
 		printf 'header = "Authorization: Bearer %s"\n' "$VULTR_API_KEY" |
-			curl -sS -m 30 -K - -X "$1" -H 'Content-Type: application/json' --data-binary "$3" "https://api.vultr.com/v2$2"
+			curl -sS -m "${API_TIMEOUT:-30}" -K - -X "$1" -H 'Content-Type: application/json' --data-binary "$3" "https://api.vultr.com/v2$2"
 	else
 		printf 'header = "Authorization: Bearer %s"\n' "$VULTR_API_KEY" |
-			curl -sS -m 30 -K - -X "$1" "https://api.vultr.com/v2$2"
+			curl -sS -m "${API_TIMEOUT:-30}" -K - -X "$1" "https://api.vultr.com/v2$2"
 	fi
+}
+
+ids_by_label() { # LABEL -> instance ids with that label, one per line
+	api GET '/instances?per_page=500' | json '"\n".join(i["id"] for i in d["instances"] if i["label"]=="'"$1"'")'
 }
 json() { python3 -I -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
 
@@ -54,18 +58,27 @@ cmd_create() {
 	plan=$1 region=${2:-ewr} ollama=0
 	[ "${3:-}" = --ollama ] && ollama=1
 	case ",${VULTR_BENCH_APPROVED:-}," in *",$plan,"*) ;; *) die "plan $plan is not in VULTR_BENCH_APPROVED" ;; esac
-	run="$BASE/$(date +%Y%m%d-%H%M%S)-$plan"
+	label="nollama-bench-$plan"
+	existing=$(ids_by_label "$label") || die "can't list instances"
+	[ -z "$existing" ] || die "an instance labelled $label already exists ($existing): destroy it first"
+	run=${RUN:-"$BASE/$(date +%Y%m%d-%H%M%S)-$plan"}
 	mkdir -p "$run"
 	echo "$plan" >"$run/plan"
 	ssh-keygen -q -t ed25519 -N '' -C nollama-bench -f "$run/key"
 	pub=$(cat "$run/key.pub")
 	ud=$(sed -e "s|__PUBKEY__|$pub|" -e "s|__OLLAMA__|$ollama|" "$HERE/box-setup.sh" | base64 | tr -d '\n')
-	label="nollama-bench-$plan"
 	body=$(printf '{"region":"%s","plan":"%s","os_id":%s,"label":"%s","hostname":"%s","user_data":"%s","backups":"disabled","enable_ipv6":false}' \
 		"$region" "$plan" "$OS_ID" "$label" "$label" "$ud")
 	say "creating $plan in $region (ollama=$ollama)"
-	out=$(api POST /instances "$body")
-	id=$(echo "$out" | json 'd["instance"]["id"]' 2>/dev/null) || die "create failed: $out"
+	out=$(API_TIMEOUT=90 api POST /instances "$body" 2>&1) || true
+	if ! id=$(echo "$out" | json 'd["instance"]["id"]' 2>/dev/null); then
+		# the request may have failed after Vultr made the instance: look for it by label
+		say "create didn't answer cleanly ($out); looking for the instance by label"
+		sleep 10
+		id=$(ids_by_label "$label" | head -1)
+		[ -n "$id" ] || die "create failed and no $label instance exists"
+		say "found $id: adopting it"
+	fi
 	echo "$id" >"$run/id"
 	say "created instance $id; run dir $run"
 	echo "$run"
@@ -124,7 +137,12 @@ cmd_fetch() {
 
 cmd_destroy() {
 	run=$1
-	id=$(cat "$run/id" 2>/dev/null) || { say "no instance id in $run"; return 0; }
+	id=$(cat "$run/id" 2>/dev/null) || id=""
+	if [ -z "$id" ] && [ -s "$run/plan" ]; then
+		id=$(ids_by_label "nollama-bench-$(cat "$run/plan")" | head -1) || id=""
+		[ -n "$id" ] && echo "$id" >"$run/id"
+	fi
+	[ -n "$id" ] || { say "no instance to destroy for $run"; return 0; }
 	say "destroying $id"
 	api DELETE "/instances/$id" >/dev/null || true
 	for i in 1 2 3 4 5 6; do
@@ -143,8 +161,11 @@ cmd_list() {
 }
 
 cmd_all() {
-	run=$(cmd_create "$@" | tee /dev/stderr | tail -1)
+	run="$BASE/$(date +%Y%m%d-%H%M%S)-$1"
+	mkdir -p "$run"
+	echo "$1" >"$run/plan"
 	trap 'cmd_destroy "$run"' EXIT INT TERM HUP
+	RUN=$run cmd_create "$@"
 	cmd_wait "$run"
 	cmd_push "$run"
 	cmd_start "$run"
