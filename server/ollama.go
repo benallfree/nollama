@@ -91,6 +91,7 @@ type ollamaGenerateRequest struct {
 	Context   []int           `json:"context"`
 	Images    []string        `json:"images"`
 	KeepAlive json.RawMessage `json:"keep_alive"`
+	ollamaLogprobs
 }
 
 type ollamaChatRequest struct {
@@ -104,6 +105,21 @@ type ollamaChatRequest struct {
 	ToolChoice json.RawMessage `json:"tool_choice"`
 	KeepAlive  json.RawMessage `json:"keep_alive"`
 	Truncate   *bool           `json:"truncate"` // drop the oldest messages if the chat doesn't fit (nollama's; nil: the server's default)
+	ollamaLogprobs
+}
+
+// ollamaLogprobs is the request fields asking for log-probabilities, at the top level (not in options).
+type ollamaLogprobs struct {
+	Logprobs    bool `json:"logprobs"`
+	TopLogprobs int  `json:"top_logprobs"`
+}
+
+func (l ollamaLogprobs) apply(sp *sampling) error {
+	if err := checkTopLogprobs(l.TopLogprobs, maxTopLogprobs); err != nil {
+		return err
+	}
+	sp.Logprobs, sp.TopLogprobs = l.Logprobs, l.TopLogprobs // Ollama ignores top_logprobs without logprobs
+	return nil
 }
 
 // ollamaDone is the closing fields of a generate or chat answer.
@@ -184,6 +200,9 @@ func (s *Server) ollamaGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sp, err := req.Options.sampling(req.Format)
+	if err == nil {
+		err = req.ollamaLogprobs.apply(&sp)
+	}
 	if err != nil {
 		ollamaError(w, err)
 		return
@@ -205,8 +224,15 @@ func (s *Server) ollamaGenerate(w http.ResponseWriter, r *http.Request) {
 	nd := &ndjson{w: w}
 	model := req.Model
 	if stream {
+		if sp.Logprobs {
+			g.lp = &lpStream{}
+		}
 		g.onText = func(piece string) bool {
-			return nd.send(map[string]any{"model": model, "created_at": now(), "response": piece, "done": false})
+			c := map[string]any{"model": model, "created_at": now(), "response": piece, "done": false}
+			if g.lp != nil {
+				c["logprobs"] = lpEntries(g.lp.take(piece))
+			}
+			return nd.send(c)
 		}
 	}
 	out, err := s.generate(r.Context(), g)
@@ -225,12 +251,19 @@ func (s *Server) ollamaGenerate(w http.ResponseWriter, r *http.Request) {
 		Done      bool   `json:"done"`
 		Context   []int  `json:"context,omitempty"`
 		ollamaDone
+		Logprobs []lpEntry `json:"logprobs,omitempty"`
 	}{Model: model, CreatedAt: now(), Done: true, ollamaDone: doneOf(out)}
 	final.Context = append(append([]int(nil), out.ids...), out.res.Tokens...)
 	if !stream {
 		final.Response = out.res.Text
+		if sp.Logprobs {
+			final.Logprobs = lpEntries(out.lps)
+		}
 		writeJSON(w, 200, final)
 		return
+	}
+	if g.lp != nil {
+		final.Logprobs = lpEntries(g.lp.rest(len(out.res.Text)))
 	}
 	nd.send(final)
 }
@@ -274,6 +307,9 @@ func (s *Server) ollamaChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sp, err := req.Options.sampling(req.Format)
+	if err == nil {
+		err = req.ollamaLogprobs.apply(&sp)
+	}
 	if err != nil {
 		ollamaError(w, err)
 		return
@@ -286,15 +322,27 @@ func (s *Server) ollamaChat(w http.ResponseWriter, r *http.Request) {
 	stream := req.Stream == nil || *req.Stream
 	nd := &ndjson{w: w}
 	model := req.Model
+	var lpPending []lpToken // logprobs of text generated but not sent yet (a tool call is held back until complete)
 	send := func(msg ollamaMessage) bool {
-		return nd.send(map[string]any{"model": model, "created_at": now(), "message": msg, "done": false})
+		c := map[string]any{"model": model, "created_at": now(), "message": msg, "done": false}
+		if g.lp != nil {
+			c["logprobs"] = lpEntries(lpPending)
+			lpPending = nil
+		}
+		return nd.send(c)
 	}
 	var split *toolStream
 	ncalls := 0
 	if stream {
+		if sp.Logprobs {
+			g.lp = &lpStream{}
+		}
 		if ts.calling() {
 			split = &toolStream{}
 			g.onText = func(piece string) bool {
+				if g.lp != nil {
+					lpPending = append(lpPending, g.lp.take(piece)...)
+				}
 				content, calls := split.feed(piece)
 				if content != "" && !send(ollamaMessage{Role: "assistant", Content: content}) {
 					return false
@@ -308,7 +356,12 @@ func (s *Server) ollamaChat(w http.ResponseWriter, r *http.Request) {
 				return true
 			}
 		} else {
-			g.onText = func(piece string) bool { return send(ollamaMessage{Role: "assistant", Content: piece}) }
+			g.onText = func(piece string) bool {
+				if g.lp != nil {
+					lpPending = append(lpPending, g.lp.take(piece)...)
+				}
+				return send(ollamaMessage{Role: "assistant", Content: piece})
+			}
 		}
 	}
 	out, err := s.generate(r.Context(), g)
@@ -326,6 +379,7 @@ func (s *Server) ollamaChat(w http.ResponseWriter, r *http.Request) {
 		Message   ollamaMessage `json:"message"`
 		Done      bool          `json:"done"`
 		ollamaDone
+		Logprobs []lpEntry `json:"logprobs,omitempty"`
 	}{Model: model, CreatedAt: now(), Message: ollamaMessage{Role: "assistant"}, Done: true, ollamaDone: doneOf(out)}
 	if !stream {
 		final.Message.Content = out.res.Text
@@ -334,13 +388,23 @@ func (s *Server) ollamaChat(w http.ResponseWriter, r *http.Request) {
 			final.Message.Content = content
 			final.Message.ToolCalls = ollamaCalls(calls, 0)
 		}
+		if sp.Logprobs {
+			final.Logprobs = lpEntries(out.lps)
+		}
 		writeJSON(w, 200, final)
 		return
 	}
+	var rest []lpToken
+	if g.lp != nil {
+		rest = g.lp.rest(len(out.res.Text))
+	}
 	if split != nil {
-		if rest := split.rest(); rest != "" {
-			send(ollamaMessage{Role: "assistant", Content: rest})
+		if text := split.rest(); text != "" {
+			send(ollamaMessage{Role: "assistant", Content: text})
 		}
+	}
+	if g.lp != nil {
+		final.Logprobs = lpEntries(append(lpPending, rest...))
 	}
 	nd.send(final)
 }

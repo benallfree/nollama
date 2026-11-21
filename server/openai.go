@@ -223,16 +223,25 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			ToolCalls  []openaiToolCall `json:"tool_calls"`
 			ToolCallID string           `json:"tool_call_id"`
 		} `json:"messages"`
+		Logprobs    bool `json:"logprobs"`
+		TopLogprobs *int `json:"top_logprobs"`
 	}
 	if err := decode(r, &req); err != nil {
 		openaiError(w, err)
 		return
 	}
 	sp, err := req.sampling()
+	if err == nil && req.TopLogprobs != nil {
+		sp.TopLogprobs = *req.TopLogprobs
+		if err = checkTopLogprobs(sp.TopLogprobs, maxTopLogprobs); err == nil && !req.Logprobs {
+			err = errTopWithoutLogprobs
+		}
+	}
 	if err != nil {
 		openaiError(w, err)
 		return
 	}
+	sp.Logprobs = req.Logprobs
 	if len(req.Messages) == 0 {
 		openaiError(w, badRequest{errors.New("messages is required")})
 		return
@@ -249,28 +258,44 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	id, created, model := completionID("chatcmpl"), time.Now().Unix(), req.Model
-	chunk := func(delta map[string]any, finish any) map[string]any {
+	// chatLogprobs is a choice's "logprobs": null unless asked for
+	chatLogprobs := func(toks []lpToken) any {
+		if !req.Logprobs {
+			return nil
+		}
+		return map[string]any{"content": lpEntries(toks)}
+	}
+	chunk := func(delta map[string]any, finish any, toks []lpToken) map[string]any {
 		return map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-			"choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}}}
+			"choices": []any{map[string]any{"index": 0, "delta": delta, "logprobs": chatLogprobs(toks), "finish_reason": finish}}}
 	}
 	tools := sp.Tools.prompt()
 	g := genRequest{model: req.Model, sampling: sp, trim: chatTrim(msgs, tools),
 		tokens: func(m *engine.Model) ([]int, error) { return m.Tokenize(m.ChatPromptTools(msgs, tools)), nil }}
 	ev := &sse{w: w}
 	first := true
+	var lpPending []lpToken // logprobs of text generated but not sent yet (a tool call is held back until complete)
 	send := func(d map[string]any) bool {
 		if first {
 			d["role"] = "assistant"
 			first = false
 		}
-		return ev.send(chunk(d, nil))
+		toks := lpPending
+		lpPending = nil
+		return ev.send(chunk(d, nil, toks))
 	}
 	var split *toolStream
 	ncalls := 0
 	if req.Stream {
+		if req.Logprobs {
+			g.lp = &lpStream{}
+		}
 		if sp.Tools.calling() {
 			split = &toolStream{}
 			g.onText = func(piece string) bool {
+				if g.lp != nil {
+					lpPending = append(lpPending, g.lp.take(piece)...)
+				}
 				content, calls := split.feed(piece)
 				if content != "" && !send(map[string]any{"content": content}) {
 					return false
@@ -284,7 +309,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				return true
 			}
 		} else {
-			g.onText = func(piece string) bool { return send(map[string]any{"content": piece}) }
+			g.onText = func(piece string) bool {
+				if g.lp != nil {
+					lpPending = append(lpPending, g.lp.take(piece)...)
+				}
+				return send(map[string]any{"content": piece})
+			}
 		}
 	}
 	out, err := s.generate(r.Context(), g)
@@ -318,7 +348,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		res := map[string]any{"id": id, "object": "chat.completion", "created": created, "model": model,
-			"choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": finish}},
+			"choices": []any{map[string]any{"index": 0, "message": msg, "logprobs": chatLogprobs(out.lps), "finish_reason": finish}},
 			"usage":   usageOf(out)}
 		if t := truncatedOf(out); t != nil {
 			res["truncated"] = t
@@ -326,15 +356,19 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, res)
 		return
 	}
+	var rest []lpToken
+	if g.lp != nil {
+		rest = g.lp.rest(len(out.res.Text))
+	}
 	if split != nil {
-		if rest := split.rest(); rest != "" {
-			send(map[string]any{"content": rest})
+		if text := split.rest(); text != "" {
+			send(map[string]any{"content": text})
 		}
 		if ncalls > 0 && finish == "stop" {
 			finish = "tool_calls"
 		}
 	}
-	last := chunk(map[string]any{}, finish)
+	last := chunk(map[string]any{}, finish, append(lpPending, rest...))
 	if t := truncatedOf(out); t != nil {
 		last["truncated"] = t
 	}
@@ -349,13 +383,24 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 func (s *Server) openaiCompletions(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		openaiCommon
-		Prompt json.RawMessage `json:"prompt"`
+		Prompt   json.RawMessage `json:"prompt"`
+		Logprobs *int            `json:"logprobs"` // the legacy API's number of top tokens (null: no logprobs)
+		Echo     bool            `json:"echo"`
 	}
 	if err := decode(r, &req); err != nil {
 		openaiError(w, err)
 		return
 	}
 	sp, err := req.sampling()
+	if err == nil && req.Logprobs != nil {
+		sp.Logprobs, sp.TopLogprobs = true, *req.Logprobs
+		if *req.Logprobs < 0 || *req.Logprobs > 5 {
+			err = badRequest{errors.New("logprobs must be between 0 and 5")}
+		}
+	}
+	if err == nil && req.Echo {
+		err = badRequest{errors.New("echo isn't supported")}
+	}
 	if err != nil {
 		openaiError(w, err)
 		return
@@ -377,15 +422,28 @@ func (s *Server) openaiCompletions(w http.ResponseWriter, r *http.Request) {
 		sp.MaxTokens = 16 // OpenAI's default for completions
 	}
 	id, created, model := completionID("cmpl"), time.Now().Unix(), req.Model
-	chunk := func(text string, finish any) map[string]any {
+	chunk := func(text string, finish any, toks []lpToken) map[string]any {
+		var lps any
+		if sp.Logprobs {
+			lps = legacyOf(toks)
+		}
 		return map[string]any{"id": id, "object": "text_completion", "created": created, "model": model,
-			"choices": []any{map[string]any{"index": 0, "text": text, "finish_reason": finish, "logprobs": nil}}}
+			"choices": []any{map[string]any{"index": 0, "text": text, "finish_reason": finish, "logprobs": lps}}}
 	}
 	g := genRequest{model: req.Model, sampling: sp,
 		tokens: func(m *engine.Model) ([]int, error) { return m.Tokenize(prompt), nil }}
 	ev := &sse{w: w}
 	if req.Stream {
-		g.onText = func(piece string) bool { return ev.send(chunk(piece, nil)) }
+		if sp.Logprobs {
+			g.lp = &lpStream{}
+		}
+		g.onText = func(piece string) bool {
+			var toks []lpToken
+			if g.lp != nil {
+				toks = g.lp.take(piece)
+			}
+			return ev.send(chunk(piece, nil, toks))
+		}
 	}
 	out, err := s.generate(r.Context(), g)
 	if err != nil {
@@ -398,12 +456,16 @@ func (s *Server) openaiCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !req.Stream {
-		c := chunk(out.res.Text, out.reason)
+		c := chunk(out.res.Text, out.reason, out.lps)
 		c["usage"] = usageOf(out)
 		writeJSON(w, 200, c)
 		return
 	}
-	ev.send(chunk("", out.reason))
+	var rest []lpToken
+	if g.lp != nil {
+		rest = g.lp.rest(len(out.res.Text))
+	}
+	ev.send(chunk("", out.reason, rest))
 	if req.StreamOptions.IncludeUsage {
 		ev.send(map[string]any{"id": id, "object": "text_completion", "created": created, "model": model,
 			"choices": []any{}, "usage": usageOf(out)})

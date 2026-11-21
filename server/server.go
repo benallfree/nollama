@@ -324,6 +324,8 @@ type sampling struct {
 	Schema      json.RawMessage // constrain the output to this JSON schema
 	Truncate    *bool           // a chat that doesn't fit drops its oldest messages (nil: the server's default)
 	Tools       *toolSet        // tools the model may call (nil: none)
+	Logprobs    bool            // report each output token's log-probability
+	TopLogprobs int             // and this many most likely tokens at each step
 }
 
 // genRequest is one generation: the model, its prompt as tokens (built once the model is loaded) and the sampling.
@@ -335,6 +337,7 @@ type genRequest struct {
 	onText    func(piece string) bool // nil: no streaming
 	// trim, for a chat, rebuilds the prompt within budget tokens by dropping old messages (fitContext); nil: can't
 	trim func(m *engine.Model, budget int) ([]int, engine.Trimmed, error)
+	lp   *lpStream // when streaming with logprobs: collects them for onText to pair with its text
 }
 
 type genOutput struct {
@@ -345,6 +348,7 @@ type genOutput struct {
 	total   time.Duration
 	reason  string         // "stop" or "length"
 	trimmed engine.Trimmed // what fitContext dropped (Messages 0: nothing)
+	lps     []lpToken      // the answer's logprobs, when asked for
 }
 
 func (s *Server) generate(ctx context.Context, g genRequest) (genOutput, error) {
@@ -427,12 +431,22 @@ func (s *Server) generate(ctx context.Context, g genRequest) (genOutput, error) 
 	} else {
 		o.Seed = rand.Uint64()
 	}
+	if g.sampling.Logprobs {
+		o.Logprobs, o.TopLogprobs = true, g.sampling.TopLogprobs
+		if g.lp != nil {
+			g.lp.m = l.m
+			o.OnLogprob = g.lp.add
+		}
+	}
 	on := g.onText
 	if on == nil {
 		on = func(string) bool { return true }
 	}
 	res, err := l.m.GenerateTokens(ctx, ids, o, on)
 	out.res = res
+	if g.sampling.Logprobs {
+		out.lps = lpTokens(l.m, res.Logprobs) // while the model is held
+	}
 	out.total = time.Since(start)
 	out.reason = "stop"
 	if res.StopReason == "length" {
