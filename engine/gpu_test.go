@@ -391,3 +391,16 @@ func TestGPUAttention(t *testing.T) {
 		maxRelDiff(t, fmt.Sprintf("attention, masked=%v", masked), download(b, ob, len(want)), want, 1e-5)
 	}
 }
+
+// TestGPUBackends reports which GPU backends open here and why the others don't.
+func TestGPUBackends(t *testing.T) {
+	for i, open := range gpuOpeners {
+		b, err := open()
+		if err != nil {
+			t.Logf("backend %d: %v", i, err)
+			continue
+		}
+		t.Logf("backend %d: %s, unified=%v", i, b.name(), b.unified())
+		b.close()
+	}
+}

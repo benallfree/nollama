@@ -82,7 +82,7 @@ type gpuAttention struct {
 }
 
 // gpuOpeners are the backends to try, in order of preference.
-var gpuOpeners = []func() (gpuBackend, error){openMetal}
+var gpuOpeners = []func() (gpuBackend, error){openMetal, openCUDA}
 
 // openGPU returns the first backend that works on this machine, with the model's weights loaded,
 // or an error listing why each failed.
