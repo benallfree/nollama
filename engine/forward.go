@@ -221,6 +221,7 @@ type state struct {
 	lastAct      *acts
 	hidden       []float32 // when set (Embed), forward stores the last token's normed hidden state here and skips the LM head
 	bytes        int64     // what it takes in memory (stateBytes), reserved in the model's Resources
+	allLogits    []float32 // when set (Score), forward fills logits for every token, maxN*vocab
 }
 
 // actsBytes is what newActs(maxN, k) allocates.
@@ -450,6 +451,15 @@ func (m *Model) forward(s *state, tokens []int, pos int) {
 
 	if s.hidden != nil { // embeddings: the final hidden state, no logits
 		rmsnorm(s.hidden, s.x[(n-1)*dim:n*dim], m.norm, hp.eps)
+		return
+	}
+	if s.allLogits != nil { // logits for every position (Score)
+		a := s.an
+		a.n = n
+		perToken(func(t int) { rmsnorm(a.f[t*dim:(t+1)*dim], s.x[t*dim:(t+1)*dim], m.norm, hp.eps) })
+		a.quantize(p, m.out)
+		m.matmul(p, a, 0, mmSeg{m.out, s.allLogits, hp.vocab})
+		copy(s.logits, s.allLogits[(n-1)*hp.vocab:n*hp.vocab])
 		return
 	}
 	la := s.lastAct

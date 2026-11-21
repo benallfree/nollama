@@ -38,6 +38,13 @@ type GenerateOptions struct {
 	// for the folder (<= 0: no limit), least recently used first.
 	ThreadDir  string
 	ThreadDisk int64
+	// Logprobs records each generated token's log-probability in Result.Logprobs, with the TopLogprobs most likely
+	// tokens at each step; tokens that only held a stop string are left out. OnLogprob, when set, is also called with
+	// each one as it is chosen, before its text reaches onToken (which may hold text back while it could start a stop
+	// string), and for every chosen token, stop string or not.
+	Logprobs    bool
+	TopLogprobs int
+	OnLogprob   func(TokenLogprob)
 }
 
 // Fit is how a Constraint judges the output so far.
@@ -60,9 +67,10 @@ type Result struct {
 	PromptTokens int
 	CachedTokens int // of PromptTokens, how many came from the prompt cache instead of being read again
 	OutputTokens int
-	Prefill      time.Duration // prompt processing, up to the first sampled token
-	Decode       time.Duration // remaining tokens
-	StopReason   string        // "eos", "stop", "length" (MaxTokens reached), "callback", "canceled"
+	Prefill      time.Duration  // prompt processing, up to the first sampled token
+	Decode       time.Duration  // remaining tokens
+	StopReason   string         // "eos", "stop", "length" (MaxTokens reached), "callback", "canceled"
+	Logprobs     []TokenLogprob // one per token of Text, when GenerateOptions.Logprobs
 }
 
 // Message is one chat turn.
@@ -294,6 +302,17 @@ func (m *Model) generateTokens(ctx context.Context, ids []int, o GenerateOptions
 	finish := func(reason string) {
 		res.StopReason = reason
 		res.Text = text.String()
+		if len(res.Logprobs) > 0 { // keep the tokens that put at least one byte into Text (a stop string drops the rest)
+			off, keep := 0, 0
+			for _, t := range res.Tokens {
+				if off >= len(res.Text) {
+					break
+				}
+				off += len(m.tok.tokenBytes(t))
+				keep++
+			}
+			res.Logprobs = res.Logprobs[:min(keep, len(res.Logprobs))]
+		}
 		if !decodeStart.IsZero() {
 			res.Decode = time.Since(decodeStart)
 		}
@@ -323,6 +342,15 @@ func (m *Model) generateTokens(ctx context.Context, ids []int, o GenerateOptions
 		if m.tok.eos[tok] && !o.IgnoreEOS {
 			finish("eos")
 			break
+		}
+		if o.Logprobs || o.OnLogprob != nil {
+			lp := logprobOf(s.logits, tok, o.TopLogprobs)
+			if o.Logprobs {
+				res.Logprobs = append(res.Logprobs, lp)
+			}
+			if o.OnLogprob != nil {
+				o.OnLogprob(lp)
+			}
 		}
 		res.Tokens = append(res.Tokens, tok)
 		res.OutputTokens++
