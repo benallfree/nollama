@@ -67,23 +67,28 @@ func (m *Model) Score(ctx context.Context, ids []int, o ScoreOptions) ([]TokenLo
 		end := min(pos+b, len(ids)-1) // the last token is only a target
 		m.forward(s, ids[pos:end], pos)
 		for t := 0; t < end-pos; t++ {
-			out = append(out, logprobOf(s.allLogits[t*v:(t+1)*v], ids[pos+t+1], o.TopLogprobs))
+			out = append(out, logprobOf(s.allLogits[t*v:(t+1)*v], ids[pos+t+1], o.TopLogprobs, m.det))
 		}
 	}
 	return out, nil
 }
 
-// logprobOf is tok's log-softmax in logits, plus the top n tokens.
-func logprobOf(logits []float32, tok, n int) TokenLogprob {
+// logprobOf is tok's log-softmax in logits, plus the top n tokens. det uses the portable exp and log (detmath.go),
+// the same bits on every architecture; math.Exp is about 1.5x faster, and this runs over the whole vocabulary.
+func logprobOf(logits []float32, tok, n int, det bool) TokenLogprob {
+	exp, log := math.Exp, math.Log
+	if det {
+		exp, log = exp64, log64
+	}
 	mx := float32(math.Inf(-1))
 	for _, x := range logits {
 		mx = max(mx, x)
 	}
 	var sum float64
 	for _, x := range logits {
-		sum += math.Exp(float64(x - mx))
+		sum += exp(float64(x - mx))
 	}
-	lse := float64(mx) + math.Log(sum)
+	lse := float64(mx) + log(sum)
 	r := TokenLogprob{Logprob: Logprob{tok, float64(logits[tok]) - lse}}
 	if n <= 0 {
 		return r

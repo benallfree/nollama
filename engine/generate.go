@@ -344,7 +344,7 @@ func (m *Model) generateTokens(ctx context.Context, ids []int, o GenerateOptions
 			break
 		}
 		if o.Logprobs || o.OnLogprob != nil {
-			lp := logprobOf(s.logits, tok, o.TopLogprobs)
+			lp := logprobOf(s.logits, tok, o.TopLogprobs, m.det)
 			if o.Logprobs {
 				res.Logprobs = append(res.Logprobs, lp)
 			}

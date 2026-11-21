@@ -304,7 +304,7 @@ about a logit, enough to change a sampled token. Thread count doesn't matter.
 
 `LoadOptions.Deterministic` (or `nollama serve --deterministic`, `NOLLAMA_DETERMINISTIC=1`, `nollama run
 --deterministic`) makes the logits the same bits on arm64 and amd64, at any thread count and prompt batch size, with or
-without a prompt-cache hit. Greedy output, logprobs and seeded sampling follow. Use it when two machines must agree
+without a prompt-cache hit. Greedy output, logprobs, `Score` (any `Batch`), `Classify` and seeded sampling follow. Use it when two machines must agree
 exactly, for example a compressor driven by the model's probabilities. It runs the portable Go kernels instead of the
 assembly ones (`Info().Kernels` reports `go (deterministic)`), so it's slower, mostly when reading prompts. It won't
 continue a conversation from half-precision state: thread files in a `ThreadDir` are ignored, and `LoadThread` /

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -160,6 +161,24 @@ func TestDeterministic(t *testing.T) {
 				m1.forward(s2, ids[i:i+1], i)
 				if pos, d := firstDiff(ref[i:i+1], [][]float32{s2.logits}); pos >= 0 {
 					t.Fatalf("after a prompt-cache restore: position %d differs (max |d| %g)", i, d)
+				}
+			}
+
+			// Score in batches must give the same logprobs, bit for bit, as Score one token at a time
+			sc1, err := m1.Score(context.Background(), ids, ScoreOptions{Batch: 1, TopLogprobs: 3})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, b := range []int{4, 7, 64} {
+				scb, err := m3.Score(context.Background(), ids, ScoreOptions{Batch: b, TopLogprobs: 3})
+				if err != nil {
+					t.Fatal(err)
+				}
+				for i := range sc1 {
+					if math.Float64bits(sc1[i].Logprob.Logprob) != math.Float64bits(scb[i].Logprob.Logprob) ||
+						sc1[i].Top[0] != scb[i].Top[0] {
+						t.Fatalf("Score batch %d differs from batch 1 at token %d: %v vs %v", b, i+1, scb[i], sc1[i])
+					}
 				}
 			}
 

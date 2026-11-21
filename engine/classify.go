@@ -121,7 +121,7 @@ func (m *Model) ClassifyTokens(ctx context.Context, ids []int, labels []string, 
 	res.Logprobs = make([]float64, len(labels))
 	res.Tokens = make([]int, len(labels))
 	for i, lt := range toks {
-		res.Logprobs[i] = logprobOf(last, lt[0], 0).Logprob.Logprob
+		res.Logprobs[i] = logprobOf(last, lt[0], 0, m.det).Logprob.Logprob
 		res.Tokens[i] = len(lt)
 	}
 	if total > 0 {
@@ -152,7 +152,7 @@ func (m *Model) ClassifyTokens(ctx context.Context, ids []int, labels []string, 
 		for k := first; k < i; k++ {
 			lt := toks[k]
 			for j := 1; j < len(lt); j++ {
-				res.Logprobs[k] += logprobOf(s.allLogits[r*v:(r+1)*v], lt[j], 0).Logprob.Logprob
+				res.Logprobs[k] += logprobOf(s.allLogits[r*v:(r+1)*v], lt[j], 0, m.det).Logprob.Logprob
 				r++
 			}
 		}
@@ -179,7 +179,7 @@ func softmax64(x []float64) []float64 {
 	out := make([]float64, len(x))
 	var sum float64
 	for i, v := range x {
-		out[i] = math.Exp(v - mx)
+		out[i] = exp64(v - mx) // portable: a few labels, so its cost doesn't matter
 		sum += out[i]
 	}
 	for i := range out {
