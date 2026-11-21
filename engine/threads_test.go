@@ -21,10 +21,7 @@ func TestF16RoundTrip(t *testing.T) {
 
 func loadTestModel(t *testing.T, o LoadOptions) *Model {
 	t.Helper()
-	path := os.Getenv("GGUF")
-	if path == "" {
-		t.Skip("set GGUF to a Qwen3 GGUF file")
-	}
+	path := testModelPath(t)
 	o.Threads = 4
 	m, err := Load(path, o)
 	if err != nil {

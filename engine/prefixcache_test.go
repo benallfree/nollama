@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"math"
-	"os"
 	"strings"
 	"testing"
 )
@@ -12,10 +11,7 @@ import (
 // full read (within float rounding, since the prompt splits into different prefill chunks), Generate reports the
 // cached tokens, and the cache stays inside its budget. GGUF=<a Qwen3 .gguf> go test -run TestPromptCache -v
 func TestPromptCache(t *testing.T) {
-	path := os.Getenv("GGUF")
-	if path == "" {
-		t.Skip("set GGUF to a Qwen3 GGUF file")
-	}
+	path := testModelPath(t)
 	const budget = 64 << 20
 	m, err := Load(path, LoadOptions{Threads: 4, PromptCache: budget})
 	if err != nil {

@@ -24,6 +24,10 @@ type LoadOptions struct {
 	ThreadMemory int64
 	// ID names the model in thread files, so one model never reads another's (default: the file's name and size).
 	ID string
+	// Respond, when set, makes the model answer from a script instead of its weights: each Generate call passes the
+	// prompt's text to Respond and returns what it says, as tokens (see respond.go). For tests; the nollamatest
+	// package builds on it.
+	Respond func(prompt string) string
 }
 
 // Info describes a loaded model.
@@ -83,6 +87,7 @@ type Model struct {
 	prefix  prefixCache // the start of recent prompts (keys and values), for reuse
 	threads threadStore // conversations' state between calls
 	id      string      // in thread files
+	respond func(prompt string) string
 }
 
 // getState returns an idle state with room for maxCtx positions and batches of maxN.
@@ -144,6 +149,7 @@ func newModel(g *ggufFile, opts LoadOptions) (*Model, error) {
 	m.prefix.budget = opts.PromptCache
 	m.threads.budget = opts.ThreadMemory
 	m.id = opts.ID
+	m.respond = opts.Respond
 	req := func(k string) (int, error) {
 		v, ok := g.getInt(arch + "." + k)
 		if !ok {

@@ -113,6 +113,39 @@ fmt.Println(res.Text) // {"label": "billing"}
 The engine also keeps the start of recent prompts (`LoadOptions.PromptCache`), so a long system prompt is read once,
 and can keep a conversation's state between calls (`GenerateOptions.Thread`).
 
+## Test without a model
+
+The `nollamatest` package lets your tests run in CI with no download. A scripted model answers with a function you
+write, so you can test what your code does with an answer:
+
+```go
+import "github.com/benallfree/nollama/nollamatest"
+
+func TestRouting(t *testing.T) {
+	m := nollamatest.Scripted(t, func(p nollamatest.Prompt) string {
+		if strings.Contains(p.Last("user"), "charged") {
+			return `{"label": "billing"}`
+		}
+		return `{"label": "question"}`
+	})
+	// m is an *engine.Model: pass it to your code. Its answers are tokenized, streamed, cut at max tokens and stop
+	// strings, and checked against your schema (an answer that doesn't fit is an error).
+}
+```
+
+`nollamatest.Load(t, nollamatest.TinyConfig{})` is a tiny Qwen3 model with random weights (about 1 MB, built in
+memory in a few milliseconds). It runs the whole engine, constraints included, and writes a jumble of English words,
+the same every run on a given machine.
+
+For code that talks HTTP, `nollamatest.NewServer(t)` runs nollama's real server on either model. It answers to every
+catalog name (`qwen3:1.7b` and the rest), so code that names a real model works unchanged:
+
+```go
+ts := nollamatest.NewServer(t, nollamatest.WithResponder(nollamatest.Reply("Bonjour !")))
+client := openai.NewClient(option.WithBaseURL(ts.URL+"/v1"), option.WithAPIKey("unused"))
+// or an Ollama client pointed at ts.URL
+```
+
 ## Models
 
 | Name | Download | Memory | Good for |

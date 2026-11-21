@@ -109,6 +109,9 @@ func (m *Model) GenerateTokens(ctx context.Context, ids []int, o GenerateOptions
 	if maxCtx > m.hp.ctx {
 		return res, errors.New("engine: prompt plus max tokens exceeds the model's context length")
 	}
+	if m.respond != nil {
+		return m.generateScripted(ctx, ids, o, onToken)
+	}
 	s := m.getState(maxCtx, min(len(ids), prefillBatch))
 	defer m.putState(s)
 	rng := rand.New(rand.NewPCG(o.Seed, o.Seed^0x9e3779b97f4a7c15))

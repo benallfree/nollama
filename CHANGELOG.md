@@ -11,6 +11,8 @@ becomes `## vX.Y.Z` and its lines are the release notes (`release.sh` reads them
 - `--read-only`, `--no-pull` and `--no-delete` turn off model management; `--models` limits which models clients may use.
 - Request limits: body size (`--max-body-mb`, default 8), context window (`--max-num-ctx`, default 32768), answer length (`--max-tokens`), and requests open at once per client IP (`--per-client`, default 8).
 - The same settings are fields of `server.Config` for embedders.
+- `nollamatest` package: test code that uses nollama with no model download. A tiny random-weight Qwen3 model (about 1 MB, built in memory) runs the real engine; a scripted model answers with a function you write; `nollamatest.NewServer(t)` runs either behind the real Ollama/OpenAI HTTP server, answering to every catalog model name.
+- `engine.LoadOptions.Respond` makes a model answer from a script instead of its weights, and `server.Config.Load` lets a test choose how model files are opened.
 
 ## v0.0.1-alpha.1
 

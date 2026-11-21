@@ -2,17 +2,14 @@ package engine
 
 import (
 	"context"
-	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
 func TestConcurrentGenerate(t *testing.T) {
-	p := os.Getenv("GGUF")
-	if p == "" {
-		t.Skip("GGUF not set")
-	}
+	p := testModelPath(t)
 	m, err := Load(p, LoadOptions{Threads: 4})
 	if err != nil {
 		t.Fatal(err)
@@ -49,9 +46,12 @@ func TestConcurrentGenerate(t *testing.T) {
 	if res.StopReason != "callback" {
 		t.Errorf("callback stop: %q", res.StopReason)
 	}
-	res, _ = m.Generate(context.Background(), prompt, GenerateOptions{MaxTokens: 50, Stop: []string{"three", "Three", "3"}}, nil)
-	if res.StopReason != "stop" {
-		t.Errorf("stop string: %q %q", res.StopReason, res.Text)
+	// a stop string from the middle of the greedy answer: the same answer, cut just before it
+	stop := strings.TrimSpace(want.Text[len(want.Text)/2:])
+	stop = stop[:min(4, len(stop))]
+	res, _ = m.Generate(context.Background(), prompt, GenerateOptions{MaxTokens: 50, Stop: []string{stop}}, nil)
+	if i := strings.Index(want.Text, stop); res.StopReason != "stop" || i < 0 || res.Text != want.Text[:i] {
+		t.Errorf("stop string %q: %q %q (answer %q)", stop, res.StopReason, res.Text, want.Text)
 	}
 	so := GenerateOptions{MaxTokens: 24, Temperature: 0.8, TopP: 0.95, TopK: 40, Seed: 42}
 	a, _ := m.Generate(context.Background(), prompt, so, nil)

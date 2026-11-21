@@ -48,6 +48,10 @@ type Config struct {
 	MaxTokens      int      // longest answer a request may ask for (0: up to the context window)
 	MaxNumCtx      int      // largest context window a request may ask for with num_ctx (default 32768, capped at the model's)
 	PerClient      int      // requests one client IP may have open at once (default 8; negative: no limit)
+
+	// Load opens a model file (default engine.Load). A test can wrap it, e.g. to set LoadOptions.Respond (see the
+	// nollamatest package).
+	Load func(path string, opts engine.LoadOptions) (*engine.Model, error)
 }
 
 // Server holds at most one loaded model and answers both APIs with it, loading the model a request names (and
@@ -98,6 +102,9 @@ func New(cfg Config) *Server {
 	}
 	if cfg.PerClient == 0 {
 		cfg.PerClient = 8
+	}
+	if cfg.Load == nil {
+		cfg.Load = engine.Load
 	}
 	return &Server{cfg: cfg, sem: make(chan struct{}, cfg.Parallel)}
 }
@@ -202,7 +209,7 @@ func (s *Server) acquire(name string) (*loaded, time.Duration, error) {
 		s.cur = nil
 		s.retire(old)
 	}
-	m, err := engine.Load(src.Path, engine.LoadOptions{Threads: s.cfg.Threads, PromptCache: s.cfg.PromptCache})
+	m, err := s.cfg.Load(src.Path, engine.LoadOptions{Threads: s.cfg.Threads, PromptCache: s.cfg.PromptCache})
 	if err != nil {
 		return nil, 0, fmt.Errorf("loading %s: %w", src.Name, err)
 	}
