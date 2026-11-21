@@ -1,0 +1,22 @@
+{
+    "version": "0.0.1-alpha.1",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/benallfree/nollama/releases/download/v0.0.1-alpha.1/nollama_0.0.1-alpha.1_windows_amd64.zip",
+            "bin": [
+                "nollama.exe"
+            ],
+            "hash": "20c9ccb5cad3c94865667c9b6dafa1d8d642cd14a776069c01915cce02e3ae4c"
+        },
+        "arm64": {
+            "url": "https://github.com/benallfree/nollama/releases/download/v0.0.1-alpha.1/nollama_0.0.1-alpha.1_windows_arm64.zip",
+            "bin": [
+                "nollama.exe"
+            ],
+            "hash": "3d9d90348143a838c63f806496ae9ca2597f1582ec876e02b60e7b718825e164"
+        }
+    },
+    "homepage": "https://github.com/benallfree/nollama",
+    "license": "MIT",
+    "description": "An embeddable, Ollama-compatible LLM engine and server, in Go"
+}
