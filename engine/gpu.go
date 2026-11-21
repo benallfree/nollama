@@ -28,6 +28,9 @@ type gpuBackend interface {
 	alloc(n int) (gpuBuf, error)
 	write(dst gpuRef, src []byte) // host to device
 	read(src gpuRef, dst []byte)  // device to host
+	// mapped returns buf's memory as the CPU sees it on unified memory (the KV cache is shared this way
+	// with the prompt cache and threads), or nil on a discrete GPU.
+	mapped(buf gpuBuf) []byte
 	batch() gpuBatch
 	close()
 }
@@ -57,6 +60,8 @@ type gpuBatch interface {
 	rope(x, cs, sn gpuRef, tokens, heads, headDim int)
 	swiglu(gate, up, out gpuRef, n int) // out = silu(gate) * up
 	add(x, y gpuRef, n int)             // x += y
+	// storeKV writes n tokens' keys and values (each [n][kvd]) into a layer's f32 cache at positions pos..
+	storeKV(k, v, kc, vc gpuRef, n, pos, kvd, ctxP int)
 	attention(a gpuAttention)
 	submit() error
 }

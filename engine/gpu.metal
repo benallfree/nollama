@@ -381,3 +381,25 @@ kernel void attention_f32(device const float *q [[buffer(0)]],
 		out[((ulong)t * a.heads + h) * hd + tid] = acc * inv;
 	}
 }
+
+// kv_store_f32 writes n tokens' keys and values into one layer's f32 cache at positions pos..:
+// keys transposed (kT[i*ctxP + p], i = kvHead*headDim + d), values by row (vc[p*kvd + i]).
+struct KVStoreArgs {
+	uint kvd;
+	uint ctxP;
+	uint pos;
+};
+
+kernel void kv_store_f32(device const float *k [[buffer(0)]],
+                         device const float *v [[buffer(1)]],
+                         device float *kT [[buffer(2)]],
+                         device float *vc [[buffer(3)]],
+                         constant KVStoreArgs &a [[buffer(4)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+	uint i = gid.x, t = gid.y;
+	if (i >= a.kvd) {
+		return;
+	}
+	kT[(ulong)i * a.ctxP + a.pos + t] = k[(ulong)t * a.kvd + i];
+	vc[((ulong)a.pos + t) * a.kvd + i] = v[(ulong)t * a.kvd + i];
+}

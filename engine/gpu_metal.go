@@ -14,7 +14,7 @@ import (
 var metalSource string
 
 // metalKernels are the kernels metalSource defines.
-var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "attention_f32"}
+var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "attention_f32", "kv_store_f32"}
 
 // metalBackend is the gpuBackend for Apple GPUs (unified memory only).
 type metalBackend struct {
@@ -82,6 +82,8 @@ func (m *metalBackend) write(dst gpuRef, src []byte) {
 func (m *metalBackend) read(src gpuRef, dst []byte) {
 	copy(dst, src.buf.(metalBuf).b.Bytes()[src.off:])
 }
+
+func (m *metalBackend) mapped(buf gpuBuf) []byte { return buf.(metalBuf).b.Bytes() }
 
 func (m *metalBackend) batch() gpuBatch { return &metalBatch{m: m} }
 
@@ -202,5 +204,14 @@ func (b *metalBatch) attention(a gpuAttention) {
 		Groups:  metal.Size{W: uint(a.heads), H: uint(a.n), D: 1},
 		Threads: metal.Size{W: nt, H: 1, D: 1},
 		Shared:  4 * (a.headDim + nt),
+	})
+}
+
+func (b *metalBatch) storeKV(k, v, kc, vc gpuRef, n, pos, kvd, ctxP int) {
+	b.ds = append(b.ds, metal.Dispatch{
+		P:       b.m.ps["kv_store_f32"],
+		Args:    []metal.Arg{marg(k), marg(v), marg(kc), marg(vc), {Bytes: u32(uint32(kvd), uint32(ctxP), uint32(pos))}},
+		Groups:  metal.Size{W: uint((kvd + 255) / 256), H: uint(n), D: 1},
+		Threads: metal.Size{W: 256, H: 1, D: 1},
 	})
 }
