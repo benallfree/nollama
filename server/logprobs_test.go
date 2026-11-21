@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/benallfree/nollama/internal/tinymodel"
 )
 
 func tok(text string, start int) lpToken {
@@ -104,14 +106,15 @@ func post(t *testing.T, url, body string) []string {
 	return lines
 }
 
-// TestLogprobs runs every API's logprobs against a real model: GGUF=/path/to/qwen3-0.6b.gguf go test -run Logprobs ./server
+// TestLogprobs runs every API's logprobs on the tiny random model, or on a real one:
+// GGUF=/path/to/qwen3-0.6b.gguf go test -run Logprobs ./server
 func TestLogprobs(t *testing.T) {
-	p := os.Getenv("GGUF")
-	if p == "" {
-		t.Skip("GGUF not set")
-	}
 	dir := t.TempDir()
-	if err := os.Symlink(p, filepath.Join(dir, "test.gguf")); err != nil {
+	if p := os.Getenv("GGUF"); p != "" {
+		if err := os.Symlink(p, filepath.Join(dir, "test.gguf")); err != nil {
+			t.Fatal(err)
+		}
+	} else if err := tinymodel.Write(filepath.Join(dir, "test.gguf"), tinymodel.Config{}); err != nil {
 		t.Fatal(err)
 	}
 	ts := newTest(t, dir)
@@ -137,7 +140,7 @@ func TestLogprobs(t *testing.T) {
 
 	// the same, streamed with a stop string: each chunk's tokens, then the leftovers, cover the text exactly or run
 	// past it only inside the token the stop string cut
-	lines = post(t, ts.URL+"/v1/chat/completions", `{"model":"`+model+`","temperature":0,"max_tokens":30,"stream":true,"stop":["Five"],"logprobs":true,"top_logprobs":2,`+msgs+`}`)
+	lines = post(t, ts.URL+"/v1/chat/completions", `{"model":"`+model+`","temperature":0,"max_tokens":30,"stream":true,"stop":["Five","five"],"logprobs":true,"top_logprobs":2,`+msgs+`}`)
 	var text string
 	var all []entry
 	for _, l := range lines {
@@ -164,10 +167,10 @@ func TestLogprobs(t *testing.T) {
 	}
 	t.Logf("streamed %q", text)
 	checkEntries(t, "stream", all, 2)
-	if strings.Contains(text, "Five") {
+	if strings.Contains(strings.ToLower(text), "five") {
 		t.Errorf("stream: stop string in %q", text)
 	}
-	if j := joined(all); !strings.HasPrefix(j, text) || len(j)-len(all[len(all)-1].RawBytes) >= len(text) {
+	if j := joined(all); !strings.HasPrefix(j, text) || (len(j) > len(text) && len(j)-len(all[len(all)-1].RawBytes) >= len(text)) {
 		t.Errorf("stream: tokens %q, text %q", j, text)
 	}
 
@@ -223,5 +226,62 @@ func TestLogprobs(t *testing.T) {
 	lines = post(t, ts.URL+"/api/generate", `{"model":"`+model+`","stream":false,"raw":true,"prompt":"one two three","options":{"num_predict":2}}`)
 	if strings.Contains(lines[0], "logprobs") {
 		t.Errorf("logprobs not asked for: %s", lines[0])
+	}
+
+	// streamed tool calls hold text back until a call is complete: every generated token still comes out once,
+	// in order, with a chunk that is sent
+	tools := `"tools":[` + testWeather + `],"tool_choice":"required"`
+	ask := `"messages":[{"role":"user","content":"/no_think What's the weather in Paris?"}]`
+	lines = post(t, ts.URL+"/v1/chat/completions", `{"model":"`+model+`","temperature":0,"max_tokens":80,"stream":true,"stream_options":{"include_usage":true},"logprobs":true,`+tools+`,`+ask+`}`)
+	all, calls, usage := nil, 0, 0
+	for _, l := range lines {
+		if l == "[DONE]" {
+			continue
+		}
+		var ch struct {
+			Choices []struct {
+				Delta struct {
+					ToolCalls []any `json:"tool_calls"`
+				}
+				Logprobs struct{ Content []entry }
+			}
+			Usage *struct {
+				CompletionTokens int `json:"completion_tokens"`
+			}
+		}
+		if err := json.Unmarshal([]byte(l), &ch); err != nil {
+			t.Fatal(err)
+		}
+		if ch.Usage != nil {
+			usage = ch.Usage.CompletionTokens
+		}
+		for _, c := range ch.Choices {
+			calls += len(c.Delta.ToolCalls)
+			all = append(all, c.Logprobs.Content...)
+		}
+	}
+	real := os.Getenv("GGUF") != "" // the tiny model's vocabulary can't write a tool call, so only count tokens
+	if (real && calls == 0) || len(all) != usage {
+		t.Errorf("tool call stream: %d calls, %d logprobs for %d tokens", calls, len(all), usage)
+	}
+	lines = post(t, ts.URL+"/api/chat", `{"model":"`+model+`","options":{"temperature":0,"num_predict":80},"logprobs":true,`+tools+`,`+ask+`}`)
+	all, calls, usage = nil, 0, 0
+	for _, l := range lines {
+		var ch struct {
+			Message struct {
+				ToolCalls []any `json:"tool_calls"`
+			}
+			Logprobs  []entry
+			EvalCount int `json:"eval_count"`
+		}
+		if err := json.Unmarshal([]byte(l), &ch); err != nil {
+			t.Fatal(err)
+		}
+		calls += len(ch.Message.ToolCalls)
+		all = append(all, ch.Logprobs...)
+		usage = max(usage, ch.EvalCount)
+	}
+	if (real && calls == 0) || len(all) != usage {
+		t.Errorf("ollama tool call stream: %d calls, %d logprobs for %d tokens", calls, len(all), usage)
 	}
 }
