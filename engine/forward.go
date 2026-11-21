@@ -2,6 +2,7 @@ package engine
 
 import (
 	"math"
+	"sync"
 )
 
 // acts holds n activation rows of length k in the forms the weights need.
@@ -10,17 +11,22 @@ type acts struct {
 	f              []float32
 	q8k, q80       []byte
 	q80x4          []byte // groups of 4 rows interleaved, for the 4-column Q8_0 kernel
+	q8k4           []byte // groups of 4 rows in the q8k4 layout, for the 2x4 Q4_K kernel
 	need8k, need80 bool
 	// rowByRow skips the 4-row kernels (speculative decoding's check, speculative.go). They follow the reference order
 	// and give the same bits as the 1-row ones (TestKernelsReferenceOrder), so a batch already gives each token exactly
 	// the logits a one-token forward would; this is belt and braces.
 	rowByRow bool
+	needK4         bool
 }
 
 func newActs(maxN, k int) *acts {
 	a := &acts{k: k, f: make([]float32, maxN*k)}
 	if k%qk == 0 {
 		a.q8k = make([]byte, maxN*k/qk*q8kBytes)
+		if gemmQ4K2x4 != nil && maxN >= 4 {
+			a.q8k4 = make([]byte, maxN/4*k/qk*q8k4Bytes)
+		}
 	}
 	if k%32 == 0 {
 		a.q80 = make([]byte, maxN*k/32*q80aBytes)
@@ -33,10 +39,13 @@ func newActs(maxN, k int) *acts {
 
 // prepare records which quantized forms the given weights need.
 func (a *acts) prepare(ws ...*weight) {
-	a.need8k, a.need80 = false, false
+	a.need8k, a.need80, a.needK4 = false, false, false
 	for _, w := range ws {
 		switch w.typ {
-		case typeQ4_K, typeQ6_K:
+		case typeQ4_K:
+			a.need8k = true
+			a.needK4 = a.q8k4 != nil
+		case typeQ6_K:
 			a.need8k = true
 		case typeQ8_0:
 			a.need80 = true
@@ -51,6 +60,10 @@ func (a *acts) quantizeRow(t, e0, e1 int) {
 	x := a.f[t*k+e0 : t*k+e1]
 	if a.need8k {
 		quantizeQ8K(x, a.q8k[(t*k+e0)/qk*q8kBytes:])
+		if a.needK4 && t < a.n&^3 {
+			g := a.q8k4[((t/4)*(k/qk)+e0/qk)*q8k4Bytes:]
+			packQ8K4(a.q8k[(t*k+e0)/qk*q8kBytes:], g, t%4, (e1-e0)/qk)
+		}
 	}
 	if a.need80 {
 		quantizeQ8_0(x, a.q80[(t*k+e0)/32*q80aBytes:])
@@ -131,6 +144,34 @@ func rowDot4(w *weight, a *acts) func(row []byte, t int, out *[4]float32) {
 	return nil
 }
 
+// gemm2x4 is a 2-row x 4-column prompt kernel for one weight: per tile,
+// scales unpacks each row's block scales into sb bytes; run then computes rows
+// (r0, r1) with unpacked scales (s0, s1) against activation rows t..t+3 (t a
+// multiple of 4) into out[r*4+c].
+type gemm2x4 struct {
+	nb, sb int
+	scales func(w, dst []byte, nb int)
+	run    func(r0, r1, s0, s1 []byte, t int, out *[8]float32)
+}
+
+func rowGemm2x4(w *weight, a *acts) *gemm2x4 {
+	if floatRef || a.rowByRow {
+		return nil
+	}
+	nb := a.k / qk
+	switch {
+	case w.typ == typeQ4_K && gemmQ4K2x4 != nil && a.needK4:
+		return &gemm2x4{nb: nb, sb: nb * q4kScaleBytes, scales: q4kScales,
+			run: func(r0, r1, s0, s1 []byte, t int, out *[8]float32) {
+				gemmQ4K2x4(r0, r1, s0, s1, a.q8k4[(t/4)*nb*q8k4Bytes:], nb, out)
+			}}
+	}
+	return nil
+}
+
+// scaleBufs holds per-tile buffers of unpacked weight scales.
+var scaleBufs = sync.Pool{New: func() any { return new([]byte) }}
+
 type mmSeg struct {
 	w      *weight
 	out    []float32 // out[t*stride + r]
@@ -145,6 +186,7 @@ func (m *Model) matmul(p *pool, a *acts, t0 int, segs ...mmSeg) {
 	type tileSeg struct {
 		dot   func([]byte, int) float32
 		dot4  func([]byte, int, *[4]float32)
+		g2x4  *gemm2x4
 		first int // first tile index
 	}
 	n := a.n - t0
@@ -156,6 +198,9 @@ func (m *Model) matmul(p *pool, a *acts, t0 int, segs ...mmSeg) {
 	total := 0
 	for i, s := range segs {
 		ts[i] = tileSeg{dot: rowDot(s.w, a), dot4: rowDot4(s.w, a), first: total}
+		if t0%4 == 0 {
+			ts[i].g2x4 = rowGemm2x4(s.w, a)
+		}
 		total += (s.w.rows + tile - 1) / tile
 	}
 	chunk := 1
@@ -173,6 +218,35 @@ func (m *Model) matmul(p *pool, a *acts, t0 int, segs ...mmSeg) {
 			r1 := min(r0+tile, s.w.rows)
 			dot, dot4 := ts[si].dot, ts[si].dot4
 			t := t0
+			if g := ts[si].g2x4; g != nil && t+4 <= a.n {
+				bp := scaleBufs.Get().(*[]byte)
+				if need := (r1 - r0) * g.sb; cap(*bp) < need {
+					*bp = make([]byte, need)
+				}
+				sc := (*bp)[:(r1-r0)*g.sb]
+				for r := r0; r < r1; r++ {
+					g.scales(s.w.row(r), sc[(r-r0)*g.sb:], g.nb)
+				}
+				var o8 [8]float32
+				for ; t+4 <= a.n; t += 4 {
+					o := s.out[(t-t0)*s.stride:]
+					for r := r0; r < r1; r += 2 {
+						r2 := min(r+1, r1-1)
+						g.run(s.w.row(r), s.w.row(r2), sc[(r-r0)*g.sb:], sc[(r2-r0)*g.sb:], t, &o8)
+						o[r] = o8[0]
+						o[s.stride+r] = o8[1]
+						o[2*s.stride+r] = o8[2]
+						o[3*s.stride+r] = o8[3]
+						if r2 != r {
+							o[r2] = o8[4]
+							o[s.stride+r2] = o8[5]
+							o[2*s.stride+r2] = o8[6]
+							o[3*s.stride+r2] = o8[7]
+						}
+					}
+				}
+				scaleBufs.Put(bp)
+			}
 			if dot4 != nil {
 				var o4 [4]float32
 				for ; t+4 <= a.n; t += 4 {

@@ -36,3 +36,6 @@ func hasAVX2FMA() bool {
 	_, ebx7, _, _ := cpuid(7, 0)
 	return ebx7&(1<<5) != 0 // AVX2
 }
+
+// archIntAsm: amd64 keeps the plain Q8_K layout for the 4-column kernels.
+func archIntAsm() {}

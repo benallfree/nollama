@@ -159,4 +159,5 @@ func useIntAsm() {
 		_, _ = x[nb*q80Bytes-1], y[nb*q80x4Bytes-1]
 		dotQ8_0x4Asm(bptr(x), bptr(y), nb, &out[0])
 	}
+	archIntAsm()
 }
