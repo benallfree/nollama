@@ -154,26 +154,26 @@ func TestContextLimits(t *testing.T) {
 	long := `[{"role":"system","content":"Answer in one word."},` + strings.Join(history, ",") + `,{"role":"user","content":"Say hi."}]`
 
 	// too long: 400 in each API's shape, with the counts
-	code, out := call(t, ts, "POST", "/api/chat", `{"model":"`+model+`","stream":false,"messages":`+long+`}`)
+	code, out := call(t, ts, "POST", "/api/chat", `{"model":`+jsonQ(model)+`,"stream":false,"messages":`+long+`}`)
 	if code != 400 || !strings.Contains(out["error"].(string), "context window exceeded") || !strings.Contains(out["error"].(string), "num_ctx 256") {
 		t.Errorf("ollama too long: %d %v", code, out)
 	}
-	code, out = call(t, ts, "POST", "/v1/chat/completions", `{"model":"`+model+`","messages":`+long+`}`)
+	code, out = call(t, ts, "POST", "/v1/chat/completions", `{"model":`+jsonQ(model)+`,"messages":`+long+`}`)
 	if e, _ := out["error"].(map[string]any); code != 400 || e["type"] != "invalid_request_error" || !strings.Contains(e["message"].(string), "context window exceeded") {
 		t.Errorf("openai too long: %d %v", code, out)
 	}
-	code, out = call(t, ts, "POST", "/api/generate", `{"model":"`+model+`","stream":false,"prompt":"`+strings.Repeat("blue ", 400)+`"}`)
+	code, out = call(t, ts, "POST", "/api/generate", `{"model":`+jsonQ(model)+`,"stream":false,"prompt":"`+strings.Repeat("blue ", 400)+`"}`)
 	if code != 400 || !strings.Contains(out["error"].(string), "context window exceeded") {
 		t.Errorf("generate too long: %d %v", code, out)
 	}
 
 	// opt-in truncation: answered, with what was dropped in the answer and the log
-	code, out = call(t, ts, "POST", "/api/chat", `{"model":"`+model+`","stream":false,"truncate":true,"options":{"temperature":0,"num_predict":4},"messages":`+long+`}`)
+	code, out = call(t, ts, "POST", "/api/chat", `{"model":`+jsonQ(model)+`,"stream":false,"truncate":true,"options":{"temperature":0,"num_predict":4},"messages":`+long+`}`)
 	tr, _ := out["truncated"].(map[string]any)
 	if code != 200 || tr == nil || tr["messages"].(float64) < 2 || out["prompt_eval_count"].(float64) > 256-4 || out["done_reason"] != "length" || out["eval_count"] != 4.0 {
 		t.Errorf("ollama truncate: %d %v", code, out)
 	}
-	code, out = call(t, ts, "POST", "/v1/chat/completions", `{"model":"`+model+`","truncate":true,"max_tokens":4,"temperature":0,"messages":`+long+`}`)
+	code, out = call(t, ts, "POST", "/v1/chat/completions", `{"model":`+jsonQ(model)+`,"truncate":true,"max_tokens":4,"temperature":0,"messages":`+long+`}`)
 	u, _ := out["usage"].(map[string]any)
 	if code != 200 || out["truncated"] == nil || u == nil || u["completion_tokens"] != 4.0 || u["total_tokens"].(float64) != u["prompt_tokens"].(float64)+4 {
 		t.Errorf("openai truncate: %d %v", code, out)
@@ -185,23 +185,23 @@ func TestContextLimits(t *testing.T) {
 	mu.Unlock()
 
 	// length and usage when streaming
-	lines := stream(t, ts.URL+"/api/chat", `{"model":"`+model+`","options":{"num_predict":3},"messages":[{"role":"user","content":"Count to ten."}]}`)
+	lines := stream(t, ts.URL+"/api/chat", `{"model":`+jsonQ(model)+`,"options":{"num_predict":3},"messages":[{"role":"user","content":"Count to ten."}]}`)
 	var last map[string]any
 	_ = json.Unmarshal([]byte(lines[len(lines)-1]), &last)
 	if last["done"] != true || last["done_reason"] != "length" || last["eval_count"] != 3.0 || last["prompt_eval_count"].(float64) < 5 {
 		t.Errorf("ollama stream: %v", last)
 	}
-	events := stream(t, ts.URL+"/v1/chat/completions", `{"model":"`+model+`","stream":true,"stream_options":{"include_usage":true},"max_tokens":3,"messages":[{"role":"user","content":"Count to ten."}]}`)
+	events := stream(t, ts.URL+"/v1/chat/completions", `{"model":`+jsonQ(model)+`,"stream":true,"stream_options":{"include_usage":true},"max_tokens":3,"messages":[{"role":"user","content":"Count to ten."}]}`)
 	if len(events) < 3 || events[len(events)-1] != "[DONE]" || !strings.Contains(events[len(events)-3], `"finish_reason":"length"`) ||
 		!strings.Contains(events[len(events)-2], `"completion_tokens":3`) {
 		t.Errorf("openai stream: %v", events)
 	}
-	events = stream(t, ts.URL+"/v1/completions", `{"model":"`+model+`","stream":true,"stream_options":{"include_usage":true},"max_tokens":3,"prompt":"One, two,"}`)
+	events = stream(t, ts.URL+"/v1/completions", `{"model":`+jsonQ(model)+`,"stream":true,"stream_options":{"include_usage":true},"max_tokens":3,"prompt":"One, two,"}`)
 	if len(events) < 3 || !strings.Contains(events[len(events)-2], `"completion_tokens":3`) {
 		t.Errorf("completions stream: %v", events)
 	}
 	// the window's end, not max_tokens: still "length"
-	code, out = call(t, ts, "POST", "/api/generate", `{"model":"`+model+`","stream":false,"raw":true,"options":{"num_ctx":24},"prompt":"One, two, three, four,"}`)
+	code, out = call(t, ts, "POST", "/api/generate", `{"model":`+jsonQ(model)+`,"stream":false,"raw":true,"options":{"num_ctx":24},"prompt":"One, two, three, four,"}`)
 	if code != 200 || out["done_reason"] != "length" || out["prompt_eval_count"].(float64)+out["eval_count"].(float64) != 24 {
 		t.Errorf("window end: %d %v", code, out)
 	}

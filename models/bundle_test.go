@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -37,7 +38,7 @@ func TestBundle(t *testing.T) {
 		t.Fatal(err)
 	}
 	st, _ := os.Stat(out)
-	if st.Mode().Perm()&0o100 == 0 {
+	if runtime.GOOS != "windows" && st.Mode().Perm()&0o100 == 0 { // Windows has no executable bit
 		t.Errorf("bundle isn't executable: %v", st.Mode())
 	}
 	all, _ := os.ReadFile(out)

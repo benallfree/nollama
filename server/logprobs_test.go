@@ -128,7 +128,7 @@ func TestLogprobs(t *testing.T) {
 			Logprobs struct{ Content []entry }
 		}
 	}
-	lines := post(t, ts.URL+"/v1/chat/completions", `{"model":"`+model+`","temperature":0,"max_tokens":30,"logprobs":true,"top_logprobs":3,`+msgs+`}`)
+	lines := post(t, ts.URL+"/v1/chat/completions", `{"model":`+jsonQ(model)+`,"temperature":0,"max_tokens":30,"logprobs":true,"top_logprobs":3,`+msgs+`}`)
 	if err := json.Unmarshal([]byte(lines[0]), &chat); err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestLogprobs(t *testing.T) {
 
 	// the same, streamed with a stop string: each chunk's tokens, then the leftovers, cover the text exactly or run
 	// past it only inside the token the stop string cut
-	lines = post(t, ts.URL+"/v1/chat/completions", `{"model":"`+model+`","temperature":0,"max_tokens":30,"stream":true,"stop":["Five","five"],"logprobs":true,"top_logprobs":2,`+msgs+`}`)
+	lines = post(t, ts.URL+"/v1/chat/completions", `{"model":`+jsonQ(model)+`,"temperature":0,"max_tokens":30,"stream":true,"stop":["Five","five"],"logprobs":true,"top_logprobs":2,`+msgs+`}`)
 	var text string
 	var all []entry
 	for _, l := range lines {
@@ -181,7 +181,7 @@ func TestLogprobs(t *testing.T) {
 			Logprobs legacyLogprobs
 		}
 	}
-	lines = post(t, ts.URL+"/v1/completions", `{"model":"`+model+`","prompt":"one two three","temperature":0,"max_tokens":8,"logprobs":2}`)
+	lines = post(t, ts.URL+"/v1/completions", `{"model":`+jsonQ(model)+`,"prompt":"one two three","temperature":0,"max_tokens":8,"logprobs":2}`)
 	if err := json.Unmarshal([]byte(lines[0]), &cmpl); err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +192,7 @@ func TestLogprobs(t *testing.T) {
 	}
 
 	// Ollama chat, streamed
-	lines = post(t, ts.URL+"/api/chat", `{"model":"`+model+`","options":{"temperature":0,"num_predict":20},"logprobs":true,"top_logprobs":1,`+msgs+`}`)
+	lines = post(t, ts.URL+"/api/chat", `{"model":`+jsonQ(model)+`,"options":{"temperature":0,"num_predict":20},"logprobs":true,"top_logprobs":1,`+msgs+`}`)
 	text, all = "", nil
 	for _, l := range lines {
 		var ch struct {
@@ -215,7 +215,7 @@ func TestLogprobs(t *testing.T) {
 		Response string
 		Logprobs []entry
 	}
-	lines = post(t, ts.URL+"/api/generate", `{"model":"`+model+`","stream":false,"raw":true,"prompt":"one two three","options":{"temperature":0,"num_predict":8},"logprobs":true}`)
+	lines = post(t, ts.URL+"/api/generate", `{"model":`+jsonQ(model)+`,"stream":false,"raw":true,"prompt":"one two three","options":{"temperature":0,"num_predict":8},"logprobs":true}`)
 	if err := json.Unmarshal([]byte(lines[0]), &gen); err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +223,7 @@ func TestLogprobs(t *testing.T) {
 	if joined(gen.Logprobs) != gen.Response {
 		t.Errorf("ollama generate: tokens %q, response %q", joined(gen.Logprobs), gen.Response)
 	}
-	lines = post(t, ts.URL+"/api/generate", `{"model":"`+model+`","stream":false,"raw":true,"prompt":"one two three","options":{"num_predict":2}}`)
+	lines = post(t, ts.URL+"/api/generate", `{"model":`+jsonQ(model)+`,"stream":false,"raw":true,"prompt":"one two three","options":{"num_predict":2}}`)
 	if strings.Contains(lines[0], "logprobs") {
 		t.Errorf("logprobs not asked for: %s", lines[0])
 	}
@@ -232,7 +232,7 @@ func TestLogprobs(t *testing.T) {
 	// in order, with a chunk that is sent
 	tools := `"tools":[` + testWeather + `],"tool_choice":"required"`
 	ask := `"messages":[{"role":"user","content":"/no_think What's the weather in Paris?"}]`
-	lines = post(t, ts.URL+"/v1/chat/completions", `{"model":"`+model+`","temperature":0,"max_tokens":80,"stream":true,"stream_options":{"include_usage":true},"logprobs":true,`+tools+`,`+ask+`}`)
+	lines = post(t, ts.URL+"/v1/chat/completions", `{"model":`+jsonQ(model)+`,"temperature":0,"max_tokens":80,"stream":true,"stream_options":{"include_usage":true},"logprobs":true,`+tools+`,`+ask+`}`)
 	all, calls, usage := nil, 0, 0
 	for _, l := range lines {
 		if l == "[DONE]" {
@@ -264,7 +264,7 @@ func TestLogprobs(t *testing.T) {
 	if (real && calls == 0) || len(all) != usage {
 		t.Errorf("tool call stream: %d calls, %d logprobs for %d tokens", calls, len(all), usage)
 	}
-	lines = post(t, ts.URL+"/api/chat", `{"model":"`+model+`","options":{"temperature":0,"num_predict":80},"logprobs":true,`+tools+`,`+ask+`}`)
+	lines = post(t, ts.URL+"/api/chat", `{"model":`+jsonQ(model)+`,"options":{"temperature":0,"num_predict":80},"logprobs":true,`+tools+`,`+ask+`}`)
 	all, calls, usage = nil, 0, 0
 	for _, l := range lines {
 		var ch struct {

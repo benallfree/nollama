@@ -29,6 +29,12 @@ func newTest(t *testing.T, dir string) *httptest.Server {
 	return ts
 }
 
+// jsonQ is s as a JSON string literal, for building request bodies by hand: a Windows path's backslashes need escaping.
+func jsonQ(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
 func call(t *testing.T, ts *httptest.Server, method, path, body string) (int, map[string]any) {
 	t.Helper()
 	req, _ := http.NewRequest(method, ts.URL+path, strings.NewReader(body))
@@ -149,7 +155,7 @@ func TestEmbed(t *testing.T) {
 		return s
 	}
 
-	code, out := call(t, ts, "POST", "/api/embed", `{"model":"`+model+`","input":["The cat sat on the mat.","A cat was sitting on a rug.","Quarterly revenue grew by ten percent."]}`)
+	code, out := call(t, ts, "POST", "/api/embed", `{"model":`+jsonQ(model)+`,"input":["The cat sat on the mat.","A cat was sitting on a rug.","Quarterly revenue grew by ten percent."]}`)
 	if code != 200 {
 		t.Fatalf("embed: %d %v", code, out)
 	}
@@ -165,16 +171,16 @@ func TestEmbed(t *testing.T) {
 		t.Errorf("similar %.3f <= unrelated %.3f", dot(a, b), dot(a, c))
 	}
 
-	if code, out := call(t, ts, "POST", "/api/show", `{"model":"`+model+`"}`); code != 200 || fmt.Sprint(out["capabilities"]) != "[embedding]" {
+	if code, out := call(t, ts, "POST", "/api/show", `{"model":`+jsonQ(model)+`}`); code != 200 || fmt.Sprint(out["capabilities"]) != "[embedding]" {
 		t.Errorf("show: %d %v", code, out["capabilities"])
 	}
 
-	code, out = call(t, ts, "POST", "/api/embeddings", `{"model":"`+model+`","prompt":"The cat sat on the mat."}`)
+	code, out = call(t, ts, "POST", "/api/embeddings", `{"model":`+jsonQ(model)+`,"prompt":"The cat sat on the mat."}`)
 	if code != 200 || dot(vec(out["embedding"]), a) < 0.9999 {
 		t.Errorf("embeddings: %d", code)
 	}
 
-	code, out = call(t, ts, "POST", "/v1/embeddings", `{"model":"`+model+`","input":["The cat sat on the mat."],"dimensions":64}`)
+	code, out = call(t, ts, "POST", "/v1/embeddings", `{"model":`+jsonQ(model)+`,"input":["The cat sat on the mat."],"dimensions":64}`)
 	if code != 200 {
 		t.Fatalf("v1 embeddings: %d %v", code, out)
 	}
@@ -186,7 +192,7 @@ func TestEmbed(t *testing.T) {
 		t.Errorf("usage: %v", out["usage"])
 	}
 
-	code, out = call(t, ts, "POST", "/v1/embeddings", `{"model":"`+model+`","input":"The cat sat on the mat.","encoding_format":"base64"}`)
+	code, out = call(t, ts, "POST", "/v1/embeddings", `{"model":`+jsonQ(model)+`,"input":"The cat sat on the mat.","encoding_format":"base64"}`)
 	if code != 200 {
 		t.Fatalf("v1 embeddings base64: %d %v", code, out)
 	}
@@ -204,10 +210,10 @@ func TestEmbed(t *testing.T) {
 
 	// too long: /api/embed truncates by default, /v1/embeddings refuses
 	long := strings.Repeat("word ", 300)
-	if code, out := call(t, ts, "POST", "/api/embed", `{"model":"`+model+`","input":"`+long+`","options":{"num_ctx":64}}`); code != 200 || out["prompt_eval_count"].(float64) != 64 {
+	if code, out := call(t, ts, "POST", "/api/embed", `{"model":`+jsonQ(model)+`,"input":"`+long+`","options":{"num_ctx":64}}`); code != 200 || out["prompt_eval_count"].(float64) != 64 {
 		t.Errorf("truncated embed: %d %v", code, out["prompt_eval_count"])
 	}
-	if code, _ := call(t, ts, "POST", "/api/embed", `{"model":"`+model+`","input":"`+long+`","truncate":false,"options":{"num_ctx":64}}`); code != 400 {
+	if code, _ := call(t, ts, "POST", "/api/embed", `{"model":`+jsonQ(model)+`,"input":"`+long+`","truncate":false,"options":{"num_ctx":64}}`); code != 400 {
 		t.Errorf("embed, truncate false: %d", code)
 	}
 }
@@ -240,7 +246,7 @@ func TestChat(t *testing.T) {
 	ts := newTest(t, dir)
 	model := filepath.Join(dir, "test.gguf")
 
-	code, out := call(t, ts, "POST", "/api/chat", `{"model":"`+model+`","stream":false,"options":{"temperature":0,"num_predict":20},
+	code, out := call(t, ts, "POST", "/api/chat", `{"model":`+jsonQ(model)+`,"stream":false,"options":{"temperature":0,"num_predict":20},
 		"format":{"type":"object","properties":{"answer":{"enum":["yes","no"]}},"required":["answer"]},
 		"messages":[{"role":"user","content":"Is the sky blue? Answer yes or no."}]}`)
 	if code != 200 || out["done"] != true {
@@ -251,7 +257,7 @@ func TestChat(t *testing.T) {
 		t.Errorf("structured answer: %v %v", out["message"], err)
 	}
 
-	res, err := http.Post(ts.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"`+model+`","stream":true,
+	res, err := http.Post(ts.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":`+jsonQ(model)+`,"stream":true,
 		"max_tokens":5,"messages":[{"role":"user","content":"Hi"}]}`))
 	if err != nil {
 		t.Fatal(err)
@@ -337,11 +343,11 @@ func TestMemoryBudget(t *testing.T) {
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 
-	code, out := call(t, ts, "POST", "/api/chat", `{"model":"`+model+`","stream":false,"messages":[{"role":"user","content":"Hi"}]}`)
+	code, out := call(t, ts, "POST", "/api/chat", `{"model":`+jsonQ(model)+`,"stream":false,"messages":[{"role":"user","content":"Hi"}]}`)
 	if code != http.StatusServiceUnavailable || !strings.Contains(fmt.Sprint(out["error"]), "memory limit") {
 		t.Errorf("ollama: %d %v", code, out)
 	}
-	code, out = call(t, ts, "POST", "/v1/chat/completions", `{"model":"`+model+`","messages":[{"role":"user","content":"Hi"}]}`)
+	code, out = call(t, ts, "POST", "/v1/chat/completions", `{"model":`+jsonQ(model)+`,"messages":[{"role":"user","content":"Hi"}]}`)
 	if code != http.StatusServiceUnavailable || !strings.Contains(fmt.Sprint(out["error"]), "memory limit") {
 		t.Errorf("openai: %d %v", code, out)
 	}
@@ -428,7 +434,7 @@ func TestDraft(t *testing.T) {
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(func() { ts.Close(); _ = s.Close() })
 	ask := func(draftTokens string) string {
-		body := `{"model":"` + p + `","stream":false,"options":{"temperature":0,"num_predict":40` + draftTokens + `},
+		body := `{"model":` + jsonQ(p) + `,"stream":false,"options":{"temperature":0,"num_predict":40` + draftTokens + `},
 			"format":{"type":"object","properties":{"colors":{"type":"array","items":{"type":"string"}}},"required":["colors"]},
 			"messages":[{"role":"user","content":"Name the three primary colors as JSON."}]}`
 		code, out := call(t, ts, "POST", "/api/chat", body)

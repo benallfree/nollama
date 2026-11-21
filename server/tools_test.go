@@ -50,7 +50,7 @@ func TestTools(t *testing.T) {
 	tools := `[` + testWeather + `,` + testTime + `]`
 	chat := func(extra, messages string) map[string]any {
 		t.Helper()
-		code, out := call(t, ts, "POST", "/v1/chat/completions", `{"model":"`+model+`","temperature":0,"max_tokens":120,"tools":`+tools+extra+`,"messages":`+messages+`}`)
+		code, out := call(t, ts, "POST", "/v1/chat/completions", `{"model":`+jsonQ(model)+`,"temperature":0,"max_tokens":120,"tools":`+tools+extra+`,"messages":`+messages+`}`)
 		if code != 200 {
 			t.Fatalf("%s: %d %v", extra, code, out)
 		}
@@ -96,8 +96,8 @@ func TestTools(t *testing.T) {
 	})
 	t.Run("sampled arguments match the schema", func(t *testing.T) {
 		for seed := 1; seed <= 4; seed++ {
-			code, out := call(t, ts, "POST", "/v1/chat/completions", fmt.Sprintf(`{"model":"%s","temperature":1.2,"seed":%d,"max_tokens":120,
-				"tool_choice":"required","tools":%s,"messages":%s}`, model, seed, tools, ask))
+			code, out := call(t, ts, "POST", "/v1/chat/completions", fmt.Sprintf(`{"model":%s,"temperature":1.2,"seed":%d,"max_tokens":120,
+				"tool_choice":"required","tools":%s,"messages":%s}`, jsonQ(model), seed, tools, ask))
 			if code != 200 {
 				t.Fatalf("%d %v", code, out)
 			}
@@ -147,7 +147,7 @@ func TestTools(t *testing.T) {
 		}
 	})
 	t.Run("openai stream", func(t *testing.T) {
-		res, err := http.Post(ts.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"`+model+`","stream":true,
+		res, err := http.Post(ts.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":`+jsonQ(model)+`,"stream":true,
 			"temperature":0,"max_tokens":120,"tools":`+tools+`,"messages":`+ask+`}`))
 		if err != nil {
 			t.Fatal(err)
@@ -196,7 +196,7 @@ func TestTools(t *testing.T) {
 		}
 	})
 	t.Run("ollama", func(t *testing.T) {
-		code, out := call(t, ts, "POST", "/api/chat", `{"model":"`+model+`","stream":false,"options":{"temperature":0,"num_predict":120},
+		code, out := call(t, ts, "POST", "/api/chat", `{"model":`+jsonQ(model)+`,"stream":false,"options":{"temperature":0,"num_predict":120},
 			"tools":`+tools+`,"messages":`+ask+`}`)
 		if code != 200 {
 			t.Fatalf("%d %v", code, out)
@@ -216,7 +216,7 @@ func TestTools(t *testing.T) {
 		}
 		// round trip, Ollama style: the call back with object arguments, then the tool's answer
 		asst, _ := json.Marshal(map[string]any{"role": "assistant", "content": "", "tool_calls": list})
-		code, out = call(t, ts, "POST", "/api/chat", `{"model":"`+model+`","stream":false,"options":{"temperature":0,"num_predict":120},
+		code, out = call(t, ts, "POST", "/api/chat", `{"model":`+jsonQ(model)+`,"stream":false,"options":{"temperature":0,"num_predict":120},
 			"tools":`+tools+`,"messages":[{"role":"user","content":"What's the weather in Paris right now?"},`+string(asst)+
 			`,{"role":"tool","tool_name":"get_weather","content":"{\"temp_c\": 18, \"sky\": \"sunny\"}"}]}`)
 		msg = out["message"].(map[string]any)
@@ -225,7 +225,7 @@ func TestTools(t *testing.T) {
 		}
 	})
 	t.Run("ollama stream", func(t *testing.T) {
-		res, err := http.Post(ts.URL+"/api/chat", "application/json", strings.NewReader(`{"model":"`+model+`",
+		res, err := http.Post(ts.URL+"/api/chat", "application/json", strings.NewReader(`{"model":`+jsonQ(model)+`,
 			"options":{"temperature":0,"num_predict":120},"tools":`+tools+`,"messages":`+ask+`}`))
 		if err != nil {
 			t.Fatal(err)
