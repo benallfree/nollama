@@ -17,7 +17,7 @@ func BenchmarkDecode(b *testing.B) {
 	if th == 0 {
 		th = 8
 	}
-	m, err := Load(p, LoadOptions{Threads: th})
+	m, err := Load(p, LoadOptions{Threads: th, Deterministic: os.Getenv("DETERMINISTIC") != ""}) // DETERMINISTIC=1: deterministic mode
 	if err != nil {
 		b.Fatal(err)
 	}
