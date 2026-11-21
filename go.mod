@@ -1,3 +1,3 @@
 module github.com/benallfree/nollama
 
-go 1.24
+go 1.27
