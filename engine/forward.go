@@ -222,6 +222,11 @@ type state struct {
 	hidden       []float32 // when set (Embed), forward stores the last token's normed hidden state here and skips the LM head
 	bytes        int64     // what it takes in memory (stateBytes), reserved in the model's Resources
 	allLogits    []float32 // when set (Score), forward fills logits for every token, maxN*vocab
+	// Packed sequences (Classify): several short sequences after a shared prefix in one pass. When set, token t is
+	// rotated as position ropePos[t], and attends to slots [0, packBase) and [packStart[t], pos+t], not the other
+	// sequences' slots in between.
+	ropePos, packStart []int
+	packBase           int
 }
 
 // actsBytes is what newActs(maxN, k) allocates.
@@ -303,7 +308,11 @@ func (m *Model) forward(s *state, tokens []int, pos int) {
 	for t, id := range tokens {
 		dequantRow(m.embd.typ, m.embd.row(id), s.x[t*dim:(t+1)*dim])
 		for i := 0; i < half; i++ {
-			th := float64(pos+t) * m.invFrq[i]
+			pp := pos + t
+			if s.ropePos != nil {
+				pp = s.ropePos[t]
+			}
+			th := float64(pp) * m.invFrq[i]
 			s.cos[t*half+i] = float32(math.Cos(th))
 			s.sin[t*half+i] = float32(math.Sin(th))
 		}
@@ -393,6 +402,15 @@ func (m *Model) forward(s *state, tokens []int, pos int) {
 					for j := 0; j < ctx; j++ {
 						row[j] *= scale
 						mx = max(mx, row[j])
+					}
+					if s.packStart != nil { // hide the other packed sequences
+						for j := s.packBase; j < s.packStart[ts[i]]; j++ {
+							row[j] = float32(math.Inf(-1))
+						}
+						mx = float32(math.Inf(-1))
+						for j := 0; j < ctx; j++ {
+							mx = max(mx, row[j])
+						}
 					}
 					var sum float32
 					for j := 0; j < ctx; j++ {

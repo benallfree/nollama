@@ -65,6 +65,23 @@ curl http://127.0.0.1:11434/api/chat -d '{
 }'
 ```
 
+nollama also has an endpoint of its own, `/api/classify`, which returns a probability for each label instead of
+generating text (see [Classify](#classify)):
+
+```bash
+curl http://127.0.0.1:11434/api/classify -d '{
+  "model": "qwen3:1.7b",
+  "system": "Label the support ticket: bug, feature request or billing question.",
+  "prompt": "I was charged twice this month.",
+  "labels": ["bug", "feature request", "billing question"],
+  "complete": true
+}'
+```
+
+It answers `{"label": "billing question", "labels": [{"label": "bug", "probability": 0.000004, "logprob": ..., "tokens": 2}, ...]}`,
+each label's probability, log-probability and token count, in the order given. `prompt` is the user's turn in the chat template (with `system`), or `messages` gives
+the whole conversation; `raw: true` sends `prompt` as is. `normalize`, `options.num_ctx` and `keep_alive` work too.
+
 Or with any OpenAI client:
 
 ```python
@@ -171,6 +188,30 @@ es, _ := m.Embed(ctx, []string{engine.EmbedQuery("", "What is the capital of Chi
 	engine.EmbedOptions{})
 fmt.Println(engine.Cosine(es[0].Vector, es[1].Vector)) // about 0.77
 ```
+
+### Classify
+
+To label something, you don't need the model to write an answer and then parse it. `Classify` reads the prompt once
+and scores each candidate label as the model's answer, so you get a probability for every label, and the answer is
+always one of them:
+
+```go
+prompt := m.ChatPrompt([]engine.Message{
+	{Role: "system", Content: "Label the support ticket: bug, feature request or billing question."},
+	{Role: "user", Content: "I was charged twice this month."},
+})
+res, _ := m.Classify(ctx, prompt, []string{"bug", "feature request", "billing question"},
+	engine.ClassifyOptions{Complete: true})
+fmt.Println(res.Best(), res.Probs) // 2 [0.000004 0.000018 0.99998] with qwen3-1.7b
+```
+
+Labels can be several tokens long. `Complete` scores each label as the whole answer (it must be followed by the end
+of the turn), which matters when one label starts another ("bug", "bug report"); `Normalize` scores per token, so long
+labels aren't penalized. Labels are tokenized on their own, so write them as the answer would start. A one-token label
+costs nothing beyond reading the prompt; the other labels' tokens are read together in one batched pass; and the prompt
+cache skips instructions shared across calls. Labeling a ticket with 5 labels (an 85-token prompt), that's 1.6 to 1.8
+times faster than generating a schema-constrained JSON answer (`go test ./engine -bench Classify`), and you get
+the model's odds for every label instead of one word.
 
 The engine also keeps the start of recent prompts (`LoadOptions.PromptCache`), so a long system prompt is read once,
 and can keep a conversation's state between calls (`GenerateOptions.Thread`).
@@ -390,6 +431,8 @@ OpenAI's API: `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/embe
 `dimensions`, `encoding_format` `float` or `base64`), streaming (with `stream_options.include_usage`)
 and not, `response_format` (`json_object`, `json_schema`), `max_tokens`/`max_completion_tokens`, `temperature`,
 `top_p`, `seed`, `stop`.
+
+nollama's own: `/api/classify` (label probabilities, above).
 
 Not yet: GPUs, model families other than Qwen3, tool calls, images, `/api/create`, thinking mode
 (Qwen3's thinking is always off), and several models loaded at once (nollama holds one and swaps on demand).

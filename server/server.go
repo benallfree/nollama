@@ -143,6 +143,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/delete", s.manage("deleting models", s.cfg.NoDelete, s.deleteModel))
 	mux.HandleFunc("POST /api/generate", s.ollamaGenerate)
 	mux.HandleFunc("POST /api/chat", s.ollamaChat)
+	mux.HandleFunc("POST /api/classify", s.classify) // nollama's own: label probabilities, no generation
 	mux.HandleFunc("POST /api/embed", s.ollamaEmbed)
 	mux.HandleFunc("POST /api/embeddings", s.ollamaEmbeddings)
 	mux.HandleFunc("POST /api/create", s.manage("creating models", false, s.notSupported))

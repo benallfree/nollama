@@ -355,3 +355,50 @@ func TestMemoryBudget(t *testing.T) {
 		t.Errorf("after Close: want the budget still in force, got %v", err)
 	}
 }
+
+// /api/classify on the tiny random-weight model, in every test run, and against a real model when
+// GGUF=/path/to/qwen3-0.6b.gguf is set.
+func TestClassify(t *testing.T) {
+	dir := t.TempDir()
+	if err := tinymodel.Write(filepath.Join(dir, "tiny.gguf"), tinymodel.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	ts := newTest(t, dir)
+	labels := func(out map[string]any) (sum float64, names []string) {
+		ls, _ := out["labels"].([]any)
+		for _, l := range ls {
+			sum += l.(map[string]any)["probability"].(float64)
+			names = append(names, l.(map[string]any)["label"].(string))
+		}
+		return sum, names
+	}
+	code, out := call(t, ts, "POST", "/api/classify", `{"model":"tiny","prompt":"the fox","labels":["dog","fox jumps","lazy dog"],"complete":true}`)
+	if sum, names := labels(out); code != 200 || sum < 0.999 || sum > 1.001 || strings.Join(names, ",") != "dog,fox jumps,lazy dog" {
+		t.Fatalf("tiny: %d %v", code, out)
+	}
+	for _, body := range []string{
+		`{"model":"tiny","prompt":"hi","labels":[]}`,
+		`{"model":"tiny","prompt":"hi","labels":["a",""]}`,
+		`{"model":"tiny","labels":["a"]}`,
+		`{"model":"tiny","prompt":"` + strings.Repeat("word ", 50) + `","labels":["a"],"options":{"num_ctx":8}}`,
+	} {
+		if code, out := call(t, ts, "POST", "/api/classify", body); code != 400 {
+			t.Errorf("%s: %d %v, want 400", body, code, out)
+		}
+	}
+
+	p := os.Getenv("GGUF")
+	if p == "" {
+		return
+	}
+	if err := os.Symlink(p, filepath.Join(dir, "test.gguf")); err != nil {
+		t.Fatal(err)
+	}
+	code, out = call(t, ts, "POST", "/api/classify", `{"model":"test","complete":true,
+		"system":"You label customer support tickets. A bug is something that is broken or crashes. Answer with one label: bug, feature request or billing question.",
+		"prompt":"Bug report: the app crashes and closes every time I press the Save button. It is broken.",
+		"labels":["bug","feature request","billing question"]}`)
+	if sum, _ := labels(out); code != 200 || out["label"] != "bug" || sum < 0.999 || sum > 1.001 {
+		t.Errorf("classify: %d %v", code, out)
+	}
+}
