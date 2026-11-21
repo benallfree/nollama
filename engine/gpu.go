@@ -1,89 +1,104 @@
 package engine
 
 import (
-	_ "embed"
 	"encoding/binary"
 	"errors"
-	"math"
-	"unsafe"
-
-	"github.com/benallfree/nollama/engine/internal/metal"
+	"fmt"
+	"strings"
 )
 
-//go:embed gpu.metal
-var gpuSource string
-
-// gpuKernels are the kernels gpuSource defines.
-var gpuKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "attention_f32"}
-
-// gpu is a model's GPU state: the device, compiled kernels and the mmapped file wrapped as one buffer.
+// GPU backends. forward talks to gpuBackend and gpuBatch only; each GPU API (Metal today, CUDA or Vulkan
+// later) implements them. The contract holds for discrete GPUs too: buffers live on the device and move
+// with write/read, and unified-memory backends make those copies cheap (Metal wraps the mmapped model
+// file instead of uploading it). Every backend runs the same kernels with the same layouts:
+//
+//   - activations are f32, row-major, one row per token;
+//   - weights stay in their GGUF formats, rows as in the file;
+//   - the f32 KV cache keeps the CPU's layout (keys [kvHeads][headDim][ctxP], values [ctxP][kvHeads*headDim]),
+//     so prompt caching and threads work unchanged.
+//
 // Experimental: nothing in forward uses it yet.
-type gpu struct {
-	dev     *metal.Device
-	ps      map[string]*metal.Pipeline
-	weights *metal.Buffer // the whole GGUF file, zero-copy
-	base    uintptr       // address of the file's first byte
+type gpuBackend interface {
+	name() string // "metal (Apple M1 Max)"
+	unified() bool
+	supports(weightType uint32) bool // weights of other types run on the CPU
+	// loadWeights makes the model file's weights available to batches: zero-copy on unified memory,
+	// one upload otherwise. Called once, before any batch.
+	loadWeights(file []byte) error
+	alloc(n int) (gpuBuf, error)
+	write(dst gpuRef, src []byte) // host to device
+	read(src gpuRef, dst []byte)  // device to host
+	batch() gpuBatch
+	close()
 }
 
-func openGPU(g *ggufFile) (*gpu, error) {
-	dev, err := metal.Open()
-	if err != nil {
-		return nil, err
-	}
-	if !dev.Unified {
-		dev.Close()
-		return nil, errors.New("engine: GPU without unified memory isn't supported yet")
-	}
-	ps, err := dev.Compile(gpuSource, gpuKernels...)
-	if err != nil {
-		dev.Close()
-		return nil, err
-	}
-	wb, err := dev.Wrap(g.data)
-	if err != nil {
-		dev.Close()
-		return nil, err
-	}
-	return &gpu{dev: dev, ps: ps, weights: wb, base: uintptr(unsafe.Pointer(unsafe.SliceData(g.data)))}, nil
+// gpuBuf is device memory.
+type gpuBuf interface {
+	size() int
+	release()
 }
 
-func (u *gpu) close() {
-	u.weights.Release()
-	u.dev.Close()
+// gpuRef is a position in a buffer.
+type gpuRef struct {
+	buf gpuBuf
+	off int // bytes
 }
 
-// weightArg is w's bytes as a kernel argument: an offset into the wrapped file.
-func (u *gpu) weightArg(w *weight) metal.Arg {
-	return metal.Arg{Buf: u.weights, Offset: int(uintptr(unsafe.Pointer(unsafe.SliceData(w.data))) - u.base)}
+func (r gpuRef) at(off int) gpuRef { return gpuRef{r.buf, r.off + off} }
+
+// gpuBatch records operations to run in order; submit runs them and waits.
+type gpuBatch interface {
+	// matmul: out[t*w.rows + r] = W row r · x[t*w.cols:], for n tokens. The backend picks its
+	// one-token or tiled kernel by n.
+	matmul(w *weight, x, out gpuRef, n int)
+	// rmsnorm normalizes rows rows of n floats from x into out (may equal x), scaled by w (n floats).
+	rmsnorm(x, w, out gpuRef, rows, n int, eps float64)
+	// rope applies NeoX RoPE in place to x [tokens][heads][headDim] with cos/sin tables [tokens][headDim/2].
+	rope(x, cs, sn gpuRef, tokens, heads, headDim int)
+	swiglu(gate, up, out gpuRef, n int) // out = silu(gate) * up
+	add(x, y gpuRef, n int)             // x += y
+	attention(a gpuAttention)
+	submit() error
 }
 
-// gpuMatvec reports whether matvecDispatch handles weights of type t.
-func gpuMatvec(t uint32) bool { return t == typeQ4_K || t == typeQ8_0 }
+// gpuAttention is one layer's causal attention for n tokens at positions pos..pos+n-1.
+type gpuAttention struct {
+	q, out  gpuRef // [n][heads][headDim]
+	k, v    gpuRef // the layer's cache, in kvType's layout
+	scratch gpuRef // n*heads*ctxP floats
+	mask    gpuRef // n pairs of uint32: positions [lo, hi) token t must not see (packed sequences)
+	kvType  uint32 // typeF32 only, so far
+	n, pos  int
+	heads   int
+	kvHeads int
+	headDim int
+	ctxP    int // cache rows, a multiple of 16
+}
 
-// matvecDispatch computes out[t*rows+r] = W·x[t] for n tokens; x holds n rows of w.cols floats.
-func (u *gpu) matvecDispatch(w *weight, x, out *metal.Buffer, n int) metal.Dispatch {
-	var kernel string
-	var nb int
-	switch w.typ {
-	case typeQ4_K:
-		kernel, nb = "matvec_q4k_f32", w.cols/qk
-	case typeQ8_0:
-		kernel, nb = "matvec_q8_0_f32", w.cols/32
-	default:
-		panic("gpu: matvec supports Q4_K and Q8_0, got " + typeName(w.typ))
+// gpuOpeners are the backends to try, in order of preference.
+var gpuOpeners = []func() (gpuBackend, error){openMetal}
+
+// openGPU returns the first backend that works on this machine, with the model's weights loaded,
+// or an error listing why each failed.
+func openGPU(g *ggufFile) (gpuBackend, error) {
+	var why []string
+	for _, open := range gpuOpeners {
+		b, err := open()
+		if err != nil {
+			why = append(why, err.Error())
+			continue
+		}
+		if err := b.loadWeights(g.data); err != nil {
+			b.close()
+			why = append(why, fmt.Sprintf("%s: %v", b.name(), err))
+			continue
+		}
+		return b, nil
 	}
-	const nsg = 4 // rows (simdgroups) per threadgroup
-	args := make([]byte, 16)
-	binary.LittleEndian.PutUint32(args[0:], uint32(w.rows))
-	binary.LittleEndian.PutUint32(args[4:], uint32(nb))
-	binary.LittleEndian.PutUint32(args[8:], uint32(w.rowBytes))
-	binary.LittleEndian.PutUint32(args[12:], uint32(w.cols))
-	return metal.Dispatch{
-		P:       u.ps[kernel],
-		Args:    []metal.Arg{u.weightArg(w), {Buf: x}, {Buf: out}, {Bytes: args}},
-		Groups:  metal.Size{W: uint((w.rows + nsg - 1) / nsg), H: uint(n), D: 1},
-		Threads: metal.Size{W: 32 * nsg, H: 1, D: 1},
+	if len(why) == 0 {
+		return nil, errors.New("engine: no GPU backends")
 	}
+	return nil, errors.New("engine: no usable GPU: " + strings.Join(why, "; "))
 }
 
 func u32(vs ...uint32) []byte {
@@ -92,68 +107,4 @@ func u32(vs ...uint32) []byte {
 		binary.LittleEndian.PutUint32(b[4*i:], v)
 	}
 	return b
-}
-
-// rmsnormDispatch normalizes rows rows of n floats from x into out (may be x), scaled by w (n floats).
-func (u *gpu) rmsnormDispatch(x, w, out metal.Arg, rows, n int, eps float64) metal.Dispatch {
-	p := u.ps["rmsnorm_f32"]
-	nt := min(p.MaxThreads, 1024, (n+31)&^31)
-	return metal.Dispatch{
-		P:       p,
-		Args:    []metal.Arg{x, w, out, {Bytes: u32(uint32(n), math.Float32bits(float32(eps)))}},
-		Groups:  metal.Size{W: uint(rows), H: 1, D: 1},
-		Threads: metal.Size{W: uint(nt), H: 1, D: 1},
-		Shared:  32 * 4,
-	}
-}
-
-// ropeDispatch applies NeoX RoPE in place to x ([tokens][heads][headDim]) with per-token cos/sin tables.
-func (u *gpu) ropeDispatch(x, cs, sn metal.Arg, tokens, heads, headDim int) metal.Dispatch {
-	half := headDim / 2
-	tw := min(half, 64)
-	return metal.Dispatch{
-		P:       u.ps["rope_neox_f32"],
-		Args:    []metal.Arg{x, cs, sn, {Bytes: u32(uint32(heads), uint32(headDim))}},
-		Groups:  metal.Size{W: uint((half + tw - 1) / tw), H: uint(heads), D: uint(tokens)},
-		Threads: metal.Size{W: uint(tw), H: 1, D: 1},
-	}
-}
-
-// elementwise is a 1-D dispatch over n elements.
-func (u *gpu) elementwise(kernel string, n int, args ...metal.Arg) metal.Dispatch {
-	args = append(args, metal.Arg{Bytes: u32(uint32(n))})
-	return metal.Dispatch{
-		P:       u.ps[kernel],
-		Args:    args,
-		Groups:  metal.Size{W: uint((n + 255) / 256), H: 1, D: 1},
-		Threads: metal.Size{W: 256, H: 1, D: 1},
-	}
-}
-
-// matmulDispatch is matvecDispatch for a batch of tokens with the tiled kernel (Q8_0 only so far).
-func (u *gpu) matmulDispatch(w *weight, x, out *metal.Buffer, n int) metal.Dispatch {
-	if w.typ != typeQ8_0 {
-		return u.matvecDispatch(w, x, out, n)
-	}
-	return metal.Dispatch{
-		P:       u.ps["matmul_q8_0_f32"],
-		Args:    []metal.Arg{u.weightArg(w), {Buf: x}, {Buf: out}, {Bytes: u32(uint32(w.rows), uint32(w.cols/32), uint32(w.rowBytes), uint32(w.cols), uint32(n))}},
-		Groups:  metal.Size{W: uint((w.rows + 31) / 32), H: uint((n + 31) / 32), D: 1},
-		Threads: metal.Size{W: 128, H: 1, D: 1},
-		Shared:  2 * 1024 * 4,
-	}
-}
-
-// attentionDispatch runs causal attention for n tokens at positions pos.. over one layer's f32 cache
-// (kT [kvHeads][headDim][ctxP], v [ctxP][kvHeads*headDim]). mask holds n uint32 pairs: the positions
-// [lo, hi) each token must not see (packed sequences), or zeros. sc is scratch of n*heads*ctxP floats.
-func (u *gpu) attentionDispatch(q, kT, v, out, sc, mask metal.Arg, n, pos, heads, kvHeads, headDim, ctxP int) metal.Dispatch {
-	const nt = 256
-	return metal.Dispatch{
-		P:       u.ps["attention_f32"],
-		Args:    []metal.Arg{q, kT, v, out, sc, mask, {Bytes: u32(uint32(heads), uint32(kvHeads), uint32(headDim), uint32(ctxP), uint32(pos), math.Float32bits(float32(1/math.Sqrt(float64(headDim)))))}},
-		Groups:  metal.Size{W: uint(heads), H: uint(n), D: 1},
-		Threads: metal.Size{W: nt, H: 1, D: 1},
-		Shared:  4 * (headDim + nt),
-	}
 }

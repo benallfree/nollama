@@ -10,8 +10,6 @@ import (
 	"testing"
 	"time"
 	"unsafe"
-
-	"github.com/benallfree/nollama/engine/internal/metal"
 )
 
 // testGGUF returns GGUF, or the cached qwen3-1.7b, or skips.
@@ -39,40 +37,90 @@ func getFloat(b []byte, i int) float32 {
 	return math.Float32frombits(binary.LittleEndian.Uint32(b[4*i:]))
 }
 
-// checkMatvec runs u.matvecDispatch for 1 and n tokens of random input and checks it against a float64
-// reference over the dequantized weights. It returns the worst error relative to the row's magnitude.
-func checkMatvec(t *testing.T, u *gpu, w *weight, r *rand.Rand) {
+// testBackend opens the first GPU backend that works here (with no weights), or skips.
+func testBackend(t *testing.T) gpuBackend {
 	t.Helper()
-	const n = 5
-	x := make([]float32, n*w.cols)
-	for i := range x {
-		x[i] = float32(r.NormFloat64())
-	}
-	xb, _ := u.dev.NewBuffer(4 * len(x))
-	ob, _ := u.dev.NewBuffer(4 * n * w.rows)
-	defer xb.Release()
-	defer ob.Release()
-	putFloats(xb.Bytes(), x)
-	tmp := make([]float32, w.cols)
-	for _, nt := range []int{1, n} {
-		if err := u.dev.Run(u.matvecDispatch(w, xb, ob, nt)); err != nil {
-			t.Fatal(err)
+	for _, open := range gpuOpeners {
+		if b, err := open(); err == nil {
+			t.Cleanup(b.close)
+			return b
 		}
-		var worst float64
-		for tk := 0; tk < nt; tk++ {
-			for row := 0; row < w.rows; row++ {
-				dequantRow(w.typ, w.row(row), tmp)
-				var ref, mag float64
-				for i, v := range tmp {
-					p := float64(v) * float64(x[tk*w.cols+i])
-					ref += p
-					mag += math.Abs(p)
-				}
-				got := float64(getFloat(ob.Bytes(), tk*w.rows+row))
-				if e := math.Abs(got-ref) / max(mag, 1e-6); e > worst {
-					worst = e
-				}
+	}
+	t.Skip("no GPU backend works here")
+	return nil
+}
+
+// alignedBytes returns n zero bytes starting on a page boundary (loadWeights can wrap them without copying).
+func alignedBytes(n int) []byte {
+	page := os.Getpagesize()
+	b := make([]byte, n+2*page)
+	off := (page - int(uintptr(unsafe.Pointer(&b[0]))%uintptr(page))) % page
+	return b[off : off+n : off+n+page]
+}
+
+func upload(t *testing.T, b gpuBackend, x []float32) gpuRef {
+	t.Helper()
+	buf, err := b.alloc(4 * max(len(x), 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(buf.release)
+	raw := make([]byte, 4*len(x))
+	putFloats(raw, x)
+	r := gpuRef{buf: buf}
+	b.write(r, raw)
+	return r
+}
+
+func zeros(t *testing.T, b gpuBackend, n int) gpuRef { return upload(t, b, make([]float32, n)) }
+
+func download(b gpuBackend, r gpuRef, n int) []float32 {
+	raw := make([]byte, 4*n)
+	b.read(r, raw)
+	return floatsOf(raw, n)
+}
+
+func submit(t *testing.T, bt gpuBatch) {
+	t.Helper()
+	if err := bt.submit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// refMatmul is out[t][r] = W row r · x[t] in float64 over the dequantized weights, and each output's
+// sum of |products| (the scale its rounding error is measured against).
+func refMatmul(w *weight, x []float32, n int) (out, mag []float64) {
+	out, mag = make([]float64, n*w.rows), make([]float64, n*w.rows)
+	tmp := make([]float32, w.cols)
+	for row := 0; row < w.rows; row++ {
+		dequantRow(w.typ, w.row(row), tmp)
+		for tk := 0; tk < n; tk++ {
+			for i, v := range tmp {
+				p := float64(v) * float64(x[tk*w.cols+i])
+				out[tk*w.rows+row] += p
+				mag[tk*w.rows+row] += math.Abs(p)
 			}
+		}
+	}
+	return out, mag
+}
+
+// checkMatmul runs the backend's matmul for 1, 5 and 45 tokens of random input (one-token and tiled kernels)
+// and checks it against refMatmul.
+func checkMatmul(t *testing.T, b gpuBackend, w *weight, r *rand.Rand) {
+	t.Helper()
+	const n = 45
+	x := randFloats(r, n*w.cols)
+	xr, or := upload(t, b, x), zeros(t, b, n*w.rows)
+	ref, mag := refMatmul(w, x, n)
+	for _, nt := range []int{1, 5, n} {
+		bt := b.batch()
+		bt.matmul(w, xr, or, nt)
+		submit(t, bt)
+		got := download(b, or, nt*w.rows)
+		var worst float64
+		for i := range got {
+			worst = max(worst, math.Abs(float64(got[i])-ref[i])/max(mag[i], 1e-6))
 		}
 		t.Logf("%s %dx%d, %d token(s): worst error %.1e of the row's magnitude", typeName(w.typ), w.rows, w.cols, nt, worst)
 		if worst > 1e-5 {
@@ -81,105 +129,112 @@ func checkMatvec(t *testing.T, u *gpu, w *weight, r *rand.Rand) {
 	}
 }
 
-// TestGPUMatvecQ4KSynthetic checks the Q4_K kernel on random blocks (the default models are Q8_0).
-func TestGPUMatvecQ4KSynthetic(t *testing.T) {
-	dev, err := metal.Open()
-	if err != nil {
-		t.Skip(err)
-	}
-	ps, err := dev.Compile(gpuSource, gpuKernels...)
-	if err != nil {
-		t.Fatal(err)
+// TestGPUMatmulQ4KSynthetic checks Q4_K on random blocks (the default models are Q8_0).
+func TestGPUMatmulQ4KSynthetic(t *testing.T) {
+	b := testBackend(t)
+	if !b.supports(typeQ4_K) {
+		t.Skip(b.name() + " has no Q4_K")
 	}
 	r := rand.New(rand.NewPCG(5, 6))
 	const rows, nb = 77, 8
-	blocks := randBlocks(r, rows*nb, q4kBytes, []int{0, 2})
-	wb, _ := dev.NewBuffer(len(blocks))
-	copy(wb.Bytes(), blocks)
-	u := &gpu{dev: dev, ps: ps, weights: wb, base: uintptr(unsafe.Pointer(unsafe.SliceData(wb.Bytes())))}
-	defer u.close()
-	checkMatvec(t, u, &weight{typ: typeQ4_K, cols: nb * qk, rows: rows, rowBytes: nb * q4kBytes, data: wb.Bytes()}, r)
+	file := alignedBytes(rows * nb * q4kBytes)
+	copy(file, randBlocks(r, rows*nb, q4kBytes, []int{0, 2}))
+	if err := b.loadWeights(file); err != nil {
+		t.Fatal(err)
+	}
+	checkMatmul(t, b, &weight{typ: typeQ4_K, cols: nb * qk, rows: rows, rowBytes: nb * q4kBytes, data: file}, r)
 }
 
-// TestGPUMatvec checks the matvec kernels on a real model's weights, wrapped zero-copy from the
-// mmapped file, and compares one decode step's matrix work on the GPU with the CPU.
-func TestGPUMatvec(t *testing.T) {
+// openModelGPU loads the test model and opens a backend with its weights, or skips.
+func openModelGPU(t *testing.T) (*Model, gpuBackend) {
 	m, err := Load(testGGUF(t), LoadOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer m.Close()
-	u, err := openGPU(m.g)
+	t.Cleanup(func() { m.Close() })
+	b, err := openGPU(m.g)
 	if err != nil {
 		t.Skip(err)
 	}
-	defer u.close()
-	t.Logf("device %s, file %d MB wrapped without copying", u.dev.Name, len(m.g.data)>>20)
+	t.Cleanup(b.close)
+	return m, b
+}
 
+// TestGPUMatmul checks matmul on a real model's weights (one-token and tiled kernels) and times one decode
+// step's matrix work against the CPU, and a 512-token prompt's.
+func TestGPUMatmul(t *testing.T) {
+	m, b := openModelGPU(t)
+	t.Logf("%s, file %d MB, unified=%v", b.name(), len(m.g.data)>>20, b.unified())
 	var ws []*weight
 	for _, l := range m.layers {
 		for _, w := range []*weight{l.wq, l.wk, l.wv, l.wo, l.wgate, l.wup, l.wdown} {
-			if gpuMatvec(w.typ) {
+			if b.supports(w.typ) {
 				ws = append(ws, w)
 			}
 		}
 	}
-	if gpuMatvec(m.out.typ) {
-		ws = append(ws, m.out)
-	}
 	if len(ws) == 0 {
-		t.Skip("no weights of a type the GPU handles")
+		t.Skip("no weights of a type " + b.name() + " handles")
 	}
 	r := rand.New(rand.NewPCG(3, 4))
 	l := m.layers[len(m.layers)-1]
 	for _, w := range []*weight{l.wk, l.wdown} {
-		if gpuMatvec(w.typ) {
-			checkMatvec(t, u, w, r)
+		if b.supports(w.typ) {
+			checkMatmul(t, b, w, r)
 		}
 	}
-
-	// Speed: every layer matrix plus the output projection once, as in one decode step.
+	if testing.Short() {
+		return
+	}
+	if b.supports(m.out.typ) {
+		ws = append(ws, m.out)
+	}
 	maxRows, maxCols, bytes := 0, 0, 0
 	for _, w := range ws {
 		maxRows, maxCols = max(maxRows, w.rows), max(maxCols, w.cols)
 		bytes += len(w.data)
 	}
-	xb, _ := u.dev.NewBuffer(4 * maxCols)
-	ob, _ := u.dev.NewBuffer(4 * maxRows)
-	defer xb.Release()
-	defer ob.Release()
-	ds := make([]metal.Dispatch, len(ws))
-	for i, w := range ws {
-		ds[i] = u.matvecDispatch(w, xb, ob, 1)
-	}
-	const iters = 10
-	_ = u.dev.Run(ds...)
-	t0 := time.Now()
-	for i := 0; i < iters; i++ {
-		if err := u.dev.Run(ds...); err != nil {
-			t.Fatal(err)
+	const prompt = 512
+	xr, or := upload(t, b, randFloats(r, prompt*maxCols)), zeros(t, b, prompt*maxRows)
+	timeIt := func(n int, ws []*weight) time.Duration {
+		run := func() {
+			bt := b.batch()
+			for _, w := range ws {
+				bt.matmul(w, xr, or, n)
+			}
+			submit(t, bt)
 		}
+		run()
+		t0 := time.Now()
+		const iters = 3
+		for i := 0; i < iters; i++ {
+			run()
+		}
+		return time.Since(t0) / iters
 	}
-	gpuT := time.Since(t0) / iters
-
+	gpuT := timeIt(1, ws)
 	a := newActs(1, maxCols)
 	out := make([]float32, maxRows)
-	cpu := func() {
-		for _, w := range ws {
-			a.k, a.n = w.cols, 1
-			a.quantize(m.pool, w)
-			m.matmul(m.pool, a, 0, mmSeg{w, out, w.rows})
-		}
+	t0 := time.Now()
+	for _, w := range ws {
+		a.k, a.n = w.cols, 1
+		a.quantize(m.pool, w)
+		m.matmul(m.pool, a, 0, mmSeg{w, out, w.rows})
 	}
-	cpu()
-	t0 = time.Now()
-	for i := 0; i < iters; i++ {
-		cpu()
-	}
-	cpuT := time.Since(t0) / iters
+	cpuT := time.Since(t0)
 	gb := func(d time.Duration) float64 { return float64(bytes) / d.Seconds() / 1e9 }
-	t.Logf("decode-step matrices (%d, %d MB): GPU %v (%.0f GB/s), CPU %v (%.0f GB/s, %d threads)",
+	t.Logf("decode step (%d matrices, %d MB): GPU %v (%.0f GB/s), CPU %v (%.0f GB/s, %d threads)",
 		len(ws), bytes>>20, gpuT.Round(time.Microsecond), gb(gpuT), cpuT.Round(time.Microsecond), gb(cpuT), m.pool.n)
+	layers := ws[:len(ws)-1]
+	if !b.supports(m.out.typ) {
+		layers = ws
+	}
+	var flops float64
+	for _, w := range layers {
+		flops += 2 * float64(w.rows) * float64(w.cols) * prompt
+	}
+	d := timeIt(prompt, layers)
+	t.Logf("%d-token prompt, layer matrices: %v (%.1f TFLOPS)", prompt, d.Round(time.Millisecond), flops/d.Seconds()/1e12)
 }
 
 func randFloats(r *rand.Rand, n int) []float32 {
@@ -213,37 +268,22 @@ func maxRelDiff(t *testing.T, what string, got, want []float32, tol float64) {
 
 // TestGPUElementwise checks rmsnorm (whole rows and per-head), RoPE, SwiGLU and add against the CPU code.
 func TestGPUElementwise(t *testing.T) {
-	dev, err := metal.Open()
-	if err != nil {
-		t.Skip(err)
-	}
-	ps, err := dev.Compile(gpuSource, gpuKernels...)
-	if err != nil {
-		t.Fatal(err)
-	}
-	u := &gpu{dev: dev, ps: ps}
-	defer dev.Close()
+	b := testBackend(t)
 	r := rand.New(rand.NewPCG(7, 8))
-	buf := func(x []float32) *metal.Buffer {
-		b, _ := dev.NewBuffer(4 * len(x))
-		putFloats(b.Bytes(), x)
-		return b
-	}
+	buf := func(x []float32) gpuRef { return upload(t, b, x) }
 
 	// rmsnorm: 3 rows of 2048 (hidden state), then 3*16 rows of 128 (QK-norm per head), in place.
 	for _, c := range []struct{ rows, n int }{{3, 2048}, {48, 128}} {
 		x, w := randFloats(r, c.rows*c.n), randFloats(r, c.n)
 		xb, wb := buf(x), buf(w)
-		if err := dev.Run(u.rmsnormDispatch(metal.Arg{Buf: xb}, metal.Arg{Buf: wb}, metal.Arg{Buf: xb}, c.rows, c.n, 1e-6)); err != nil {
-			t.Fatal(err)
-		}
+		bt := b.batch()
+		bt.rmsnorm(xb, wb, xb, c.rows, c.n, 1e-6)
+		submit(t, bt)
 		want := make([]float32, len(x))
 		for i := 0; i < c.rows; i++ {
 			rmsnorm(want[i*c.n:(i+1)*c.n], x[i*c.n:(i+1)*c.n], w, 1e-6)
 		}
-		maxRelDiff(t, fmt.Sprintf("rmsnorm %dx%d", c.rows, c.n), floatsOf(xb.Bytes(), len(x)), want, 1e-5)
-		xb.Release()
-		wb.Release()
+		maxRelDiff(t, fmt.Sprintf("rmsnorm %dx%d", c.rows, c.n), download(b, xb, len(x)), want, 1e-5)
 	}
 
 	// RoPE: 3 tokens x 16 heads x 128.
@@ -257,9 +297,9 @@ func TestGPUElementwise(t *testing.T) {
 		}
 	}
 	xb, cb, sb := buf(x), buf(cs), buf(sn)
-	if err := dev.Run(u.ropeDispatch(metal.Arg{Buf: xb}, metal.Arg{Buf: cb}, metal.Arg{Buf: sb}, tokens, heads, hd)); err != nil {
-		t.Fatal(err)
-	}
+	bt := b.batch()
+	bt.rope(xb, cb, sb, tokens, heads, hd)
+	submit(t, bt)
 	want := append([]float32(nil), x...)
 	for tk := 0; tk < tokens; tk++ {
 		for h := 0; h < heads; h++ {
@@ -267,110 +307,29 @@ func TestGPUElementwise(t *testing.T) {
 			rope(v, cs[tk*hd/2:(tk+1)*hd/2], sn[tk*hd/2:(tk+1)*hd/2])
 		}
 	}
-	maxRelDiff(t, "rope", floatsOf(xb.Bytes(), len(x)), want, 1e-6)
+	maxRelDiff(t, "rope", download(b, xb, len(x)), want, 1e-6)
 
 	// SwiGLU and add over 6144*3.
 	n := 3 * 6144
 	g, up := randFloats(r, n), randFloats(r, n)
 	gb, ub, ob := buf(g), buf(up), buf(make([]float32, n))
-	if err := dev.Run(u.elementwise("swiglu_f32", n, metal.Arg{Buf: gb}, metal.Arg{Buf: ub}, metal.Arg{Buf: ob}),
-		u.elementwise("add_f32", n, metal.Arg{Buf: gb}, metal.Arg{Buf: ub})); err != nil {
-		t.Fatal(err)
-	}
+	bt = b.batch()
+	bt.swiglu(gb, ub, ob, n)
+	bt.add(gb, ub, n)
+	submit(t, bt)
 	sw, ad := make([]float32, n), make([]float32, n)
 	for i := range sw {
 		sw[i] = g[i] / (1 + expf(-g[i])) * up[i]
 		ad[i] = g[i] + up[i]
 	}
-	maxRelDiff(t, "swiglu", floatsOf(ob.Bytes(), n), sw, 1e-5)
-	maxRelDiff(t, "add", floatsOf(gb.Bytes(), n), ad, 0)
-}
-
-// TestGPUMatmul checks the tiled batch kernel against matvec on real Q8_0 weights (including a token
-// count that isn't a multiple of 32) and times a 512-token prompt's matrix work with both.
-func TestGPUMatmul(t *testing.T) {
-	m, err := Load(testGGUF(t), LoadOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Close()
-	u, err := openGPU(m.g)
-	if err != nil {
-		t.Skip(err)
-	}
-	defer u.close()
-	l := m.layers[0]
-	if l.wq.typ != typeQ8_0 {
-		t.Skip("model isn't Q8_0")
-	}
-	r := rand.New(rand.NewPCG(9, 10))
-	for _, w := range []*weight{l.wk, l.wdown} {
-		const n = 45
-		xb, _ := u.dev.NewBuffer(4 * n * w.cols)
-		putFloats(xb.Bytes(), randFloats(r, n*w.cols))
-		vb, _ := u.dev.NewBuffer(4 * n * w.rows)
-		mb, _ := u.dev.NewBuffer(4 * n * w.rows)
-		if err := u.dev.Run(u.matvecDispatch(w, xb, vb, n), u.matmulDispatch(w, xb, mb, n)); err != nil {
-			t.Fatal(err)
-		}
-		maxRelDiff(t, fmt.Sprintf("matmul vs matvec %dx%d, %d tokens", w.rows, w.cols, n),
-			floatsOf(mb.Bytes(), n*w.rows), floatsOf(vb.Bytes(), n*w.rows), 1e-4)
-		xb.Release()
-		vb.Release()
-		mb.Release()
-	}
-
-	// Speed: the layer matrices (not the output projection) for a 512-token prompt.
-	const n = 512
-	var ws []*weight
-	maxRows, maxCols, flops := 0, 0, 0.0
-	for _, l := range m.layers {
-		for _, w := range []*weight{l.wq, l.wk, l.wv, l.wo, l.wgate, l.wup, l.wdown} {
-			ws = append(ws, w)
-			maxRows, maxCols = max(maxRows, w.rows), max(maxCols, w.cols)
-			flops += 2 * float64(w.rows) * float64(w.cols) * n
-		}
-	}
-	xb, _ := u.dev.NewBuffer(4 * n * maxCols)
-	ob, _ := u.dev.NewBuffer(4 * n * maxRows)
-	defer xb.Release()
-	defer ob.Release()
-	putFloats(xb.Bytes(), randFloats(r, n*maxCols))
-	for _, c := range []struct {
-		name string
-		f    func(*weight, *metal.Buffer, *metal.Buffer, int) metal.Dispatch
-	}{{"matvec", u.matvecDispatch}, {"matmul", u.matmulDispatch}} {
-		ds := make([]metal.Dispatch, len(ws))
-		for i, w := range ws {
-			ds[i] = c.f(w, xb, ob, n)
-		}
-		_ = u.dev.Run(ds...)
-		t0 := time.Now()
-		const iters = 3
-		for i := 0; i < iters; i++ {
-			if err := u.dev.Run(ds...); err != nil {
-				t.Fatal(err)
-			}
-		}
-		d := time.Since(t0) / iters
-		t.Logf("%d-token prompt, layer matrices, %s: %v (%.1f TFLOPS, %.0f tokens/s for this part)",
-			n, c.name, d.Round(time.Millisecond), flops/d.Seconds()/1e12, n/d.Seconds())
-	}
+	maxRelDiff(t, "swiglu", download(b, ob, n), sw, 1e-5)
+	maxRelDiff(t, "add", download(b, gb, n), ad, 0)
 }
 
 // TestGPUAttention checks attention over the f32 cache against a float64 reference, with and without a
 // packed-sequence mask, for a batch of tokens appended after earlier positions (GQA: 16 query heads on 8 KV heads).
 func TestGPUAttention(t *testing.T) {
-	dev, err := metal.Open()
-	if err != nil {
-		t.Skip(err)
-	}
-	ps, err := dev.Compile(gpuSource, gpuKernels...)
-	if err != nil {
-		t.Fatal(err)
-	}
-	u := &gpu{dev: dev, ps: ps}
-	defer dev.Close()
+	b := testBackend(t)
 	r := rand.New(rand.NewPCG(11, 12))
 	const heads, kvHeads, hd, pos, n = 16, 8, 128, 37, 5
 	ctxP := (pos + n + 15) &^ 15
@@ -378,11 +337,7 @@ func TestGPUAttention(t *testing.T) {
 	q := randFloats(r, n*heads*hd)
 	kT := randFloats(r, kvHeads*hd*ctxP)
 	v := randFloats(r, ctxP*kvd)
-	buf := func(x []float32) *metal.Buffer {
-		b, _ := dev.NewBuffer(4 * len(x))
-		putFloats(b.Bytes(), x)
-		return b
-	}
+	buf := func(x []float32) gpuRef { return upload(t, b, x) }
 	qb, kb, vb := buf(q), buf(kT), buf(v)
 	ob, sb := buf(make([]float32, n*heads*hd)), buf(make([]float32, n*heads*ctxP))
 	for _, masked := range []bool{false, true} {
@@ -395,12 +350,12 @@ func TestGPUAttention(t *testing.T) {
 				binary.LittleEndian.PutUint32(mask[8*tk+4:], pos+2)
 			}
 		}
-		mb, _ := dev.NewBuffer(len(mask))
-		copy(mb.Bytes(), mask)
-		if err := dev.Run(u.attentionDispatch(metal.Arg{Buf: qb}, metal.Arg{Buf: kb}, metal.Arg{Buf: vb}, metal.Arg{Buf: ob},
-			metal.Arg{Buf: sb}, metal.Arg{Buf: mb}, n, pos, heads, kvHeads, hd, ctxP)); err != nil {
-			t.Fatal(err)
-		}
+		mb := zeros(t, b, 2*n)
+		b.write(mb, mask)
+		bt := b.batch()
+		bt.attention(gpuAttention{q: qb, out: ob, k: kb, v: vb, scratch: sb, mask: mb, kvType: typeF32,
+			n: n, pos: pos, heads: heads, kvHeads: kvHeads, headDim: hd, ctxP: ctxP})
+		submit(t, bt)
 		want := make([]float32, n*heads*hd)
 		for tk := 0; tk < n; tk++ {
 			for h := 0; h < heads; h++ {
@@ -433,7 +388,6 @@ func TestGPUAttention(t *testing.T) {
 				}
 			}
 		}
-		maxRelDiff(t, fmt.Sprintf("attention, masked=%v", masked), floatsOf(ob.Bytes(), len(want)), want, 1e-5)
-		mb.Release()
+		maxRelDiff(t, fmt.Sprintf("attention, masked=%v", masked), download(b, ob, len(want)), want, 1e-5)
 	}
 }
