@@ -274,3 +274,110 @@ kernel void matmul_q8_0_f32(device const uchar *w [[buffer(0)]],
 		}
 	}
 }
+
+// attention_f32: causal attention over the f32 KV cache, one threadgroup per (token, query head).
+// q and out are [tokens][heads][headDim]; kT is one layer's keys transposed, [kvHeads][headDim][ctxP];
+// v is [ctxP][kvHeads*headDim]. Token t sits at position pos+t and sees positions [0, pos+t], minus the
+// masked range [mask[t].x, mask[t].y) (packed sequences hide each other; {0,0} hides nothing).
+// sc is scratch for the scores, [tokens*heads][ctxP]. Threadgroup memory: headDim + 2*threads floats.
+struct AttnArgs {
+	uint heads;
+	uint kvHeads;
+	uint headDim;
+	uint ctxP;
+	uint pos;
+	float scale;
+};
+
+kernel void attention_f32(device const float *q [[buffer(0)]],
+                          device const float *kT [[buffer(1)]],
+                          device const float *v [[buffer(2)]],
+                          device float *out [[buffer(3)]],
+                          device float *sc [[buffer(4)]],
+                          device const uint2 *mask [[buffer(5)]],
+                          constant AttnArgs &a [[buffer(6)]],
+                          threadgroup float *shm [[threadgroup(0)]],
+                          uint2 tg [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]],
+                          uint2 ntg [[threads_per_threadgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]],
+                          uint nsg [[simdgroups_per_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+	uint nt = ntg.x;
+	uint h = tg.x, t = tg.y;
+	uint hd = a.headDim, kvh = h / (a.heads / a.kvHeads), kvd = a.kvHeads * hd;
+	uint ctx = a.pos + t + 1;
+	uint2 m = mask[t];
+	threadgroup float *qs = shm;           // [headDim]
+	threadgroup float *red = shm + hd;     // [threads] reduction scratch
+	device float *s = sc + ((ulong)t * a.heads + h) * a.ctxP;
+	device const float *qh = q + ((ulong)t * a.heads + h) * hd;
+	for (uint d = tid; d < hd; d += nt) {
+		qs[d] = qh[d];
+	}
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+
+	// scores and their max
+	device const float *kh = kT + (ulong)kvh * hd * a.ctxP;
+	float mx = -INFINITY;
+	for (uint j = tid; j < ctx; j += nt) {
+		float x = -INFINITY;
+		if (j < m.x || j >= m.y) {
+			x = 0;
+			for (uint d = 0; d < hd; d++) {
+				x += qs[d] * kh[(ulong)d * a.ctxP + j];
+			}
+			x *= a.scale;
+		}
+		s[j] = x;
+		mx = max(mx, x);
+	}
+	mx = simd_max(mx);
+	if (lane == 0) {
+		red[sg] = mx;
+	}
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+	mx = red[0];
+	for (uint i = 1; i < nsg; i++) {
+		mx = max(mx, red[i]);
+	}
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+
+	// softmax numerators and their sum
+	float sum = 0;
+	for (uint j = tid; j < ctx; j += nt) {
+		float e = exp(s[j] - mx);
+		s[j] = e;
+		sum += e;
+	}
+	sum = simd_sum(sum);
+	if (lane == 0) {
+		red[sg] = sum;
+	}
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+	sum = 0;
+	for (uint i = 0; i < nsg; i++) {
+		sum += red[i];
+	}
+	float inv = 1 / sum;
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+
+	// weighted sum of values: thread (d, part) sums positions part, part+parts, ... for channel d
+	uint parts = nt / hd, d = tid % hd, part = tid / hd;
+	float o = 0;
+	if (part < parts) {
+		device const float *vh = v + kvh * hd + d;
+		for (uint j = part; j < ctx; j += parts) {
+			o += s[j] * vh[(ulong)j * kvd];
+		}
+	}
+	red[tid] = o;
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+	if (tid < hd) {
+		float acc = 0;
+		for (uint p = 0; p < parts; p++) {
+			acc += red[p * hd + tid];
+		}
+		out[((ulong)t * a.heads + h) * hd + tid] = acc * inv;
+	}
+}

@@ -357,3 +357,83 @@ func TestGPUMatmul(t *testing.T) {
 			n, c.name, d.Round(time.Millisecond), flops/d.Seconds()/1e12, n/d.Seconds())
 	}
 }
+
+// TestGPUAttention checks attention over the f32 cache against a float64 reference, with and without a
+// packed-sequence mask, for a batch of tokens appended after earlier positions (GQA: 16 query heads on 8 KV heads).
+func TestGPUAttention(t *testing.T) {
+	dev, err := metal.Open()
+	if err != nil {
+		t.Skip(err)
+	}
+	ps, err := dev.Compile(gpuSource, gpuKernels...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := &gpu{dev: dev, ps: ps}
+	defer dev.Close()
+	r := rand.New(rand.NewPCG(11, 12))
+	const heads, kvHeads, hd, pos, n = 16, 8, 128, 37, 5
+	ctxP := (pos + n + 15) &^ 15
+	kvd := kvHeads * hd
+	q := randFloats(r, n*heads*hd)
+	kT := randFloats(r, kvHeads*hd*ctxP)
+	v := randFloats(r, ctxP*kvd)
+	buf := func(x []float32) *metal.Buffer {
+		b, _ := dev.NewBuffer(4 * len(x))
+		putFloats(b.Bytes(), x)
+		return b
+	}
+	qb, kb, vb := buf(q), buf(kT), buf(v)
+	ob, sb := buf(make([]float32, n*heads*hd)), buf(make([]float32, n*heads*ctxP))
+	for _, masked := range []bool{false, true} {
+		mask := make([]byte, 8*n)
+		lo, hi := make([]int, n), make([]int, n)
+		if masked { // tokens 2.. start a new packed sequence at position pos+2; positions [10, pos+2) are another's
+			for tk := 2; tk < n; tk++ {
+				lo[tk], hi[tk] = 10, pos+2
+				binary.LittleEndian.PutUint32(mask[8*tk:], 10)
+				binary.LittleEndian.PutUint32(mask[8*tk+4:], pos+2)
+			}
+		}
+		mb, _ := dev.NewBuffer(len(mask))
+		copy(mb.Bytes(), mask)
+		if err := dev.Run(u.attentionDispatch(metal.Arg{Buf: qb}, metal.Arg{Buf: kb}, metal.Arg{Buf: vb}, metal.Arg{Buf: ob},
+			metal.Arg{Buf: sb}, metal.Arg{Buf: mb}, n, pos, heads, kvHeads, hd, ctxP)); err != nil {
+			t.Fatal(err)
+		}
+		want := make([]float32, n*heads*hd)
+		for tk := 0; tk < n; tk++ {
+			for h := 0; h < heads; h++ {
+				kvh := h / (heads / kvHeads)
+				ctx := pos + tk + 1
+				sc := make([]float64, ctx)
+				mx := math.Inf(-1)
+				for j := 0; j < ctx; j++ {
+					if j >= lo[tk] && j < hi[tk] {
+						sc[j] = math.Inf(-1)
+						continue
+					}
+					for d := 0; d < hd; d++ {
+						sc[j] += float64(q[(tk*heads+h)*hd+d]) * float64(kT[(kvh*hd+d)*ctxP+j])
+					}
+					sc[j] /= math.Sqrt(hd)
+					mx = math.Max(mx, sc[j])
+				}
+				var sum float64
+				for j := range sc {
+					sc[j] = math.Exp(sc[j] - mx)
+					sum += sc[j]
+				}
+				for d := 0; d < hd; d++ {
+					var o float64
+					for j := range sc {
+						o += sc[j] / sum * float64(v[j*kvd+kvh*hd+d])
+					}
+					want[(tk*heads+h)*hd+d] = float32(o)
+				}
+			}
+		}
+		maxRelDiff(t, fmt.Sprintf("attention, masked=%v", masked), floatsOf(ob.Bytes(), len(want)), want, 1e-5)
+		mb.Release()
+	}
+}

@@ -14,7 +14,7 @@ import (
 var gpuSource string
 
 // gpuKernels are the kernels gpuSource defines.
-var gpuKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32"}
+var gpuKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "attention_f32"}
 
 // gpu is a model's GPU state: the device, compiled kernels and the mmapped file wrapped as one buffer.
 // Experimental: nothing in forward uses it yet.
@@ -141,5 +141,19 @@ func (u *gpu) matmulDispatch(w *weight, x, out *metal.Buffer, n int) metal.Dispa
 		Groups:  metal.Size{W: uint((w.rows + 31) / 32), H: uint((n + 31) / 32), D: 1},
 		Threads: metal.Size{W: 128, H: 1, D: 1},
 		Shared:  2 * 1024 * 4,
+	}
+}
+
+// attentionDispatch runs causal attention for n tokens at positions pos.. over one layer's f32 cache
+// (kT [kvHeads][headDim][ctxP], v [ctxP][kvHeads*headDim]). mask holds n uint32 pairs: the positions
+// [lo, hi) each token must not see (packed sequences), or zeros. sc is scratch of n*heads*ctxP floats.
+func (u *gpu) attentionDispatch(q, kT, v, out, sc, mask metal.Arg, n, pos, heads, kvHeads, headDim, ctxP int) metal.Dispatch {
+	const nt = 256
+	return metal.Dispatch{
+		P:       u.ps["attention_f32"],
+		Args:    []metal.Arg{q, kT, v, out, sc, mask, {Bytes: u32(uint32(heads), uint32(kvHeads), uint32(headDim), uint32(ctxP), uint32(pos), math.Float32bits(float32(1/math.Sqrt(float64(headDim)))))}},
+		Groups:  metal.Size{W: uint(heads), H: uint(n), D: 1},
+		Threads: metal.Size{W: nt, H: 1, D: 1},
+		Shared:  4 * (headDim + nt),
 	}
 }
