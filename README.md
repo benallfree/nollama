@@ -466,13 +466,104 @@ What that means:
   600-token prompt takes a few seconds before the first word. The prompt cache helps when prompts share a start (a fixed
   system prompt, a growing chat): only the new part is read.
 - **Loading** is near instant (the file is memory-mapped), and memory use is a little lower.
-- On a small server it is slower still. On a 1 vCPU x86 VPS (Skylake, AVX2), `qwen3-0.6b` reads about 35 tokens/s and
-  writes about 9: a one-word label takes about a second, a paragraph ten or more. Keep answers short (`num_predict`,
-  `max_tokens`) and run long jobs in the background.
+- On a small server it depends on the CPU: see [On small cloud servers](#on-small-cloud-servers).
 
 Today, if your users have a GPU and are happy to install Ollama, Ollama is faster.
 
 Run them yourself with `go run ./engine/cmd/bench bench` (it needs Ollama running, for the comparison).
+
+### On small cloud servers
+
+Measured on Vultr cloud servers on 2026-11-21: nollama (main at afe1f7f) and Ollama 0.40.17, both on the CPU, on the
+same GGUF files, Ubuntu 24.04. Threads = vCPUs, 128 tokens written per run, medians of 3 runs. A 4096-token context and
+a 256 MB prompt cache, like `nollama serve`'s defaults; prompts are the same 35- and 590-token texts as above. The
+Q4_K_M files for 0.6B and 1.7B are Ollama's own (`qwen3:0.6b`, `qwen3:1.7b`), since Qwen publishes only Q8_0 at those
+sizes; the rest come from Qwen's Hugging Face repositories.
+
+- **Cold first token**: a fresh start with the model file out of the page cache (`drop_caches`), to the first token of
+  the short prompt. For nollama that's a new process; for Ollama, its server is up but the model isn't loaded.
+- **Warm first token**: the same, with the file already in the page cache.
+- **First token, loaded**: the model already loaded and nothing reused from the prompt cache.
+- **Peak RAM**: the highest resident memory of the process holding the model (for Ollama, its `llama-server`). It
+  includes the memory-mapped model file.
+
+`qwen3-0.6b`, Q4_K_M:
+
+| Machine | Engine | Cold first token | Warm first token | First token, loaded (short / long) | Reading tok/s (short / long) | Writing tok/s | Peak RAM |
+|---|---|---|---|---|---|---|---|
+| Vultr vc2-1c-1gb (1 vCPU, 1 GB, Broadwell, AVX2) | **nollama** | 7.9 s | 5.5 s | 6.0 s / 95 s | 6 / 6 | 1.7 | 743 MB |
+| | Ollama | 41 s | 37 s | 1.5 s / 24 s | 24 / 25 | 7.0 | 742 MB |
+| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | **nollama** | 1.3 s | 640 ms | 512 ms / 10 s | 69 / 59 | 17.9 | 1.3 GB |
+| | Ollama | 4.3 s | 3.3 s | 438 ms / 7.2 s | 86 / 83 | 16.8 | 3.0 GB |
+| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | **nollama** | 976 ms | 584 ms | 478 ms / 8.5 s | 76 / 70 | 13.9 | 1.3 GB |
+| | Ollama | 2.9 s | 2.4 s | 407 ms / 5.5 s | 99 / 108 | 13.6 | 1.2 GB |
+| Vultr vhp-2c-4gb-amd (2 vCPU, 4 GB, EPYC Rome, AVX2) | **nollama** | 4.5 s | 3.7 s | 3.9 s / 55 s | 9 / 11 | 2.4 | 1.3 GB |
+| | Ollama | 3.4 s | 2.6 s | 469 ms / 7.3 s | 77 / 82 | 24.0 | 1.2 GB |
+| Vultr vhp-4c-8gb-amd (4 vCPU, 8 GB, EPYC Rome, AVX2) | **nollama** | 2.3 s | 2.1 s | 2.0 s / 28 s | 17 / 21 | 4.8 | 1.3 GB |
+| | Ollama | 2.9 s | 2.1 s | 276 ms / 4.1 s | 138 / 148 | 34.0 | 1.2 GB |
+
+What that means:
+
+- **Starting is fast.** From a cold start, nollama's first token comes 2 to 5 times sooner than Ollama's on the Intel
+  servers: there's nothing to load, the file is memory-mapped. On the 1 GB server Ollama took 41 s.
+- **On Intel CPUs with AVX-512, nollama keeps up.** Across all the models, writing runs at 80 to 105% of Ollama's speed
+  and reading at 65 to 90%. On 2 vCPUs the 0.6B model's first token after a 590-token prompt takes 8 to 10 s.
+- **On CPUs without AVX-512, nollama is far slower today.** On the Broadwell and EPYC Rome servers it reads and writes
+  4 to 12 times slower than Ollama with Q4_K_M, and 20 to 30 times slower with Q8_0, while Ollama runs fine on the same
+  machines. The same benchmark is close to Ollama on AVX-512, so nollama's AVX2 code paths look like the cause. Check
+  your server's CPU (`grep -m1 avx512f /proc/cpuinfo`) before you pick nollama for one.
+- **Memory** is about the same as Ollama's, apart from Ollama's two 0.6B runs on vc2-2c-4gb (about 3 GB), which we
+  didn't dig into.
+
+<details>
+<summary>Every model on every server</summary>
+
+On the EPYC Rome servers the bigger models didn't finish within the run's 90 minutes, so they're missing. A model is
+left out when its file doesn't fit in the server's memory.
+
+| Machine | Model | Quant | Engine | Cold first token | Warm first token | First token, loaded (short / long) | Reading tok/s (short / long) | Writing tok/s | Peak RAM |
+|---|---|---|---|---|---|---|---|---|---|
+| Vultr vc2-1c-1gb (1 vCPU, 1 GB, Broadwell, AVX2) | 0.6b | Q4_K_M | **nollama** | 7.9 s | 5.5 s | 6.0 s / 95 s | 6 / 6 | 1.7 | 743 MB |
+| Vultr vc2-1c-1gb (1 vCPU, 1 GB, Broadwell, AVX2) | 0.6b | Q4_K_M | Ollama | 41 s | 37 s | 1.5 s / 24 s | 24 / 25 | 7.0 | 742 MB |
+| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | 0.6b | Q4_K_M | **nollama** | 1.3 s | 640 ms | 512 ms / 10 s | 69 / 59 | 17.9 | 1.3 GB |
+| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | 0.6b | Q4_K_M | Ollama | 4.3 s | 3.3 s | 438 ms / 7.2 s | 86 / 83 | 16.8 | 3.0 GB |
+| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | 0.6b | Q8_0 | **nollama** | 1.7 s | 897 ms | 802 ms / 12 s | 45 / 48 | 10.8 | 1.4 GB |
+| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | 0.6b | Q8_0 | Ollama | 4.4 s | 3.3 s | 757 ms / 10.0 s | 49 / 60 | 13.2 | 2.9 GB |
+| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | 1.7b | Q4_K_M | **nollama** | 3.0 s | 1.6 s | 1.3 s / 23 s | 26 / 26 | 8.1 | 2.1 GB |
+| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | 1.7b | Q4_K_M | Ollama | 10 s | 5.6 s | 1.2 s / 16 s | 30 / 37 | 7.6 | 2.3 GB |
+| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | 1.7b | Q8_0 | **nollama** | 4.3 s | 2.2 s | 2.2 s / 31 s | 16 / 19 | 4.2 | 2.7 GB |
+| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | 1.7b | Q8_0 | Ollama | 8.1 s | 6.2 s | 1.9 s / 27 s | 19 / 22 | 5.3 | 2.5 GB |
+| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | 4b | Q4_K_M | **nollama** | 6.2 s | 3.5 s | 3.2 s / 56 s | 11 / 10 | 4.0 | 3.5 GB |
+| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | 4b | Q4_K_M | Ollama | 15 s | 14 s | 2.8 s / 43 s | 13 / 14 | 3.7 | 3.3 GB |
+| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | 0.6b | Q4_K_M | **nollama** | 976 ms | 584 ms | 478 ms / 8.5 s | 76 / 70 | 13.9 | 1.3 GB |
+| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | 0.6b | Q4_K_M | Ollama | 2.9 s | 2.4 s | 407 ms / 5.5 s | 99 / 108 | 13.6 | 1.2 GB |
+| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | 0.6b | Q8_0 | **nollama** | 1.3 s | 831 ms | 718 ms / 11 s | 49 / 54 | 9.1 | 1.4 GB |
+| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | 0.6b | Q8_0 | Ollama | 3.1 s | 2.6 s | 564 ms / 8.1 s | 64 / 74 | 10.1 | 1.3 GB |
+| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | 1.7b | Q4_K_M | **nollama** | 1.9 s | 1.2 s | 1.2 s / 20 s | 29 / 30 | 5.8 | 2.1 GB |
+| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | 1.7b | Q4_K_M | Ollama | 5.5 s | 4.8 s | 866 ms / 13 s | 42 / 45 | 5.6 | 2.0 GB |
+| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | 1.7b | Q8_0 | **nollama** | 3.1 s | 2.1 s | 2.1 s / 29 s | 16 / 20 | 3.5 | 2.6 GB |
+| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | 1.7b | Q8_0 | Ollama | 6.2 s | 5.2 s | 1.5 s / 19 s | 24 / 30 | 4.0 | 2.5 GB |
+| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | 4b | Q4_K_M | **nollama** | 4.1 s | 3.0 s | 2.9 s / 50 s | 12 / 12 | 2.8 | 3.5 GB |
+| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | 4b | Q4_K_M | Ollama | 10 s | 10 s | 2.2 s / 32 s | 16 / 18 | 2.8 | 3.3 GB |
+| Vultr vhp-2c-4gb-amd (2 vCPU, 4 GB, EPYC Rome, AVX2) | 0.6b | Q4_K_M | **nollama** | 4.5 s | 3.7 s | 3.9 s / 55 s | 9 / 11 | 2.4 | 1.3 GB |
+| Vultr vhp-2c-4gb-amd (2 vCPU, 4 GB, EPYC Rome, AVX2) | 0.6b | Q4_K_M | Ollama | 3.4 s | 2.6 s | 469 ms / 7.3 s | 77 / 82 | 24.0 | 1.2 GB |
+| Vultr vhp-2c-4gb-amd (2 vCPU, 4 GB, EPYC Rome, AVX2) | 0.6b | Q8_0 | **nollama** | 12 s | 12 s | 12 s / 159 s | 3 / 4 | 0.7 | 1.3 GB |
+| Vultr vhp-2c-4gb-amd (2 vCPU, 4 GB, EPYC Rome, AVX2) | 0.6b | Q8_0 | Ollama | 3.0 s | 2.6 s | 554 ms / 9.1 s | 67 / 66 | 19.4 | 1.3 GB |
+| Vultr vhp-2c-4gb-amd (2 vCPU, 4 GB, EPYC Rome, AVX2) | 1.7b | Q4_K_M | **nollama** | 12 s | 11 s | 12 s / 170 s | 3 / 3 | 0.9 | 1.9 GB |
+| Vultr vhp-2c-4gb-amd (2 vCPU, 4 GB, EPYC Rome, AVX2) | 1.7b | Q4_K_M | Ollama | 7.4 s | 5.2 s | 1.3 s / 20 s | 28 / 30 | 10.5 | 2.0 GB |
+| Vultr vhp-4c-8gb-amd (4 vCPU, 8 GB, EPYC Rome, AVX2) | 0.6b | Q4_K_M | **nollama** | 2.3 s | 2.1 s | 2.0 s / 28 s | 17 / 21 | 4.8 | 1.3 GB |
+| Vultr vhp-4c-8gb-amd (4 vCPU, 8 GB, EPYC Rome, AVX2) | 0.6b | Q4_K_M | Ollama | 2.9 s | 2.1 s | 276 ms / 4.1 s | 138 / 148 | 34.0 | 1.2 GB |
+| Vultr vhp-4c-8gb-amd (4 vCPU, 8 GB, EPYC Rome, AVX2) | 0.6b | Q8_0 | **nollama** | 6.0 s | 5.3 s | 5.9 s / 80 s | 6 / 7 | 1.5 | 1.4 GB |
+| Vultr vhp-4c-8gb-amd (4 vCPU, 8 GB, EPYC Rome, AVX2) | 0.6b | Q8_0 | Ollama | 3.4 s | 2.1 s | 282 ms / 5.0 s | 140 / 120 | 29.8 | 1.3 GB |
+| Vultr vhp-4c-8gb-amd (4 vCPU, 8 GB, EPYC Rome, AVX2) | 1.7b | Q4_K_M | **nollama** | 6.7 s | 5.8 s | 6.1 s / 86 s | 6 / 7 | 1.7 | 2.0 GB |
+| Vultr vhp-4c-8gb-amd (4 vCPU, 8 GB, EPYC Rome, AVX2) | 1.7b | Q4_K_M | Ollama | 5.2 s | 3.9 s | 605 ms / 10 s | 59 / 58 | 17.3 | 2.0 GB |
+| Vultr vhp-4c-8gb-amd (4 vCPU, 8 GB, EPYC Rome, AVX2) | 1.7b | Q8_0 | **nollama** | 18 s | 17 s | 18 s / 250 s | 2 / 2 | 0.5 | 2.5 GB |
+| Vultr vhp-4c-8gb-amd (4 vCPU, 8 GB, EPYC Rome, AVX2) | 1.7b | Q8_0 | Ollama | 5.5 s | 3.5 s | 758 ms / 12 s | 48 / 51 | 13.4 | 2.5 GB |
+
+</details>
+
+Run them yourself with `go run ./engine/cmd/bench vps -models qwen3-0.6b:Q4_K_M=/path/to/model.gguf -ollama` (as root,
+for the cold starts), or on a fresh Vultr server with `scripts/vultr-bench/vultr.sh`.
 
 ## Draft models (experimental, not faster yet)
 

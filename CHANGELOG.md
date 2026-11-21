@@ -5,6 +5,7 @@ becomes `## vX.Y.Z` and its lines are the release notes (`release.sh` reads them
 
 ## Unreleased
 
+- Benchmarks on five Vultr cloud servers (1 to 4 vCPUs): time to first token from a cold and a warm start, with the model loaded, reading and writing speed and peak memory, next to Ollama on the same files (README, "On small cloud servers"). `go run ./engine/cmd/bench vps` measures the same on any Linux server, and `scripts/vultr-bench/vultr.sh` runs it on a fresh Vultr server and deletes the server afterwards.
 - `nollama serve` can require an API key (`NOLLAMA_API_KEY` or `--api-key`; clients send `Authorization: Bearer <key>` or `X-API-Key`), and refuses to listen on a non-loopback address without one unless you pass `--insecure-public`.
 - Requests from web pages not served from this machine, and requests whose `Host` is a domain other than `localhost` (DNS rebinding), are refused unless allowed with `--allowed-origins` / `--allowed-hosts` (or an API key is set, for hosts).
 - The server no longer loads a model by a path outside its models folder (`"model": "/etc/passwd"`); `--allow-paths` turns that back on. A `.gguf` file in the models folder can be used by its name, and `hf:` downloads can't write outside the folder.
