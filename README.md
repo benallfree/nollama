@@ -506,12 +506,14 @@ What that means:
 
 - **Starting is fast.** From a cold start, nollama's first token comes 2 to 5 times sooner than Ollama's on the Intel
   servers: there's nothing to load, the file is memory-mapped. On the 1 GB server Ollama took 41 s.
-- **On Intel CPUs with AVX-512, nollama keeps up.** Across all the models, writing runs at 80 to 105% of Ollama's speed
+- **On Skylake and Cascade Lake Xeons, nollama keeps up.** Across all the models, writing runs at 80 to 105% of Ollama's speed
   and reading at 65 to 90%. On 2 vCPUs the 0.6B model's first token after a 590-token prompt takes 8 to 10 s.
-- **On CPUs without AVX-512, nollama is far slower today.** On the Broadwell and EPYC Rome servers it reads and writes
-  4 to 12 times slower than Ollama with Q4_K_M, and 20 to 30 times slower with Q8_0, while Ollama runs fine on the same
-  machines. The same benchmark is close to Ollama on AVX-512, so nollama's AVX2 code paths look like the cause. Check
-  your server's CPU (`grep -m1 avx512f /proc/cpuinfo`) before you pick nollama for one.
+- **On older Intel (Broadwell) and AMD EPYC Rome servers, nollama is far slower today.** There it reads and writes 4 to
+  12 times slower than Ollama with Q4_K_M, and 20 to 30 times slower with Q8_0, while Ollama runs fine on the same
+  machines. nollama runs the same AVX2 code on every one of these servers (it has no AVX-512 code), so the slow part is
+  how that code behaves on those CPU models, not missing support. It's a known problem to fix. Until then, check the
+  CPU model (`grep -m1 "model name" /proc/cpuinfo`) before you pick nollama for a server: Skylake, Cascade Lake or
+  newer Intel ran well here.
 - **Memory** is about the same as Ollama's, apart from Ollama's two 0.6B runs on vc2-2c-4gb (about 3 GB), which we
   didn't dig into.
 
