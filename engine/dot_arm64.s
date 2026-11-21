@@ -7,6 +7,7 @@
 #define SDOT(m, n, d) WORD $(0x4E809400 | ((m)<<16) | ((n)<<5) | (d))          // Vd.4S += Vn.16B . Vm.16B
 #define SCVTF4S(n, d) WORD $(0x4E21D800 | ((n)<<5) | (d))                       // Vd.4S = float(Vn.4S)
 #define FADDP4S(m, n, d) WORD $(0x6E20D400 | ((m)<<16) | ((n)<<5) | (d))
+#define ADDV4S(n, d) WORD $(0x4EB1B800 | ((n)<<5) | (d))                        // Sd = sum of Vn.4S (ints), upper lanes zeroed
 #define FADDP2S(n, d) WORD $(0x7E30D800 | ((n)<<5) | (d))                       // Sd = Vn.S[0]+Vn.S[1]
 #define MLAE(m, i, n, d) WORD $(0x6F800000 | (((i)&1)<<21) | (((m)&15)<<16) | (((i)>>1)<<11) | ((n)<<5) | (d)) // Vd.4S += Vn.4S * Vm.S[i], m<16
 #define SMULL4H(m, n, d) WORD $(0x0E60C000 | ((m)<<16) | ((n)<<5) | (d))        // Vd.4S = Vn.4H * Vm.4H
@@ -78,8 +79,8 @@ q4loop:
 	ADDP8H(5, 4, 6)               // V6.8H = pairwise sums of 16 bsums
 	SMULL4H(1, 6, 7)
 	SMLAL8H(1, 6, 7)              // V7.4S
+	ADDV4S(7, 7)                  // lane 0 = mins . bsums, exact
 	SCVTF4S(7, 7)
-	VFMLS V27.S4, V7.S4, V30.S4   // acc -= dmin * mins
 
 	ADD  $16, R0, R14
 	ADD  $4, R1, R15
@@ -146,8 +147,11 @@ q4loop:
 	MLAE(3, 2, 19, 16)
 	MLAE(3, 3, 20, 16)
 
+	// reference order (dotQ4KQ8KGo): exact totals, then acc = fma(d, sumi, acc), acc = fma(-dmin, mins, acc), in lane 0
+	ADDV4S(16, 16)
 	SCVTF4S(16, 16)
-	VFMLA V26.S4, V16.S4, V30.S4  // acc += d * sumi
+	VFMLA V26.S4, V16.S4, V30.S4
+	VFMLS V27.S4, V7.S4, V30.S4
 
 	ADD  $144, R0
 	ADD  $292, R1
@@ -155,9 +159,7 @@ q4loop:
 	BNE  q4loop
 
 q4done:
-	FADDP4S(30, 30, 30)
-	FADDP2S(30, 0)
-	FMOVS F0, ret+24(FP)
+	FMOVS F30, ret+24(FP)
 	RET
 
 // One 64-element half-chunk of a Q6_K block.
@@ -253,6 +255,7 @@ q6loop:
 	Q6HALF(3, 4)
 	Q6HALF(5, 6)
 
+	ADDV4S(16, 16)                // reference order: exact total, then acc = fma(d, sumi, acc) in lane 0
 	SCVTF4S(16, 16)
 	VFMLA V7.S4, V16.S4, V31.S4
 
@@ -262,9 +265,7 @@ q6loop:
 	BNE  q6loop
 
 q6done:
-	FADDP4S(31, 31, 31)
-	FADDP2S(31, 0)
-	FMOVS F0, ret+24(FP)
+	FMOVS F31, ret+24(FP)
 	RET
 
 // func dotF16F32Asm(x, y unsafe.Pointer, n int) float32   (n multiple of 16)
@@ -292,9 +293,10 @@ f16loop:
 	SUBS $1, R2
 	BNE  f16loop
 f16done:
-	VFADD V17.S4, V16.S4, V16.S4
-	VFADD V19.S4, V18.S4, V18.S4
-	VFADD V18.S4, V16.S4, V16.S4
+	// reference tree (sum16): lane k of V16..V19 holds a_k, a_{k+4}, a_{k+8}, a_{k+12}
+	VFADD V18.S4, V16.S4, V16.S4  // a_k + a_{k+8}
+	VFADD V19.S4, V17.S4, V17.S4  // a_{k+4} + a_{k+12}
+	VFADD V17.S4, V16.S4, V16.S4  // w_k
 	FADDP4S(16, 16, 16)
 	FADDP2S(16, 0)
 	FMOVS F0, ret+24(FP)
@@ -391,10 +393,12 @@ q80loop:
 	SDOT(14, 10, 17)
 	SDOT(5, 1, 16)
 	SDOT(15, 11, 17)
+	ADDV4S(16, 16)                // reference order: exact block totals, then acc = fma(d, sumi, acc), block by block
+	ADDV4S(17, 17)
 	SCVTF4S(16, 16)
 	SCVTF4S(17, 17)
 	VFMLA V3.S4, V16.S4, V30.S4
-	VFMLA V13.S4, V17.S4, V29.S4
+	VFMLA V13.S4, V17.S4, V30.S4
 	ADD  $68, R0
 	ADD  $72, R1
 	SUBS $1, R6
@@ -414,13 +418,11 @@ q80tail:
 	VMOVI $0, V16.B16
 	SDOT(4, 0, 16)
 	SDOT(5, 1, 16)
+	ADDV4S(16, 16)
 	SCVTF4S(16, 16)
 	VFMLA V3.S4, V16.S4, V30.S4
 q80done:
-	VFADD V29.S4, V30.S4, V30.S4
-	FADDP4S(30, 30, 30)
-	FADDP2S(30, 0)
-	FMOVS F0, ret+24(FP)
+	FMOVS F30, ret+24(FP)
 	RET
 
 // ---- 4-column kernels: one weight row against 4 activation rows (prefill) ----
@@ -685,12 +687,19 @@ q6x4done:
 	RET
 
 
-#define F16x4COL(PTR, A0, A1) \
+// element i of a column goes to lane i%4 of accumulator (i/4)%4, as in the 1-row kernel (reference order: dotF16F32Go)
+#define F16x4COL(PTR, A0, A1, A2, A3) \
 	VLD1.P 64(PTR), [V8.S4, V9.S4, V10.S4, V11.S4] \
 	VFMLA V0.S4, V8.S4, A0.S4 \
 	VFMLA V1.S4, V9.S4, A1.S4 \
-	VFMLA V2.S4, V10.S4, A0.S4 \
-	VFMLA V3.S4, V11.S4, A1.S4
+	VFMLA V2.S4, V10.S4, A2.S4 \
+	VFMLA V3.S4, V11.S4, A3.S4
+
+// F16x4W(A0..A3): A0 = w_k of sum16 for one column
+#define F16x4W(A0, A1, A2, A3) \
+	VFADD A2.S4, A0.S4, A0.S4 \
+	VFADD A3.S4, A1.S4, A1.S4 \
+	VFADD A1.S4, A0.S4, A0.S4
 
 // func dotF16F32x4Asm(x, y unsafe.Pointer, stride, n int, out *float32)
 // out[c] = sum_i f16(x[i]) * y[c*stride bytes + 4i]; n multiple of 16.
@@ -712,6 +721,14 @@ TEXT ·dotF16F32x4Asm(SB), NOSPLIT, $0-40
 	VMOVI $0, V21.B16
 	VMOVI $0, V22.B16
 	VMOVI $0, V23.B16
+	VMOVI $0, V24.B16
+	VMOVI $0, V25.B16
+	VMOVI $0, V26.B16
+	VMOVI $0, V27.B16
+	VMOVI $0, V28.B16
+	VMOVI $0, V29.B16
+	VMOVI $0, V30.B16
+	VMOVI $0, V31.B16
 	CBZ  R2, f16x4done
 f16x4loop:
 	VLD1.P 32(R0), [V4.H8, V5.H8]
@@ -719,20 +736,20 @@ f16x4loop:
 	FCVTL2_8H(4, 1)
 	FCVTL4H(5, 2)
 	FCVTL2_8H(5, 3)
-	F16x4COL(R1, V16, V17)
-	F16x4COL(R16, V18, V19)
-	F16x4COL(R17, V20, V21)
-	F16x4COL(R19, V22, V23)
+	F16x4COL(R1, V16, V17, V18, V19)
+	F16x4COL(R16, V20, V21, V22, V23)
+	F16x4COL(R17, V24, V25, V26, V27)
+	F16x4COL(R19, V28, V29, V30, V31)
 	SUBS $1, R2
 	BNE  f16x4loop
 f16x4done:
-	VFADD V17.S4, V16.S4, V16.S4
-	VFADD V19.S4, V18.S4, V18.S4
-	VFADD V21.S4, V20.S4, V20.S4
-	VFADD V23.S4, V22.S4, V22.S4
-	FADDP4S(18, 16, 16)
-	FADDP4S(22, 20, 20)
-	FADDP4S(20, 16, 16)
+	F16x4W(V16, V17, V18, V19)
+	F16x4W(V20, V21, V22, V23)
+	F16x4W(V24, V25, V26, V27)
+	F16x4W(V28, V29, V30, V31)
+	FADDP4S(20, 16, 16)           // (w0+w1, w2+w3) for columns 0 and 1
+	FADDP4S(28, 24, 24)
+	FADDP4S(24, 16, 16)           // lane c = (w0+w1)+(w2+w3) of column c
 	VST1 [V16.S4], (R20)
 	RET
 

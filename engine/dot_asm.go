@@ -75,7 +75,7 @@ func useFloatAsm() {
 			s = dotF16F32Asm(bptr(x), fptr(y), n)
 		}
 		if n < len(y) {
-			s += dotF16F32Go(x[2*n:], y[n:])
+			s += dotF16Tail(x[2*n:], y[n:])
 		}
 		return s
 	}

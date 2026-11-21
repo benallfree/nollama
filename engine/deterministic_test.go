@@ -22,8 +22,8 @@ const detTokens = 40
 
 // detGolden: sha256 of the tiny model's GGUF bytes and of the float32 bits of the serial logits for each fixture.
 var detGolden = map[string][2]string{
-	"f32":  {"76fe28e655f344d9f1fb4cf0d355ae5e311898ccf277f57ba774c30e3017c487", "7ac1192a823e957989b45f10e3f84b8bc0b290a654cfa44e8623ac22f005d69b"},
-	"q8_0": {"dc78f121bafe9d25f37d2345b8ff76d7be2a3001aac544035eaa0a8133cdd57f", "e2bced538523c0301f86c1899aef4823ef99b4d8d644177439605ddda7d094a1"},
+	"f32":  {"76fe28e655f344d9f1fb4cf0d355ae5e311898ccf277f57ba774c30e3017c487", "9e65b308975754ada935ec86ae69540f9cf0514fd0eeff84c3cc5ea4f9f2f244"},
+	"q8_0": {"dc78f121bafe9d25f37d2345b8ff76d7be2a3001aac544035eaa0a8133cdd57f", "048d9eec0c033c2c1d878ac1fc757d7dc4fa14479b2dd0c732ecaefa7a625a45"},
 }
 
 func detFixture(t *testing.T, kind string) string {
@@ -126,7 +126,7 @@ func TestDeterministic(t *testing.T) {
 				return m
 			}
 			m1 := load(1)
-			if m1.Info().Kernels != "go (deterministic)" {
+			if m1.Info().Kernels != kernelName+" (deterministic)" {
 				t.Fatalf("kernels %q", m1.Info().Kernels)
 			}
 			ids := detIDs(m1, detTokens)
@@ -182,6 +182,16 @@ func TestDeterministic(t *testing.T) {
 				}
 			}
 
+			// the default (assembly) path computes the same logits: every kernel follows the reference order
+			md, err := Load(p, LoadOptions{Threads: 2})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer md.Close()
+			if pos, d := firstDiff(ref, detLogits(md, ids, 0)); pos >= 0 {
+				t.Errorf("default path, batch=all: position %d differs from deterministic serial (max |d| %g)", pos, d)
+			}
+
 			gf, gl := fileHash(t, p), logitsHash(ref)
 			want := detGolden[kind]
 			t.Logf("fixture %s, logits %s", gf, gl)
@@ -227,4 +237,27 @@ func TestDeterministicGGUF(t *testing.T) {
 	if g := os.Getenv("DET_GOLDEN"); g != "" && g != h {
 		t.Errorf("differs from DET_GOLDEN %s", g)
 	}
+}
+
+// With GGUF=<a Q4_K/Q6_K model>, the default (assembly) path: a prompt read in batches gives the same logits as one
+// read a token at a time, since those kernels follow the reference order.
+func TestBatchInvariantGGUF(t *testing.T) {
+	p := os.Getenv("GGUF")
+	if p == "" {
+		t.Skip("GGUF not set")
+	}
+	m, err := Load(p, LoadOptions{Threads: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	t.Logf("kernels %s, tensor types %v", m.Info().Kernels, m.Info().TensorTypes)
+	ids := detIDs(m, 24)
+	ref := detLogits(m, ids, 1)
+	for _, b := range []int{0, 4, 7} {
+		if pos, d := firstDiff(ref, detLogits(m, ids, b)); pos >= 0 {
+			t.Errorf("batch %d: position %d differs (max |d| %g)", b, pos, d)
+		}
+	}
+	t.Logf("default-path serial logits %s", logitsHash(ref))
 }

@@ -108,8 +108,17 @@ func TestDetMathGolden(t *testing.T) {
 			rope(v, []float32{float32(r.Float64())}, []float32{float32(r.Float64())})
 			return uint64(math.Float32bits(v[0]))<<32 | uint64(math.Float32bits(v[1]))
 		}, 200000),
+		// fma32 last: it draws from r after the others, so their checksums stay put
+		"fma32": sum(func() uint64 {
+			a, b, c := math.Float32frombits(r.Uint32()), math.Float32frombits(r.Uint32()), math.Float32frombits(r.Uint32())
+			f := fma32(a, b, c)
+			if f != f {
+				return 1 // NaN bit patterns differ by CPU (arm64's default NaN is positive, x86's negative)
+			}
+			return uint64(math.Float32bits(f))
+		}, 200000),
 	}
-	for _, k := range []string{"sincos", "exp64", "log64", "expf", "rope"} {
+	for _, k := range []string{"sincos", "exp64", "log64", "expf", "fma32", "rope"} {
 		w, ok := detMathGolden[k]
 		t.Logf("%-6s %016x", k, got[k])
 		if ok && w != got[k] {
@@ -123,5 +132,46 @@ var detMathGolden = map[string]uint64{
 	"exp64":  0xd0656db02952d589,
 	"log64":  0xeaf7e439eda877dc,
 	"expf":   0x7fa6d21f096245bd,
+	"fma32":  0x65c40c6c40cd67f1,
 	"rope":   0xc478218e3d231971,
+}
+
+//go:noinline
+func hwFMA32(a, b, c float32) float32 { return a*b + c } // fused into one instruction on arm64
+
+func TestFMA32(t *testing.T) {
+	if !fusesFMA() {
+		t.Skip("this GOARCH doesn't fuse a*b+c; the golden checksum covers fma32 here")
+	}
+	r := rand.New(rand.NewPCG(11, 13))
+	bad := 0
+	for i := 0; i < 5_000_000; i++ {
+		a := math.Float32frombits(r.Uint32())
+		b := math.Float32frombits(r.Uint32())
+		var c float32
+		switch i % 3 {
+		case 0:
+			c = math.Float32frombits(r.Uint32())
+		case 1: // near cancellation: c ≈ -a*b
+			c = -float32(float64(a)*float64(b)) * (1 + float32(r.IntN(9)-4)*1e-7)
+		default:
+			c = float32(r.NormFloat64())
+			a, b = float32(r.NormFloat64()), float32(r.NormFloat64()*1000)
+		}
+		g, w := fma32(a, b, c), hwFMA32(a, b, c)
+		if math.Float32bits(g) != math.Float32bits(w) && !(g != g && w != w) {
+			if bad++; bad < 5 {
+				t.Errorf("fma32(%g, %g, %g) = %g, hardware %g", a, b, c, g, w)
+			}
+		}
+	}
+	if bad > 0 {
+		t.Fatalf("%d mismatches", bad)
+	}
+}
+
+// fusesFMA reports whether the compiler fused hwFMA32 (it does on arm64).
+func fusesFMA() bool {
+	a, b := float32(1+1.0/(1<<12)), float32(1-1.0/(1<<12)) // a*b = 1 - 2^-24 exactly, rounds to 1 when unfused
+	return hwFMA32(a, b, -1) != 0
 }

@@ -216,3 +216,141 @@ func TestAttn4Kernels(t *testing.T) {
 		}
 	}
 }
+
+// TestKernelsReferenceOrder: the Q4_K and Q6_K kernels (assembly or Go, one row or four) give the same bits, so a
+// prompt read in batches, deterministic mode and every architecture agree.
+func TestKernelsReferenceOrder(t *testing.T) {
+	r := rand.New(rand.NewPCG(5, 8))
+	for trial := 0; trial < 300; trial++ {
+		nb := 1 + r.IntN(12)
+		ys := make([]byte, 4*nb*q8kBytes)
+		for c := 0; c < 4; c++ {
+			x := make([]float32, nb*qk)
+			for i := range x {
+				x[i] = float32(r.NormFloat64())
+			}
+			quantizeQ8K(x, ys[c*nb*q8kBytes:])
+		}
+		for _, k := range []struct {
+			name string
+			size int
+			f16  []int
+			one  func(x, y []byte, nb int) float32
+			ref  func(x, y []byte, nb int) float32
+			four func(x, y []byte, stride, nb int, out *[4]float32)
+		}{
+			{"Q4_K", q4kBytes, []int{0, 2}, dotQ4K, dotQ4KQ8KGo, dotQ4Kx4},
+			{"Q6_K", q6kBytes, []int{208}, dotQ6K, dotQ6KQ8KGo, dotQ6Kx4},
+		} {
+			w := randBlocks(r, nb, k.size, k.f16)
+			var o [4]float32
+			if k.four != nil {
+				k.four(w, ys, nb*q8kBytes, nb, &o)
+			}
+			for c := 0; c < 4; c++ {
+				y := ys[c*nb*q8kBytes:]
+				ref := k.ref(w, y, nb)
+				if g := k.one(w, y, nb); math.Float32bits(g) != math.Float32bits(ref) {
+					t.Fatalf("%s %s: %g, Go reference %g", k.name, kernelName, g, ref)
+				}
+				if k.four != nil && math.Float32bits(o[c]) != math.Float32bits(ref) {
+					t.Fatalf("%s %s 4-row, column %d: %g, 1-row %g", k.name, kernelName, c, o[c], ref)
+				}
+			}
+		}
+		// F16, including a length that isn't a multiple of 16
+		for _, n := range []int{nb * 64, nb*64 + 5} {
+			wf := make([]byte, 2*n)
+			for i := 0; i < n; i++ {
+				binary.LittleEndian.PutUint16(wf[2*i:], uint16(0x3000+r.IntN(0x1800))|uint16(r.IntN(2))<<15)
+			}
+			yf := make([]float32, 4*n)
+			for i := range yf {
+				yf[i] = float32(r.NormFloat64())
+			}
+			var of [4]float32
+			if dotF16x4 != nil {
+				dotF16x4(wf, yf, n, &of)
+			}
+			for c := 0; c < 4; c++ {
+				ref := dotF16F32Go(wf, yf[c*n:(c+1)*n])
+				if g := dotF16(wf, yf[c*n:(c+1)*n]); math.Float32bits(g) != math.Float32bits(ref) {
+					t.Fatalf("F16 n=%d %s: %g, Go reference %g", n, kernelName, g, ref)
+				}
+				if dotF16x4 != nil && math.Float32bits(of[c]) != math.Float32bits(ref) {
+					t.Fatalf("F16 n=%d %s 4-row, column %d: %g, 1-row %g", n, kernelName, c, of[c], ref)
+				}
+			}
+		}
+		// Q8_0: one row and the 4-row interleaved layout
+		nb32 := 8 * nb
+		w8 := randBlocks(r, nb32, q80Bytes, []int{0})
+		acts := make([]byte, 4*nb32*q80aBytes)
+		x4 := make([]byte, nb32*q80x4Bytes)
+		for c := 0; c < 4; c++ {
+			x := make([]float32, nb32*32)
+			for i := range x {
+				x[i] = float32(r.NormFloat64())
+			}
+			quantizeQ8_0(x, acts[c*nb32*q80aBytes:])
+			interleaveQ8_0(acts[c*nb32*q80aBytes:], x4, c, nb32)
+		}
+		var o8 [4]float32
+		if dotQ80x4 != nil {
+			dotQ80x4(w8, x4, nb32, &o8)
+		}
+		for c := 0; c < 4; c++ {
+			y := acts[c*nb32*q80aBytes:]
+			ref := dotQ8_0Go(w8, y, nb32)
+			if g := dotQ80(w8, y, nb32); math.Float32bits(g) != math.Float32bits(ref) {
+				t.Fatalf("Q8_0 %s: %g, Go reference %g", kernelName, g, ref)
+			}
+			if dotQ80x4 != nil && math.Float32bits(o8[c]) != math.Float32bits(ref) {
+				t.Fatalf("Q8_0 %s 4-row, column %d: %g, 1-row %g", kernelName, c, o8[c], ref)
+			}
+		}
+	}
+}
+
+// TestAttentionReferenceOrder: the attention kernels (assembly or Go) give the same bits.
+func TestAttentionReferenceOrder(t *testing.T) {
+	r := rand.New(rand.NewPCG(9, 4))
+	for trial := 0; trial < 50; trial++ {
+		hd := 16 * (1 + r.IntN(8))
+		nblk := 1 + r.IntN(6)
+		ctxP := 16 * (nblk + r.IntN(3))
+		q := make([]float32, 4*hd)
+		kT := make([]float32, hd*ctxP)
+		for i := range q {
+			q[i] = float32(r.NormFloat64())
+		}
+		for i := range kT {
+			kT[i] = float32(r.NormFloat64())
+		}
+		got, want := make([]float32, 4*ctxP), make([]float32, 4*ctxP)
+		scores4(q, kT, ctxP, nblk, got, ctxP)
+		scores4Go(q, kT, ctxP, nblk, want, ctxP)
+		for i := range got {
+			if math.Float32bits(got[i]) != math.Float32bits(want[i]) {
+				t.Fatalf("scores4 %s: [%d] %g, Go %g", kernelName, i, got[i], want[i])
+			}
+		}
+		n4 := 1 + r.IntN(nblk*4)
+		p := make([]float32, 4*ctxP)
+		v := make([]float32, 4*n4*hd)
+		for i := range p {
+			p[i] = float32(r.Float64())
+		}
+		for i := range v {
+			v[i] = float32(r.NormFloat64())
+		}
+		og, ow := make([]float32, 4*hd), make([]float32, 4*hd)
+		wsum4(p, ctxP, v, hd, n4, og, hd, hd)
+		wsum4Go(p, ctxP, v, hd, n4, ow, hd, hd)
+		for i := range og {
+			if math.Float32bits(og[i]) != math.Float32bits(ow[i]) {
+				t.Fatalf("wsum4 %s: [%d] %g, Go %g", kernelName, i, og[i], ow[i])
+			}
+		}
+	}
+}

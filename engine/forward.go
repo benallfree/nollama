@@ -11,8 +11,9 @@ type acts struct {
 	q8k, q80       []byte
 	q80x4          []byte // groups of 4 rows interleaved, for the 4-column Q8_0 kernel
 	need8k, need80 bool
-	// rowByRow skips the 4-row kernels, which round differently from the 1-row ones: a batch then gives each token
-	// exactly the logits a one-token forward would (speculative decoding's check, speculative.go).
+	// rowByRow skips the 4-row kernels (speculative decoding's check, speculative.go). They follow the reference order
+	// and give the same bits as the 1-row ones (TestKernelsReferenceOrder), so a batch already gives each token exactly
+	// the logits a one-token forward would; this is belt and braces.
 	rowByRow bool
 }
 
@@ -69,23 +70,8 @@ func (a *acts) quantize(p *pool, ws ...*weight) {
 }
 
 // rowDot returns a function computing dot(weight row bytes, activation row t).
-func rowDot(w *weight, a *acts, det bool) func(row []byte, t int) float32 {
+func rowDot(w *weight, a *acts) func(row []byte, t int) float32 {
 	k := a.k
-	if det { // the Go kernels: the same rounding on every architecture (see detmath.go)
-		switch w.typ {
-		case typeQ4_K:
-			nb, sz := k/qk, k/qk*q8kBytes
-			return func(row []byte, t int) float32 { return dotQ4KQ8KGo(row, a.q8k[t*sz:], nb) }
-		case typeQ6_K:
-			nb, sz := k/qk, k/qk*q8kBytes
-			return func(row []byte, t int) float32 { return dotQ6KQ8KGo(row, a.q8k[t*sz:], nb) }
-		case typeQ8_0:
-			nb, sz := k/32, k/32*q80aBytes
-			return func(row []byte, t int) float32 { return dotQ8_0Go(row, a.q80[t*sz:], nb) }
-		case typeF16:
-			return func(row []byte, t int) float32 { return dotF16F32Go(row, a.f[t*k:(t+1)*k]) }
-		}
-	}
 	if floatRef {
 		return func(row []byte, t int) float32 {
 			tmp := make([]float32, k)
@@ -125,8 +111,8 @@ func rowDot(w *weight, a *acts, det bool) func(row []byte, t int) float32 {
 var floatRef = false
 
 // rowDot4 returns a function computing 4 dots (activation rows t..t+3), or nil.
-func rowDot4(w *weight, a *acts, det bool) func(row []byte, t int, out *[4]float32) {
-	if floatRef || det || a.rowByRow { // deterministic, or a draft's check: each row exactly as the 1-row kernel computes it
+func rowDot4(w *weight, a *acts) func(row []byte, t int, out *[4]float32) {
+	if floatRef || a.rowByRow {
 		return nil
 	}
 	k := a.k
@@ -169,7 +155,7 @@ func (m *Model) matmul(p *pool, a *acts, t0 int, segs ...mmSeg) {
 	ts := make([]tileSeg, len(segs))
 	total := 0
 	for i, s := range segs {
-		ts[i] = tileSeg{dot: rowDot(s.w, a, m.det), dot4: rowDot4(s.w, a, m.det), first: total}
+		ts[i] = tileSeg{dot: rowDot(s.w, a), dot4: rowDot4(s.w, a), first: total}
 		total += (s.w.rows + tile - 1) / tile
 	}
 	chunk := 1
@@ -423,10 +409,6 @@ func (m *Model) forward(s *state, tokens []int, pos int) {
 		// time (items (t, head-in-group) in order), so each K/V row loaded
 		// serves four dot products.
 		att := s.aa.f
-		sc4, ws4 := scores4, wsum4
-		if m.det {
-			sc4, ws4 = scores4Go, wsum4Go
-		}
 		items := n * group
 		quads := (items + 3) / 4
 		p.parallelForW(hp.kvHeads*quads, 1, func(w, lo, hi int) {
@@ -441,7 +423,7 @@ func (m *Model) forward(s *state, tokens []int, pos int) {
 				}
 				ctxQ := pos + ts[3] + 1 // items are in token order: the last has the longest context
 				if kc != nil {
-					sc4(qb, kc[kvh*hd*ctxP:], ctxP, (ctxQ+15)/16, sc, ctxP)
+					scores4(qb, kc[kvh*hd*ctxP:], ctxP, (ctxQ+15)/16, sc, ctxP)
 				} else {
 					m.scoresQ(s, s.kv.scratch[w], li, kvh, ctxQ, qb, sc)
 				}
@@ -476,7 +458,7 @@ func (m *Model) forward(s *state, tokens []int, pos int) {
 					clear(row[ctx:])
 				}
 				if vc != nil {
-					ws4(sc, ctxP, vc[kvh*hd:], kvd, n4, ob, hd, hd)
+					wsum4(sc, ctxP, vc[kvh*hd:], kvd, n4, ob, hd, hd)
 				} else {
 					m.wsumQ(s, s.kv.scratch[w], li, kvh, ctxQ, sc, ob)
 				}

@@ -297,19 +297,21 @@ For one model, `LoadOptions` takes `Threads`, `MaxMemory` and `LowPriority` dire
 
 ### The same numbers on every machine
 
-By default the logits depend on the CPU: the arm64 and amd64 assembly kernels sum in different orders, Go fuses
-`x*y+z` into one instruction on arm64 but not on amd64, and a prompt read in batches rounds differently from one read a
-token at a time. The differences are in the last bits, but quantizing activations between layers can grow them to
-about a logit, enough to change a sampled token. Thread count doesn't matter.
+The logits are the same bits on arm64 and amd64, with or without the assembly kernels, at any thread count and prompt
+batch size, and with or without a prompt-cache hit. Every kernel (Go, NEON, AVX2; one token or four at a time) sums in
+one reference order with single-rounding multiply-adds, and the Go code never leaves a multiply-add to the compiler,
+which fuses `x*y+z` on arm64 but not on amd64. So greedy output and seeded sampling match across machines, and `Score`
+gives the same logprobs whatever its `Batch`. `TestKernelsReferenceOrder` and `TestDeterministic` (golden hashes) check
+this on each CI architecture. It holds for the default `f32` KV cache; the compact caches (`--kv-cache-type`) round
+differently per CPU.
 
 `LoadOptions.Deterministic` (or `nollama serve --deterministic`, `NOLLAMA_DETERMINISTIC=1`, `nollama run
---deterministic`) makes the logits the same bits on arm64 and amd64, at any thread count and prompt batch size, with or
-without a prompt-cache hit. Greedy output, logprobs, `Score` (any `Batch`), `Classify` and seeded sampling follow. Use it when two machines must agree
-exactly, for example a compressor driven by the model's probabilities. It runs the portable Go kernels instead of the
-assembly ones (`Info().Kernels` reports `go (deterministic)`), so it's slower, mostly when reading prompts. It won't
-continue a conversation from half-precision state: thread files in a `ThreadDir` are ignored, and `LoadThread` /
-`LoadPromptCache` need a snapshot saved with `Full`. It needs the default `f32` KV cache. `TestDeterministic` checks the logits against golden hashes, so CI
-on each architecture catches a change that breaks this.
+--deterministic`) also makes logprobs (`Score`, `Classify`, generate's logprobs) the same bits, by computing their
+log-softmax with portable `exp`/`log` instead of Go's `math.Exp`/`math.Log`, which differ by CPU in the last bit. It
+refuses what would break exactness: a compact KV cache, and continuing from half-precision state (thread files in a
+`ThreadDir` are ignored; `LoadThread` / `LoadPromptCache` need a snapshot saved with `Full`). Use it when two machines
+must agree exactly, for example a compressor driven by the model's probabilities. It costs little: the log-softmax over
+the vocabulary is about 1.5x slower, the rest runs the same kernels.
 
 ## Test without a model
 

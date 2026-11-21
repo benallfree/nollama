@@ -186,7 +186,10 @@ func dotQ4KQ8KGo(x, y []byte, nb int) float32 {
 			bs := func(k int) int32 { return int32(int16(binary.LittleEndian.Uint16(yb[q8kBsumOff+2*k:]))) }
 			sumMins += int32(m1)*(bs(4*j)+bs(4*j+1)) + int32(m2)*(bs(4*j+2)+bs(4*j+3))
 		}
-		sum += float32(d*float32(sumi)) - float32(dmin*float32(sumMins))
+		// the reference order every kernel (Go, NEON, AVX2; 1- and 4-column) follows: exact integer totals per
+		// super-block, then two single-rounding multiply-adds into one running sum
+		sum = fma32(d, float32(sumi), sum)
+		sum = fma32(-dmin, float32(sumMins), sum)
 	}
 	return sum
 }
@@ -220,25 +223,46 @@ func dotQ6KQ8KGo(x, y []byte, nb int) float32 {
 				sumi += s[k] * int32(int8(sc[k]))
 			}
 		}
-		sum += float32(d * float32(sumi))
+		sum = fma32(d, float32(sumi), sum) // reference order: see dotQ4KQ8KGo
 	}
 	return sum
 }
 
+// dotF16F32Go is the reference order every F16 kernel (NEON, AVX2; 1- and 4-column) follows: element i goes to
+// accumulator i%16 with a single-rounding multiply-add, the 16 accumulators are summed in a fixed tree (sum16), and a
+// tail of n%16 elements is summed on its own (dotF16Tail) and added last.
 func dotF16F32Go(x []byte, y []float32) float32 {
-	var s0, s1, s2, s3 float32
-	n := len(y)
-	i := 0
-	for ; i+4 <= n; i += 4 {
-		s0 += float32(f16(x[2*i:]) * y[i])
-		s1 += float32(f16(x[2*i+2:]) * y[i+1])
-		s2 += float32(f16(x[2*i+4:]) * y[i+2])
-		s3 += float32(f16(x[2*i+6:]) * y[i+3])
+	n := len(y) &^ 15
+	var a [16]float32
+	for i := 0; i < n; i += 16 {
+		for l := 0; l < 16; l++ {
+			a[l] = fma32(f16(x[2*(i+l):]), y[i+l], a[l])
+		}
 	}
-	for ; i < n; i++ {
-		s0 += float32(f16(x[2*i:]) * y[i])
+	s := sum16(&a)
+	if n < len(y) {
+		s += dotF16Tail(x[2*n:], y[n:])
 	}
-	return s0 + s1 + s2 + s3
+	return s
+}
+
+// sum16 is the fixed tree: w_k = (a_k + a_{k+8}) + (a_{k+4} + a_{k+12}), then (w_0 + w_1) + (w_2 + w_3), as the AVX2
+// kernels' VEXTRACTF128/VHADDPS and the NEON kernels' FADDP compute it.
+func sum16(a *[16]float32) float32 {
+	var w [4]float32
+	for k := 0; k < 4; k++ {
+		w[k] = (a[k] + a[k+8]) + (a[k+4] + a[k+12])
+	}
+	return (w[0] + w[1]) + (w[2] + w[3])
+}
+
+// dotF16Tail sums the last n%16 elements in order.
+func dotF16Tail(x []byte, y []float32) float32 {
+	var s float32
+	for i := range y {
+		s = fma32(f16(x[2*i:]), y[i], s)
+	}
+	return s
 }
 
 func dotF32Go(x, y []float32) float32 {
@@ -258,10 +282,12 @@ func dotF32Go(x, y []float32) float32 {
 	return s0 + s1 + s2 + s3
 }
 
+// axpyGo is y += a*x with a single-rounding multiply-add per element, the order the attention kernels (scores4,
+// wsum4: one multiply-add per output element, over d or over positions in order) follow on every architecture.
 func axpyGo(a float32, x, y []float32) {
 	y = y[:len(x)]
 	for i, v := range x {
-		y[i] += float32(a * v)
+		y[i] = fma32(a, v, y[i])
 	}
 }
 

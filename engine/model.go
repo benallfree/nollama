@@ -39,11 +39,10 @@ type LoadOptions struct {
 	// prompt's text to Respond and returns what it says, as tokens (see respond.go). For tests; the nollamatest
 	// package builds on it.
 	Respond func(prompt string) string
-	// Deterministic makes the logits, and so greedy output, logprobs and seeded sampling, the same bits on every CPU
-	// architecture, thread count, prompt batch size and prompt-cache state. It runs the portable Go kernels in one
-	// fixed order instead of the assembly ones (several times slower to read prompts), and won't continue a
-	// conversation from half-precision state (thread files in a ThreadDir, snapshots saved without Full), and needs
-	// the f32 KV cache.
+	// Deterministic makes logprobs (Score, Classify, generate's) the same bits on every CPU, as the logits already are
+	// (every kernel follows one reference order): their log-softmax uses portable exp and log. It also refuses what
+	// would break exactness: a compact KV cache, and continuing from half-precision state (thread files in a
+	// ThreadDir, snapshots saved without Full).
 	Deterministic bool
 }
 
@@ -468,7 +467,7 @@ func newModel(g *ggufFile, opts LoadOptions) (*Model, error) {
 		KVCacheType: kvTypeName(m.kvTyp),
 	}
 	if opts.Deterministic {
-		m.det, m.info.Kernels = true, "go (deterministic)"
+		m.det, m.info.Kernels = true, kernelName+" (deterministic)"
 	}
 	ok = true
 	return m, nil

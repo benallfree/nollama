@@ -72,7 +72,8 @@ func dotQ8_0Go(x, y []byte, nb int) float32 {
 		for j := 0; j < 32; j++ {
 			s += int32(int8(xb[2+j])) * int32(int8(yb[4+j]))
 		}
-		sum += float32(f16(xb) * math.Float32frombits(binary.LittleEndian.Uint32(yb)) * float32(s))
+		d := f16(xb) * math.Float32frombits(binary.LittleEndian.Uint32(yb))
+		sum = fma32(d, float32(s), sum) // reference order, as in dotQ4KQ8KGo: exact total, one multiply-add per block
 	}
 	return sum
 }

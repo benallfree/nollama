@@ -138,3 +138,28 @@ func log64(x float64) float64 {
 	hfsq := float64(float64(0.5*f) * f)
 	return float64(k*ln2hi) - ((hfsq - (float64(s*(hfsq+r)) + float64(k*ln2lo))) - f)
 }
+
+// fma32 is a*b+c rounded once to float32, as the arm64 FMADD/FMLA and amd64 VFMADD instructions compute it. The
+// product is exact in float64; the sum is rounded to float64 "to odd" (an inexact result gets its lowest bit set), and
+// with 29 spare bits that makes the final rounding to float32 correct. The quantized dot products' reference order is
+// written with it, so the assembly kernels can match the Go ones bit for bit.
+func fma32(a, b, c float32) float32 {
+	p := float64(a) * float64(b) // exact: 24+24 bits
+	s := p + float64(c)
+	if s-s != 0 { // Inf or NaN
+		return float32(s)
+	}
+	bb := s - p // TwoSum: e is the exact rounding error of s
+	e := (p - (s - bb)) + (float64(c) - bb)
+	if e != 0 {
+		if u := math.Float64bits(s); u&1 == 0 {
+			if (e > 0) == (s > 0) {
+				u++
+			} else {
+				u--
+			}
+			s = math.Float64frombits(u)
+		}
+	}
+	return float32(s)
+}
