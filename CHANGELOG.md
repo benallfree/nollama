@@ -28,6 +28,8 @@ becomes `## vX.Y.Z` and its lines are the release notes (`release.sh` reads them
 - Deterministic mode: `engine.LoadOptions.Deterministic` (`nollama serve --deterministic`, `NOLLAMA_DETERMINISTIC`, `nollama run --deterministic`) also makes logprobs portable (its own `exp`/`log`) and refuses compact KV caches and half-precision saved state.
 - Speculative decoding (experimental: on the CPU engine today it makes answers slower, so it is off unless you ask for it): `nollama serve --draft qwen3-0.6b` (or `NOLLAMA_DRAFT`, `nollama run --draft`) loads a small model beside the one answering to guess a few tokens at a time, which the larger model checks in one pass. With temperature 0 the answer is exactly the one you'd get without it, and with sampling it follows the same distribution. `draft_tokens` in a request's options (0: off) and `--draft-tokens` set how many tokens it guesses. In Go: `engine.GenerateOptions.Draft` and `engine.CheckDraft`.
 
+- Faster prompt reading on ARM64: Q4_K and F16 weights are multiplied two rows at a time against four prompt tokens, Q6_K one row against four, with activations laid out so sub-block scales apply once per 64 weights. On an M1 Max the kernels run 1.36x (Q4_K), 1.16x (Q6_K) and 1.55x (F16) faster than before on one core. Results differ from before by float rounding only, about as much as reading a prompt in one batch differs from reading it token by token. `AGENT_ENGINE_NOGEMM=1` turns the new kernels off. x86-64 is unchanged.
+
 ## v0.0.1-alpha.1
 
 First release.

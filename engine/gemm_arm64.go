@@ -2,7 +2,10 @@
 
 package engine
 
-import "unsafe"
+import (
+	"os"
+	"unsafe"
+)
 
 //go:noescape
 func gemmQ4K2x4Asm(w0, w1, s0, s1, y unsafe.Pointer, nb int, out *float32)
@@ -16,8 +19,15 @@ func gemmQ6K1x4Asm(w, y unsafe.Pointer, nb int, out *float32)
 //go:noescape
 func q4kScalesAsm(w unsafe.Pointer, nb int, dst unsafe.Pointer)
 
+// noGemm (AGENT_ENGINE_NOGEMM set) keeps the 4-column prompt kernels, for
+// comparing against them.
+var noGemm = os.Getenv("AGENT_ENGINE_NOGEMM") != ""
+
 // archFloatAsm turns on the 2-row x 4-column F16 prompt kernel.
 func archFloatAsm() {
+	if noGemm {
+		return
+	}
 	gemmF16x2x4 = func(w0, w1 []byte, y []float32, stride int, out *[8]float32) {
 		n := len(w0) / 2
 		if n%16 != 0 {
@@ -35,6 +45,9 @@ func archFloatAsm() {
 
 // archIntAsm turns on the Q4_K (2-row) and Q6_K (1-row) 4-column prompt kernels.
 func archIntAsm() {
+	if noGemm {
+		return
+	}
 	q4kScales = func(w, dst []byte, nb int) {
 		_, _ = w[nb*q4kBytes-1], dst[nb*q4kScaleBytes-1]
 		q4kScalesAsm(bptr(w), nb, bptr(dst))
