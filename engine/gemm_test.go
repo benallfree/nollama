@@ -59,7 +59,7 @@ func TestPrefillMatchesReference(t *testing.T) {
 	if p == "" {
 		t.Skip("GGUF not set")
 	}
-	m, err := Load(p, LoadOptions{Threads: 4})
+	m, err := Load(p, LoadOptions{Threads: 4, GPU: "off"})
 	if err != nil {
 		t.Fatal(err)
 	}

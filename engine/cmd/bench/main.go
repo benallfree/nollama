@@ -142,14 +142,18 @@ func cmdRun(args []string) error {
 	gen := fs.Int("gen", 128, "tokens to generate")
 	runs := fs.Int("runs", 3, "measured runs (after one warm-up)")
 	kv := fs.String("kv", "", "KV cache type (f32, f16, q8_0, q4_0)")
+	gpu := fs.String("gpu", "off", "off: CPU (the default, so results compare with earlier runs); auto: the GPU when one works")
 	fs.Parse(args)
 	t0 := time.Now()
-	m, err := engine.Load(*gguf, engine.LoadOptions{Threads: *threads, KVCacheType: *kv})
+	m, err := engine.Load(*gguf, engine.LoadOptions{Threads: *threads, KVCacheType: *kv, GPU: *gpu})
 	if err != nil {
 		return err
 	}
 	defer m.Close()
 	r := runResult{Load: time.Since(t0).Seconds(), Kernels: m.Info().Kernels}
+	if g := m.Info().GPU; g != "" {
+		r.Kernels = "gpu: " + g
+	}
 	for i := 0; i <= *runs; i++ {
 		p := promptText(*prompt, i)
 		res, err := m.Generate(context.Background(), p, engine.GenerateOptions{MaxTokens: *gen, IgnoreEOS: true}, nil)
@@ -286,7 +290,7 @@ func cmdCompare(args []string) error {
 		if err != nil {
 			return err
 		}
-		m, err := engine.Load(path, engine.LoadOptions{Threads: cmpThreads})
+		m, err := engine.Load(path, engine.LoadOptions{Threads: cmpThreads, GPU: "off"})
 		if err != nil {
 			return err
 		}

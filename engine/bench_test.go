@@ -17,7 +17,7 @@ func BenchmarkDecode(b *testing.B) {
 	if th == 0 {
 		th = 8
 	}
-	m, err := Load(p, LoadOptions{Threads: th, Deterministic: os.Getenv("DETERMINISTIC") != ""}) // DETERMINISTIC=1: deterministic mode
+	m, err := Load(p, LoadOptions{Threads: th, Deterministic: os.Getenv("DETERMINISTIC") != "", GPU: benchGPU()}) // DETERMINISTIC=1: deterministic mode
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -37,4 +37,12 @@ func BenchmarkDecode(b *testing.B) {
 		b.ReportMetric(float64(res.PromptTokens)/res.Prefill.Seconds(), "prefill-tok/s")
 		b.ReportMetric(float64(res.OutputTokens-1)/res.Decode.Seconds(), "decode-tok/s")
 	}
+}
+
+// benchGPU is the benchmarks' LoadOptions.GPU: NOLLAMA_GPU, or "off" so results compare with earlier CPU runs.
+func benchGPU() string {
+	if g := os.Getenv("NOLLAMA_GPU"); g != "" {
+		return g
+	}
+	return "off"
 }

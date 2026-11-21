@@ -27,7 +27,7 @@ func BenchmarkPrefill(b *testing.B) {
 	if os.Getenv("NOGEMM") != "" {
 		defer promptKernelsOff()()
 	}
-	m, err := Load(p, LoadOptions{Threads: th})
+	m, err := Load(p, LoadOptions{Threads: th, GPU: benchGPU()})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestPrefillAB(t *testing.T) {
 	if trials == 0 {
 		trials = 8
 	}
-	m, err := Load(p, LoadOptions{Threads: th})
+	m, err := Load(p, LoadOptions{Threads: th, GPU: benchGPU()})
 	if err != nil {
 		t.Fatal(err)
 	}
