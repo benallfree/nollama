@@ -172,6 +172,8 @@ func TestFMA32(t *testing.T) {
 
 // fusesFMA reports whether the compiler fused hwFMA32 (it does on arm64).
 func fusesFMA() bool {
-	a, b := float32(1+1.0/(1<<12)), float32(1-1.0/(1<<12)) // a*b = 1 - 2^-24 exactly, rounds to 1 when unfused
-	return hwFMA32(a, b, -1) != 0
+	// a*a = 1 + 2^-11 + 2^-24 exactly. Unfused, the product rounds (a tie, to even) to 1 + 2^-11 and the sum is 0;
+	// fused, the sum is 2^-24.
+	a := float32(1 + 1.0/(1<<12))
+	return hwFMA32(a, a, -(1+1.0/(1<<11))) != 0
 }
