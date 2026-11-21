@@ -88,3 +88,93 @@ kernel void matvec_q8_0_f32(device const uchar *w [[buffer(0)]],
 		y[(ulong)tg.y * a.rows + r] = sum;
 	}
 }
+
+// rmsnorm: out[r] = x[r] * w / sqrt(mean(x[r]^2) + eps), one threadgroup per row of n floats.
+// Rows can be whole hidden states (w length n) or per-head slices for QK-norm (n = headDim).
+// In place is fine (out == x).
+struct NormArgs {
+	uint n;
+	float eps;
+};
+
+kernel void rmsnorm_f32(device const float *x [[buffer(0)]],
+                        device const float *w [[buffer(1)]],
+                        device float *out [[buffer(2)]],
+                        constant NormArgs &a [[buffer(3)]],
+                        threadgroup float *part [[threadgroup(0)]],
+                        uint row [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]],
+                        uint nt [[threads_per_threadgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]],
+                        uint nsg [[simdgroups_per_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+	device const float *xr = x + (ulong)row * a.n;
+	device float *orow = out + (ulong)row * a.n;
+	float ss = 0;
+	for (uint i = tid; i < a.n; i += nt) {
+		ss += xr[i] * xr[i];
+	}
+	ss = simd_sum(ss);
+	if (lane == 0) {
+		part[sg] = ss;
+	}
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+	if (sg == 0) {
+		float v = lane < nsg ? part[lane] : 0;
+		v = simd_sum(v);
+		if (lane == 0) {
+			part[0] = v;
+		}
+	}
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+	float scale = rsqrt(part[0] / float(a.n) + a.eps);
+	for (uint i = tid; i < a.n; i += nt) {
+		orow[i] = xr[i] * scale * w[i];
+	}
+}
+
+// rope_neox rotates pairs (i, i+half) of every head in place: x is [tokens][heads][headDim],
+// cs/sn are [tokens][half] (cos and sin of position*freq, computed on the CPU as forward does).
+struct RopeArgs {
+	uint heads;
+	uint headDim;
+};
+
+kernel void rope_neox_f32(device float *x [[buffer(0)]],
+                          device const float *cs [[buffer(1)]],
+                          device const float *sn [[buffer(2)]],
+                          constant RopeArgs &a [[buffer(3)]],
+                          uint3 gid [[thread_position_in_grid]]) {
+	uint half_ = a.headDim / 2;
+	uint i = gid.x, h = gid.y, t = gid.z;
+	if (i >= half_ || h >= a.heads) {
+		return;
+	}
+	device float *v = x + ((ulong)t * a.heads + h) * a.headDim;
+	float c = cs[t * half_ + i], s = sn[t * half_ + i];
+	float x0 = v[i], x1 = v[i + half_];
+	v[i] = x0 * c - x1 * s;
+	v[i + half_] = x0 * s + x1 * c;
+}
+
+// swiglu: out[i] = silu(gate[i]) * up[i].
+kernel void swiglu_f32(device const float *gate [[buffer(0)]],
+                       device const float *up [[buffer(1)]],
+                       device float *out [[buffer(2)]],
+                       constant uint &n [[buffer(3)]],
+                       uint i [[thread_position_in_grid]]) {
+	if (i < n) {
+		float g = gate[i];
+		out[i] = g / (1 + exp(-g)) * up[i];
+	}
+}
+
+// add: x[i] += y[i] (the residual stream).
+kernel void add_f32(device float *x [[buffer(0)]],
+                    device const float *y [[buffer(1)]],
+                    constant uint &n [[buffer(2)]],
+                    uint i [[thread_position_in_grid]]) {
+	if (i < n) {
+		x[i] += y[i];
+	}
+}

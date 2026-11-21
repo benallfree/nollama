@@ -2,6 +2,7 @@ package engine
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"os"
@@ -179,4 +180,108 @@ func TestGPUMatvec(t *testing.T) {
 	gb := func(d time.Duration) float64 { return float64(bytes) / d.Seconds() / 1e9 }
 	t.Logf("decode-step matrices (%d, %d MB): GPU %v (%.0f GB/s), CPU %v (%.0f GB/s, %d threads)",
 		len(ws), bytes>>20, gpuT.Round(time.Microsecond), gb(gpuT), cpuT.Round(time.Microsecond), gb(cpuT), m.pool.n)
+}
+
+func randFloats(r *rand.Rand, n int) []float32 {
+	x := make([]float32, n)
+	for i := range x {
+		x[i] = float32(r.NormFloat64())
+	}
+	return x
+}
+
+func floatsOf(b []byte, n int) []float32 {
+	x := make([]float32, n)
+	for i := range x {
+		x[i] = getFloat(b, i)
+	}
+	return x
+}
+
+func maxRelDiff(t *testing.T, what string, got, want []float32, tol float64) {
+	t.Helper()
+	var worst float64
+	for i := range want {
+		e := math.Abs(float64(got[i]-want[i])) / math.Max(1, math.Abs(float64(want[i])))
+		worst = max(worst, e)
+	}
+	t.Logf("%s: worst error %.1e", what, worst)
+	if worst > tol {
+		t.Errorf("%s: error %.2e > %.0e", what, worst, tol)
+	}
+}
+
+// TestGPUElementwise checks rmsnorm (whole rows and per-head), RoPE, SwiGLU and add against the CPU code.
+func TestGPUElementwise(t *testing.T) {
+	dev, err := metal.Open()
+	if err != nil {
+		t.Skip(err)
+	}
+	ps, err := dev.Compile(gpuSource, gpuKernels...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := &gpu{dev: dev, ps: ps}
+	defer dev.Close()
+	r := rand.New(rand.NewPCG(7, 8))
+	buf := func(x []float32) *metal.Buffer {
+		b, _ := dev.NewBuffer(4 * len(x))
+		putFloats(b.Bytes(), x)
+		return b
+	}
+
+	// rmsnorm: 3 rows of 2048 (hidden state), then 3*16 rows of 128 (QK-norm per head), in place.
+	for _, c := range []struct{ rows, n int }{{3, 2048}, {48, 128}} {
+		x, w := randFloats(r, c.rows*c.n), randFloats(r, c.n)
+		xb, wb := buf(x), buf(w)
+		if err := dev.Run(u.rmsnormDispatch(metal.Arg{Buf: xb}, metal.Arg{Buf: wb}, metal.Arg{Buf: xb}, c.rows, c.n, 1e-6)); err != nil {
+			t.Fatal(err)
+		}
+		want := make([]float32, len(x))
+		for i := 0; i < c.rows; i++ {
+			rmsnorm(want[i*c.n:(i+1)*c.n], x[i*c.n:(i+1)*c.n], w, 1e-6)
+		}
+		maxRelDiff(t, fmt.Sprintf("rmsnorm %dx%d", c.rows, c.n), floatsOf(xb.Bytes(), len(x)), want, 1e-5)
+		xb.Release()
+		wb.Release()
+	}
+
+	// RoPE: 3 tokens x 16 heads x 128.
+	const tokens, heads, hd = 3, 16, 128
+	x := randFloats(r, tokens*heads*hd)
+	cs, sn := make([]float32, tokens*hd/2), make([]float32, tokens*hd/2)
+	for t := 0; t < tokens; t++ {
+		for i := 0; i < hd/2; i++ {
+			th := float64(40+t) * math.Pow(1e6, -2*float64(i)/hd)
+			cs[t*hd/2+i], sn[t*hd/2+i] = float32(math.Cos(th)), float32(math.Sin(th))
+		}
+	}
+	xb, cb, sb := buf(x), buf(cs), buf(sn)
+	if err := dev.Run(u.ropeDispatch(metal.Arg{Buf: xb}, metal.Arg{Buf: cb}, metal.Arg{Buf: sb}, tokens, heads, hd)); err != nil {
+		t.Fatal(err)
+	}
+	want := append([]float32(nil), x...)
+	for tk := 0; tk < tokens; tk++ {
+		for h := 0; h < heads; h++ {
+			v := want[(tk*heads+h)*hd : (tk*heads+h+1)*hd]
+			rope(v, cs[tk*hd/2:(tk+1)*hd/2], sn[tk*hd/2:(tk+1)*hd/2])
+		}
+	}
+	maxRelDiff(t, "rope", floatsOf(xb.Bytes(), len(x)), want, 1e-6)
+
+	// SwiGLU and add over 6144*3.
+	n := 3 * 6144
+	g, up := randFloats(r, n), randFloats(r, n)
+	gb, ub, ob := buf(g), buf(up), buf(make([]float32, n))
+	if err := dev.Run(u.elementwise("swiglu_f32", n, metal.Arg{Buf: gb}, metal.Arg{Buf: ub}, metal.Arg{Buf: ob}),
+		u.elementwise("add_f32", n, metal.Arg{Buf: gb}, metal.Arg{Buf: ub})); err != nil {
+		t.Fatal(err)
+	}
+	sw, ad := make([]float32, n), make([]float32, n)
+	for i := range sw {
+		sw[i] = g[i] / (1 + expf(-g[i])) * up[i]
+		ad[i] = g[i] + up[i]
+	}
+	maxRelDiff(t, "swiglu", floatsOf(ob.Bytes(), n), sw, 1e-5)
+	maxRelDiff(t, "add", floatsOf(gb.Bytes(), n), ad, 0)
 }
