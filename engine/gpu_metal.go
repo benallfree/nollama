@@ -182,7 +182,7 @@ func (b *metalBatch) matmulTiled(w *weight, x, out gpuRef, n int) {
 	})
 }
 
-// detT is DET_T in gpu_det.metal: tokens per simdgroup in the deterministic matvecs.
+// detT is DET_T in gpu_det.metal and gpu_det.cu: tokens per simdgroup (warp) in the deterministic matvecs.
 const detT = 8
 
 // matmulDet quantizes x into act as the CPU does (Q8_0 or Q8_K blocks, by weight type), then runs the integer

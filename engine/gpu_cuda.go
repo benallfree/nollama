@@ -4,7 +4,6 @@ package engine
 
 import (
 	_ "embed"
-	"errors"
 	"fmt"
 	"math"
 	"unsafe"
@@ -17,6 +16,15 @@ import (
 //go:embed gpu_cuda.ptx
 var cudaPTX string
 
+// gpu_cuda_det.ptx is gpu_det.cu (which includes gpu.cu) compiled for IEEE float32 arithmetic: deterministic mode.
+//
+//go:embed gpu_cuda_det.ptx
+var cudaDetPTX string
+
+// cudaDetKernels are the kernels gpu_det.cu adds for deterministic mode.
+var cudaDetKernels = []string{"rmsnorm_det", "swiglu_det", "quant_q8_0_det", "quant_q8_k_det", "matvec_q8_0_det",
+	"matvec1_q8_0_det", "matmul_q8_0_det", "matvec_q4k_det", "attention_det"}
+
 var cudaKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "matmul_q8_0_f32", "rmsnorm_f32", "rope_neox_f32",
 	"swiglu_f32", "add_f32", "copy_f32", "kv_store_f32", "attention_f32",
 	"attention_split_f32", "attention_combine_f32"}
@@ -28,12 +36,10 @@ type cudaBackend struct {
 	ks      map[string]*cuda.Kernel
 	weights cuda.Ptr // the model file, uploaded once
 	base    uintptr  // address of the file's first byte in host memory
+	det     bool     // the deterministic kernels (gpu_det.cu): the CPU's reference results, bit for bit
 }
 
 func openCUDA(det bool) (gpuBackend, error) {
-	if det {
-		return nil, errors.New("cuda: no deterministic kernels yet")
-	}
 	dev, err := cuda.Open(0)
 	if err != nil {
 		return nil, err
@@ -42,16 +48,24 @@ func openCUDA(det bool) (gpuBackend, error) {
 		dev.Close()
 		return nil, fmt.Errorf("cuda: %s is compute %d.%d; nollama needs 7.5 or newer", dev.Name, dev.Major, dev.Minor)
 	}
-	mod, ks, err := dev.Load(cudaPTX, cudaKernels...)
+	ptx, names := cudaPTX, cudaKernels
+	if det {
+		ptx, names = cudaDetPTX, append(append([]string(nil), cudaKernels...), cudaDetKernels...)
+	}
+	mod, ks, err := dev.Load(ptx, names...)
 	if err != nil {
 		dev.Close()
 		return nil, err
 	}
-	return &cudaBackend{dev: dev, mod: mod, ks: ks}, nil
+	return &cudaBackend{dev: dev, mod: mod, ks: ks, det: det}, nil
 }
 
 func (c *cudaBackend) name() string {
-	return fmt.Sprintf("cuda (%s, %d GB, compute %d.%d)", c.dev.Name, c.dev.Memory>>30, c.dev.Major, c.dev.Minor)
+	det := ""
+	if c.det {
+		det = ", deterministic"
+	}
+	return fmt.Sprintf("cuda (%s, %d GB, compute %d.%d%s)", c.dev.Name, c.dev.Memory>>30, c.dev.Major, c.dev.Minor, det)
 }
 func (c *cudaBackend) unified() bool          { return false }
 func (c *cudaBackend) supports(t uint32) bool { return t == typeQ4_K || t == typeQ8_0 }
@@ -126,7 +140,16 @@ func (c *cudaBackend) batch() gpuBatch      { return &cudaBatch{c: c} }
 type cudaBatch struct {
 	c  *cudaBackend
 	ls []cuda.Launch
+	// quantized: what act holds (deterministic mode), so matmuls sharing an input (q/k/v, gate/up) quantize it once.
+	quantized struct {
+		x, act gpuRef
+		n      int
+		kernel string
+	}
 }
+
+// wrote forgets the quantized activations: the operation being recorded may change their source.
+func (b *cudaBatch) wrote() { b.quantized.kernel = "" }
 
 func carg(r gpuRef) cuda.Arg { return cuda.Arg{Ptr: cptr(r)} }
 
@@ -135,6 +158,7 @@ func (b *cudaBatch) launch(k string, grid, block [3]uint32, shared int, args ...
 }
 
 func (b *cudaBatch) submit() error {
+	b.wrote()
 	err := b.c.dev.Run(b.ls...)
 	b.ls = b.ls[:0]
 	return err
@@ -144,7 +168,11 @@ func (b *cudaBatch) weightArg(w *weight) cuda.Arg {
 	return cuda.Arg{Ptr: b.c.weights + cuda.Ptr(uintptr(unsafe.Pointer(unsafe.SliceData(w.data)))-b.c.base)}
 }
 
-func (b *cudaBatch) matmul(w *weight, x, out gpuRef, n int, _ gpuRef) {
+func (b *cudaBatch) matmul(w *weight, x, out gpuRef, n int, act gpuRef) {
+	if b.c.det {
+		b.matmulDet(w, x, out, n, act)
+		return
+	}
 	if n >= matmulTiledMin && w.typ == typeQ8_0 {
 		b.launch("matmul_q8_0_f32", [3]uint32{uint32((w.rows + 63) / 64), uint32((n + 63) / 64), 1}, [3]uint32{256, 1, 1}, 0,
 			b.weightArg(w), carg(x), carg(out), cuda.Arg{Bytes: u32(uint32(w.rows), uint32(w.cols/32), uint32(w.rowBytes), uint32(w.cols), uint32(n))})
@@ -164,13 +192,59 @@ func (b *cudaBatch) matmul(w *weight, x, out gpuRef, n int, _ gpuRef) {
 		b.weightArg(w), carg(x), carg(out), cuda.Arg{Bytes: u32(uint32(w.rows), uint32(nb), uint32(w.rowBytes), uint32(w.cols))})
 }
 
+// matmulDet quantizes x into act as the CPU does (once for matmuls sharing x), then runs the integer dot products in
+// the CPU's order (gpu_det.cu).
+func (b *cudaBatch) matmulDet(w *weight, x, out gpuRef, n int, act gpuRef) {
+	var quant, kernel string
+	var bs, abytes int
+	switch w.typ {
+	case typeQ8_0:
+		quant, kernel, bs, abytes = "quant_q8_0_det", "matvec_q8_0_det", 32, q80aBytes
+	case typeQ4_K:
+		quant, kernel, bs, abytes = "quant_q8_k_det", "matvec_q4k_det", qk, q8kBytes
+	default:
+		panic("cuda: deterministic matmul doesn't support " + typeName(w.typ))
+	}
+	nb := w.cols / bs
+	const nsg = 4 // blocks or rows (warps) per thread block
+	q := &b.quantized
+	if q.kernel != quant || q.x != x || q.act != act || q.n != n {
+		b.launch(quant, [3]uint32{uint32((n*nb + nsg - 1) / nsg), 1, 1}, [3]uint32{32 * nsg, 1, 1}, 0,
+			carg(x), carg(act), cuda.Arg{Bytes: u32(uint32(n * nb))})
+		q.x, q.act, q.n, q.kernel = x, act, n, quant
+	}
+	if out.buf == x.buf || out.buf == act.buf {
+		b.wrote()
+	}
+	args := cuda.Arg{Bytes: u32(uint32(w.rows), uint32(nb), uint32(w.rowBytes), uint32(nb*abytes), uint32(n))}
+	if n >= matmulTiledMin && w.typ == typeQ8_0 { // prompts: 64x64 tiles
+		b.launch("matmul_q8_0_det", [3]uint32{uint32((w.rows + 63) / 64), uint32((n + 63) / 64), 1}, [3]uint32{256, 1, 1}, 0,
+			b.weightArg(w), carg(act), carg(out), args)
+		return
+	}
+	if n == 1 && w.typ == typeQ8_0 && nb <= 1024 { // decode: coalesced loads
+		b.launch("matvec1_q8_0_det", [3]uint32{uint32((w.rows + nsg - 1) / nsg), 1, 1}, [3]uint32{32 * nsg, 1, 1}, nsg*2*nb*4,
+			b.weightArg(w), carg(act), carg(out), args)
+		return
+	}
+	b.launch(kernel, [3]uint32{uint32((w.rows + nsg - 1) / nsg), uint32((n + detT - 1) / detT), 1}, [3]uint32{32 * nsg, 1, 1},
+		nsg*64*min(detT, n)*4, b.weightArg(w), carg(act), carg(out), args)
+}
+
 func (b *cudaBatch) rmsnorm(x, w, out gpuRef, rows, n int, eps float64) {
+	b.wrote()
+	if b.c.det {
+		b.launch("rmsnorm_det", [3]uint32{uint32(rows), 1, 1}, [3]uint32{32, 1, 1}, 0,
+			carg(x), carg(w), carg(out), cuda.Arg{Bytes: u32(uint32(n), math.Float32bits(float32(eps)))})
+		return
+	}
 	nt := min(1024, (n+31)&^31)
 	b.launch("rmsnorm_f32", [3]uint32{uint32(rows), 1, 1}, [3]uint32{uint32(nt), 1, 1}, 0,
 		carg(x), carg(w), carg(out), cuda.Arg{Bytes: u32(uint32(n), math.Float32bits(float32(eps)))})
 }
 
 func (b *cudaBatch) rope(x, cs, sn gpuRef, tokens, heads, headDim int) {
+	b.wrote()
 	half := headDim / 2
 	tw := min(half, 64)
 	b.launch("rope_neox_f32", [3]uint32{uint32((half + tw - 1) / tw), uint32(heads), uint32(tokens)}, [3]uint32{uint32(tw), 1, 1}, 0,
@@ -182,12 +256,25 @@ func (b *cudaBatch) elementwise(k string, n int, args ...cuda.Arg) {
 }
 
 func (b *cudaBatch) swiglu(gate, up, out gpuRef, n int) {
+	b.wrote()
+	if b.c.det {
+		b.elementwise("swiglu_det", n, carg(gate), carg(up), carg(out))
+		return
+	}
 	b.elementwise("swiglu_f32", n, carg(gate), carg(up), carg(out))
 }
-func (b *cudaBatch) add(x, y gpuRef, n int)      { b.elementwise("add_f32", n, carg(x), carg(y)) }
-func (b *cudaBatch) copy(dst, src gpuRef, n int) { b.elementwise("copy_f32", n, carg(dst), carg(src)) }
+func (b *cudaBatch) add(x, y gpuRef, n int) {
+	b.wrote()
+	b.elementwise("add_f32", n, carg(x), carg(y))
+}
+
+func (b *cudaBatch) copy(dst, src gpuRef, n int) {
+	b.wrote()
+	b.elementwise("copy_f32", n, carg(dst), carg(src))
+}
 
 func (b *cudaBatch) storeKV(k, v, kc, vc gpuRef, n, pos, kvd, ctxP int) {
+	b.wrote()
 	b.launch("kv_store_f32", [3]uint32{uint32((kvd + 255) / 256), uint32(n), 1}, [3]uint32{256, 1, 1}, 0,
 		carg(k), carg(v), carg(kc), carg(vc), cuda.Arg{Bytes: u32(uint32(kvd), uint32(ctxP), uint32(pos))})
 }
@@ -195,6 +282,13 @@ func (b *cudaBatch) storeKV(k, v, kc, vc gpuRef, n, pos, kvd, ctxP int) {
 func (b *cudaBatch) attention(a gpuAttention) {
 	if a.kvType != typeF32 {
 		panic(fmt.Sprintf("cuda: attention over a %s cache isn't supported", kvTypeName(a.kvType)))
+	}
+	b.wrote()
+	if b.c.det { // the CPU's order: one pass per (token, head), no split (its partial sums would be added in another order)
+		b.launch("attention_det", [3]uint32{uint32(a.heads), uint32(a.n), 1}, [3]uint32{128, 1, 1}, 4*(a.headDim+4),
+			carg(a.q), carg(a.k), carg(a.v), carg(a.out), carg(a.scratch), carg(a.mask),
+			cuda.Arg{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos), a.scale())})
+		return
 	}
 	const nt = 256
 	if chunk, splits, ok := a.split(); ok {
