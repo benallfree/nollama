@@ -36,6 +36,10 @@ var (
 
 const q4kScaleBytes = 80
 
+// gemmF16x2x4, when set, computes out[r*4+c] = dot(F16 row r, y[c*stride:])
+// for rows w0, w1 and 4 float activation rows stride floats apart.
+var gemmF16x2x4 func(w0, w1 []byte, y []float32, stride int, out *[8]float32)
+
 // packQ8K4 copies nb plain Q8_K blocks of one activation row into lane j of a
 // q8k4 group.
 func packQ8K4(src, dst []byte, j, nb int) {
@@ -55,4 +59,44 @@ func packQ8K4(src, dst []byte, j, nb int) {
 			binary.LittleEndian.PutUint16(d[16+4*qk+8*k+2*j:], uint16(s0+s1))
 		}
 	}
+}
+
+// The q8k6 layout holds 4 activation rows' Q8_K blocks interleaved for the
+// Q6_K prompt kernel. Per 256-value block:
+//
+//	d[4]          float32, one per row
+//	qs[4][4][64]  int8: group g (values 64g..64g+63), row j, transposed in
+//	              4-byte lanes: byte 16*l + 4*i + b is value 16*i + 4*l + b
+//
+// matching Q6_K weights whose 4 sub-blocks per group are transposed the same
+// way.
+const q8k6Bytes = 16 + 4*qk
+
+// gemmQ6K1x4, when set, computes out[c] = dot(Q6_K row w, column c) against
+// one q8k6 group of 4 columns.
+var gemmQ6K1x4 func(w, y []byte, nb int, out *[4]float32)
+
+// packQ8K6 copies nb plain Q8_K blocks of one activation row into lane j of a
+// q8k6 group.
+func packQ8K6(src, dst []byte, j, nb int) {
+	for b := 0; b < nb; b++ {
+		s, d := src[b*q8kBytes:], dst[b*q8k6Bytes:]
+		copy(d[4*j:4*j+4], s[:4])
+		for g := 0; g < qk/64; g++ {
+			sq, dq := s[q8kQsOff+64*g:], d[16+256*g+64*j:]
+			for l := 0; l < 4; l++ {
+				for i := 0; i < 4; i++ {
+					copy(dq[16*l+4*i:16*l+4*i+4], sq[16*i+4*l:16*i+4*l+4])
+				}
+			}
+		}
+	}
+}
+
+// promptKernelsOff turns the 2-row prompt kernels off (for before/after
+// comparisons) and returns a function that turns them back on.
+func promptKernelsOff() (restore func()) {
+	q, f, q6 := gemmQ4K2x4, gemmF16x2x4, gemmQ6K1x4
+	gemmQ4K2x4, gemmF16x2x4, gemmQ6K1x4 = nil, nil, nil
+	return func() { gemmQ4K2x4, gemmF16x2x4, gemmQ6K1x4 = q, f, q6 }
 }

@@ -132,6 +132,7 @@ func useFloatAsm() {
 		_ = out[3*ostride+hd-1]
 		wsum4Asm(fptr(p), pstride*4, fptr(v), vstride*4, n4, hd, fptr(out), ostride*4)
 	}
+	archFloatAsm()
 }
 
 func useIntAsm() {

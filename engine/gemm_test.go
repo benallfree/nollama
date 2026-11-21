@@ -89,15 +89,13 @@ func TestPrefillMatchesReference(t *testing.T) {
 	}
 	text := strings.Repeat("The harbor town woke slowly; gulls argued over the nets while the ferry captain counted crates. ", 40)
 	all := m.Tokenize(text)
-	saved := gemmQ4K2x4
-	defer func() { gemmQ4K2x4 = saved }()
 	for _, n := range []int{5, 37, 300, 600} {
 		ids := all[:n]
-		gemmQ4K2x4 = saved
 		fast, fgen := run(ids, prefillBatch)
-		gemmQ4K2x4 = nil
+		restore := promptKernelsOff()
 		ref, rgen := run(ids, prefillBatch)
 		one, _ := run(ids, 1) // token by token: the old engine's own spread
+		restore()
 		diff := func(a, b []float32) (d float64) {
 			for i := range a {
 				d = max(d, math.Abs(float64(a[i]-b[i])))
@@ -113,6 +111,64 @@ func TestPrefillMatchesReference(t *testing.T) {
 		}
 		if !slices.Equal(fgen[:4], rgen[:4]) {
 			t.Errorf("n=%d: greedy continuation differs: %v vs %v", n, fgen, rgen)
+		}
+	}
+}
+
+func TestGemmF16x2x4(t *testing.T) {
+	if gemmF16x2x4 == nil {
+		t.Skip("no 2x4 F16 kernel on this CPU")
+	}
+	r := rand.New(rand.NewPCG(7, 8))
+	for _, n := range []int{16, 48, 1024, 40} {
+		w := make([]byte, 4*n)
+		for i := 0; i < 2*n; i++ {
+			h := uint16(0x3000+r.IntN(0x1000)) | uint16(r.IntN(2))<<15
+			w[2*i], w[2*i+1] = byte(h), byte(h>>8)
+		}
+		w0, w1 := w[:2*n], w[2*n:]
+		stride := n + 8
+		y := make([]float32, 4*stride)
+		for i := range y {
+			y[i] = float32(r.NormFloat64())
+		}
+		var o [8]float32
+		gemmF16x2x4(w0, w1, y, stride, &o)
+		for ri, wr := range [][]byte{w0, w1} {
+			for c := 0; c < 4; c++ {
+				if want := dotF16F32Go(wr, y[c*stride:c*stride+n]); !close32(o[ri*4+c], want) {
+					t.Errorf("n=%d row %d col %d: %v, want %v", n, ri, c, o[ri*4+c], want)
+				}
+			}
+		}
+	}
+}
+
+func TestGemmQ6K1x4(t *testing.T) {
+	if gemmQ6K1x4 == nil {
+		t.Skip("no Q6_K prompt kernel on this CPU")
+	}
+	r := rand.New(rand.NewPCG(9, 10))
+	for _, nb := range []int{1, 2, 3, 8, 24} {
+		w := randBlocks(r, nb, q6kBytes, []int{208})
+		grp := make([]byte, nb*q8k6Bytes)
+		var plain [4][]byte
+		for j := 0; j < 4; j++ {
+			x := make([]float32, nb*qk)
+			for i := range x {
+				x[i] = float32(r.NormFloat64())
+			}
+			plain[j] = make([]byte, nb*q8kBytes)
+			quantizeQ8K(x, plain[j])
+			packQ8K6(plain[j], grp, j, nb)
+		}
+		var o [4]float32
+		gemmQ6K1x4(w, grp, nb, &o)
+		for c := 0; c < 4; c++ {
+			want := dotQ6KQ8KGo(w, plain[c], nb)
+			if math.Abs(float64(o[c]-want)) > 1e-4*(1+math.Abs(float64(want))) {
+				t.Errorf("nb=%d col %d: %v, want %v", nb, c, o[c], want)
+			}
 		}
 	}
 }

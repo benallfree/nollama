@@ -25,9 +25,7 @@ func BenchmarkPrefill(b *testing.B) {
 		n = 590
 	}
 	if os.Getenv("NOGEMM") != "" {
-		saved := gemmQ4K2x4
-		gemmQ4K2x4 = nil
-		defer func() { gemmQ4K2x4 = saved }()
+		defer promptKernelsOff()()
 	}
 	m, err := Load(p, LoadOptions{Threads: th})
 	if err != nil {
@@ -81,23 +79,23 @@ func TestPrefillAB(t *testing.T) {
 	for i := range ids {
 		ids[i] = 1000 + (i*7919)%50000
 	}
-	saved := gemmQ4K2x4
-	defer func() { gemmQ4K2x4 = saved }()
+	restore := promptKernelsOff()
+	defer restore()
+	set := func(on bool) {
+		restore()
+		if !on {
+			restore = promptKernelsOff()
+		}
+	}
 	states := map[bool]*state{}
 	for _, on := range []bool{false, true} {
-		gemmQ4K2x4 = nil
-		if on {
-			gemmQ4K2x4 = saved
-		}
+		set(on)
 		states[on] = m.newState(n+1, min(n, prefillBatch))
 	}
 	best := map[bool]float64{false: 1e18, true: 1e18}
 	for i := 0; i < trials; i++ {
 		for _, on := range []bool{false, true} {
-			gemmQ4K2x4 = nil
-			if on {
-				gemmQ4K2x4 = saved
-			}
+			set(on)
 			s := states[on]
 			t0 := time.Now()
 			for pos := 0; pos < n; pos += prefillBatch {

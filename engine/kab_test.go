@@ -9,21 +9,10 @@ import (
 	"time"
 )
 
-// minTime runs f trials times and returns the fastest run: on a busy machine
-// the minimum of many short runs is far steadier than an average.
-func minTime(trials int, f func()) time.Duration {
-	best := time.Duration(1 << 62)
-	for i := 0; i < trials; i++ {
-		t0 := time.Now()
-		f()
-		if d := time.Since(t0); d < best {
-			best = d
-		}
-	}
-	return best
-}
-
-// KAB=1 go test -run KernelAB -v: single-thread kernel throughput, min of short runs.
+// KAB=1 go test -run KernelAB -v: single-thread throughput of the prompt
+// kernels, old (4-column) and new, on one L1/L2-resident weight tile. Every
+// trial runs every kernel once and each keeps its fastest trial, so all of
+// them see the same machine conditions (frequency, other load).
 func TestKernelAB(t *testing.T) {
 	if os.Getenv("KAB") == "" {
 		t.Skip("KAB not set")
@@ -31,55 +20,108 @@ func TestKernelAB(t *testing.T) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	r := rand.New(rand.NewPCG(1, 2))
-	rows, cols := 64, 2048 // weights stay in L1/L2 like a matmul tile
+	const rows, cols, reps = 32, 2048, 10
 	nb := cols / qk
-	report := func(name string, macs int, d time.Duration) {
-		fmt.Printf("%-14s %6.1f GMAC/s  (%v)\n", name, float64(macs)/d.Seconds()/1e9, d)
+	type kern struct {
+		name string
+		run  func()
 	}
+	var ks []kern
+	acts := func() (plain [4][]byte, k4, k6 []byte) {
+		k4, k6 = make([]byte, nb*q8k4Bytes), make([]byte, nb*q8k6Bytes)
+		for j := 0; j < 4; j++ {
+			x := make([]float32, cols)
+			for i := range x {
+				x[i] = float32(r.NormFloat64())
+			}
+			plain[j] = make([]byte, nb*q8kBytes)
+			quantizeQ8K(x, plain[j])
+			packQ8K4(plain[j], k4, j, nb)
+			packQ8K6(plain[j], k6, j, nb)
+		}
+		return
+	}
+	plain, k4, k6 := acts()
+	y := make([]byte, 0, 4*nb*q8kBytes)
+	for j := range plain {
+		y = append(y, plain[j]...)
+	}
+	var o4 [4]float32
+	var o8 [8]float32
 	for _, k := range []struct {
 		name string
 		wb   int
 		x4   func(x, y []byte, stride, nb int, out *[4]float32)
-	}{{"q4k x4", q4kBytes, dotQ4Kx4}, {"q6k x4", q6kBytes, dotQ6Kx4}} {
+	}{{"q4k x4 (old)", q4kBytes, dotQ4Kx4}, {"q6k x4 (old)", q6kBytes, dotQ6Kx4}} {
 		if k.x4 == nil {
 			continue
 		}
-		w := randBlocks(r, rows*nb, k.wb, []int{0})
-		x := make([]float32, 4*cols)
-		for i := range x {
-			x[i] = float32(r.NormFloat64())
-		}
-		y := make([]byte, 4*nb*q8kBytes)
-		quantizeQ8K(x, y)
-		rb := nb * k.wb
-		var o [4]float32
-		reps := 20
-		d := minTime(300, func() {
-			for i := 0; i < reps; i++ {
-				for j := 0; j < rows; j++ {
-					k.x4(w[j*rb:], y, nb*q8kBytes, nb, &o)
-				}
+		w, rb, x4 := randBlocks(r, rows*nb, k.wb, []int{0}), nb*k.wb, k.x4
+		ks = append(ks, kern{k.name, func() {
+			for j := 0; j < rows; j++ {
+				x4(w[j*rb:], y, nb*q8kBytes, nb, &o4)
 			}
-		})
-		report(k.name, reps*rows*cols*4, d)
+		}})
 	}
 	if gemmQ4K2x4 != nil {
 		w := randBlocks(r, rows*nb, q4kBytes, []int{0})
-		_, grp := makeQ8K4(r, nb)
 		rb, sb := nb*q4kBytes, nb*q4kScaleBytes
 		sc := make([]byte, rows*sb)
 		for j := 0; j < rows; j++ {
 			q4kScales(w[j*rb:], sc[j*sb:], nb)
 		}
-		var o [8]float32
-		reps := 20
-		d := minTime(300, func() {
-			for i := 0; i < reps; i++ {
-				for j := 0; j < rows; j += 2 {
-					gemmQ4K2x4(w[j*rb:], w[(j+1)*rb:], sc[j*sb:], sc[(j+1)*sb:], grp, nb, &o)
-				}
+		ks = append(ks, kern{"q4k 2x4 (new)", func() {
+			for j := 0; j < rows; j += 2 {
+				gemmQ4K2x4(w[j*rb:], w[(j+1)*rb:], sc[j*sb:], sc[(j+1)*sb:], k4, nb, &o8)
 			}
-		})
-		report("q4k 2x4", reps*rows*cols*4, d)
+		}})
+	}
+	if gemmQ6K1x4 != nil {
+		w, rb := randBlocks(r, rows*nb, q6kBytes, []int{208}), nb*q6kBytes
+		ks = append(ks, kern{"q6k 1x4 (new)", func() {
+			for j := 0; j < rows; j++ {
+				gemmQ6K1x4(w[j*rb:], k6, nb, &o4)
+			}
+		}})
+	}
+	if dotF16x4 != nil {
+		w := make([]byte, rows*cols*2)
+		for i := 0; i < rows*cols; i++ {
+			h := uint16(0x3000 + r.IntN(0x1000))
+			w[2*i], w[2*i+1] = byte(h), byte(h>>8)
+		}
+		yf := make([]float32, 4*cols)
+		for i := range yf {
+			yf[i] = float32(r.NormFloat64())
+		}
+		rb := cols * 2
+		ks = append(ks, kern{"f16 x4 (old)", func() {
+			for j := 0; j < rows; j++ {
+				dotF16x4(w[j*rb:(j+1)*rb], yf, cols, &o4)
+			}
+		}})
+		if gemmF16x2x4 != nil {
+			ks = append(ks, kern{"f16 2x4 (new)", func() {
+				for j := 0; j < rows; j += 2 {
+					gemmF16x2x4(w[j*rb:(j+1)*rb], w[(j+1)*rb:(j+2)*rb], yf, cols, &o8)
+				}
+			}})
+		}
+	}
+	best := make([]time.Duration, len(ks))
+	for i := range best {
+		best[i] = 1 << 62
+	}
+	for trial := 0; trial < 400; trial++ {
+		for i, k := range ks {
+			t0 := time.Now()
+			for rep := 0; rep < reps; rep++ {
+				k.run()
+			}
+			best[i] = min(best[i], time.Since(t0))
+		}
+	}
+	for i, k := range ks {
+		fmt.Printf("%-14s %6.1f GMAC/s\n", k.name, float64(reps*rows*cols*4)/best[i].Seconds()/1e9)
 	}
 }

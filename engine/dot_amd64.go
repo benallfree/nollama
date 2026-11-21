@@ -37,5 +37,6 @@ func hasAVX2FMA() bool {
 	return ebx7&(1<<5) != 0 // AVX2
 }
 
-// archIntAsm: amd64 keeps the plain Q8_K layout for the 4-column kernels.
-func archIntAsm() {}
+// The 2-row prompt kernels are arm64-only so far.
+func archIntAsm()   {}
+func archFloatAsm() {}
