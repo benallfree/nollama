@@ -13,6 +13,12 @@ import (
 //go:embed gpu.metal
 var metalSource string
 
+//go:embed gpu_det.metal
+var metalDetSource string
+
+// metalDetKernels are the kernels metalDetSource adds for deterministic mode.
+var metalDetKernels = []string{"rmsnorm_det", "swiglu_det", "quant_q8_0_det", "quant_q8_k_det", "matvec_q8_0_det", "matvec_q4k_det", "attention_det"}
+
 // metalKernels are the kernels metalSource defines.
 var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "attention_f32", "attention_split_f32", "attention_combine_f32", "kv_store_f32", "copy_f32"}
 
@@ -22,9 +28,10 @@ type metalBackend struct {
 	ps      map[string]*metal.Pipeline
 	weights *metal.Buffer // the whole GGUF file, zero-copy
 	base    uintptr       // address of the file's first byte
+	det     bool          // the deterministic kernels (gpu_det.metal): the CPU's reference results, bit for bit
 }
 
-func openMetal() (gpuBackend, error) {
+func openMetal(det bool) (gpuBackend, error) {
 	dev, err := metal.Open()
 	if err != nil {
 		return nil, err
@@ -33,15 +40,25 @@ func openMetal() (gpuBackend, error) {
 		dev.Close()
 		return nil, errors.New("metal: GPUs without unified memory aren't supported")
 	}
-	ps, err := dev.Compile(metalSource, metalKernels...)
+	var ps map[string]*metal.Pipeline
+	if det { // fast math off; gpu_det.metal comes first, so its no-contraction pragma covers the shared kernels too
+		ps, err = dev.CompilePrecise(metalDetSource+"\n"+metalSource, append(metalDetKernels, metalKernels...)...)
+	} else {
+		ps, err = dev.Compile(metalSource, metalKernels...)
+	}
 	if err != nil {
 		dev.Close()
 		return nil, err
 	}
-	return &metalBackend{dev: dev, ps: ps}, nil
+	return &metalBackend{dev: dev, ps: ps, det: det}, nil
 }
 
-func (m *metalBackend) name() string  { return "metal (" + m.dev.Name + ")" }
+func (m *metalBackend) name() string {
+	if m.det {
+		return "metal (" + m.dev.Name + ", deterministic)"
+	}
+	return "metal (" + m.dev.Name + ")"
+}
 func (m *metalBackend) unified() bool { return true }
 
 func (m *metalBackend) supports(t uint32) bool { return t == typeQ4_K || t == typeQ8_0 }
@@ -109,8 +126,10 @@ func (b *metalBatch) weightArg(w *weight) metal.Arg {
 // matmulTiledMin is the token count from which matmul uses the tiled kernel.
 const matmulTiledMin = 8
 
-func (b *metalBatch) matmul(w *weight, x, out gpuRef, n int) {
-	if n >= matmulTiledMin && w.typ == typeQ8_0 {
+func (b *metalBatch) matmul(w *weight, x, out gpuRef, n int, act gpuRef) {
+	if b.m.det {
+		b.matmulDet(w, x, out, n, act)
+	} else if n >= matmulTiledMin && w.typ == typeQ8_0 {
 		b.matmulTiled(w, x, out, n)
 	} else {
 		b.matvec(w, x, out, n)
@@ -152,7 +171,44 @@ func (b *metalBatch) matmulTiled(w *weight, x, out gpuRef, n int) {
 	})
 }
 
+// matmulDet quantizes x into act as the CPU does (Q8_0 or Q8_K blocks, by weight type), then runs the integer
+// matvec that follows the CPU's dot product order, for each token.
+func (b *metalBatch) matmulDet(w *weight, x, out gpuRef, n int, act gpuRef) {
+	var quant, kernel string
+	var bs, abytes int
+	switch w.typ {
+	case typeQ8_0:
+		quant, kernel, bs, abytes = "quant_q8_0_det", "matvec_q8_0_det", 32, q80aBytes
+	case typeQ4_K:
+		quant, kernel, bs, abytes = "quant_q8_k_det", "matvec_q4k_det", qk, q8kBytes
+	default:
+		panic("metal: deterministic matmul doesn't support " + typeName(w.typ))
+	}
+	nb := w.cols / bs
+	const nsg = 4 // blocks or rows (simdgroups) per threadgroup
+	b.ds = append(b.ds, metal.Dispatch{
+		P:       b.m.ps[quant],
+		Args:    []metal.Arg{marg(x), marg(act), {Bytes: u32(uint32(n * nb))}},
+		Groups:  metal.Size{W: uint((n*nb + nsg - 1) / nsg), H: 1, D: 1},
+		Threads: metal.Size{W: 32 * nsg, H: 1, D: 1},
+	}, metal.Dispatch{
+		P:       b.m.ps[kernel],
+		Args:    []metal.Arg{b.weightArg(w), marg(act), marg(out), {Bytes: u32(uint32(w.rows), uint32(nb), uint32(w.rowBytes), uint32(nb*abytes))}},
+		Groups:  metal.Size{W: uint((w.rows + nsg - 1) / nsg), H: uint(n), D: 1},
+		Threads: metal.Size{W: 32 * nsg, H: 1, D: 1},
+	})
+}
+
 func (b *metalBatch) rmsnorm(x, w, out gpuRef, rows, n int, eps float64) {
+	if b.m.det {
+		b.ds = append(b.ds, metal.Dispatch{
+			P:       b.m.ps["rmsnorm_det"],
+			Args:    []metal.Arg{marg(x), marg(w), marg(out), {Bytes: u32(uint32(n), math.Float32bits(float32(eps)))}},
+			Groups:  metal.Size{W: uint(rows), H: 1, D: 1},
+			Threads: metal.Size{W: 32, H: 1, D: 1},
+		})
+		return
+	}
 	p := b.m.ps["rmsnorm_f32"]
 	nt := min(p.MaxThreads, 1024, (n+31)&^31)
 	b.ds = append(b.ds, metal.Dispatch{
@@ -186,6 +242,10 @@ func (b *metalBatch) elementwise(kernel string, n int, args ...metal.Arg) {
 }
 
 func (b *metalBatch) swiglu(gate, up, out gpuRef, n int) {
+	if b.m.det {
+		b.elementwise("swiglu_det", n, marg(gate), marg(up), marg(out))
+		return
+	}
 	b.elementwise("swiglu_f32", n, marg(gate), marg(up), marg(out))
 }
 
@@ -196,6 +256,17 @@ func (b *metalBatch) copy(dst, src gpuRef, n int) { b.elementwise("copy_f32", n,
 func (b *metalBatch) attention(a gpuAttention) {
 	if a.kvType != typeF32 {
 		panic(fmt.Sprintf("metal: attention over a %s cache isn't supported", kvTypeName(a.kvType)))
+	}
+	if b.m.det { // the CPU's order: one pass per (token, head), no split (its partial sums would be added in another order)
+		b.ds = append(b.ds, metal.Dispatch{
+			P: b.m.ps["attention_det"],
+			Args: []metal.Arg{marg(a.q), marg(a.k), marg(a.v), marg(a.out), marg(a.scratch), marg(a.mask),
+				{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos), a.scale())}},
+			Groups:  metal.Size{W: uint(a.heads), H: uint(a.n), D: 1},
+			Threads: metal.Size{W: 128, H: 1, D: 1},
+			Shared:  4 * (a.headDim + 4),
+		})
+		return
 	}
 	const nt = 256
 	if chunk, splits, ok := a.split(); ok {

@@ -4,6 +4,7 @@ package engine
 
 import (
 	_ "embed"
+	"errors"
 	"fmt"
 	"math"
 	"unsafe"
@@ -29,7 +30,10 @@ type cudaBackend struct {
 	base    uintptr  // address of the file's first byte in host memory
 }
 
-func openCUDA() (gpuBackend, error) {
+func openCUDA(det bool) (gpuBackend, error) {
+	if det {
+		return nil, errors.New("cuda: no deterministic kernels yet")
+	}
 	dev, err := cuda.Open(0)
 	if err != nil {
 		return nil, err
@@ -140,7 +144,7 @@ func (b *cudaBatch) weightArg(w *weight) cuda.Arg {
 	return cuda.Arg{Ptr: b.c.weights + cuda.Ptr(uintptr(unsafe.Pointer(unsafe.SliceData(w.data)))-b.c.base)}
 }
 
-func (b *cudaBatch) matmul(w *weight, x, out gpuRef, n int) {
+func (b *cudaBatch) matmul(w *weight, x, out gpuRef, n int, _ gpuRef) {
 	if n >= matmulTiledMin && w.typ == typeQ8_0 {
 		b.launch("matmul_q8_0_f32", [3]uint32{uint32((w.rows + 31) / 32), uint32((n + 31) / 32), 1}, [3]uint32{256, 1, 1}, 0,
 			b.weightArg(w), carg(x), carg(out), cuda.Arg{Bytes: u32(uint32(w.rows), uint32(w.cols/32), uint32(w.rowBytes), uint32(w.cols), uint32(n))})

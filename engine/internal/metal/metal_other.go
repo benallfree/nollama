@@ -27,6 +27,10 @@ func (d *Device) Compile(src string, kernels ...string) (map[string]*Pipeline, e
 	return nil, errors.New("metal: macOS only")
 }
 
+func (d *Device) CompilePrecise(src string, kernels ...string) (map[string]*Pipeline, error) {
+	return nil, errors.New("metal: macOS only")
+}
+
 type Buffer struct{}
 
 func (b *Buffer) Bytes() []byte { return nil }

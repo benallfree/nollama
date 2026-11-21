@@ -133,7 +133,7 @@ func quantizeQ8K(x []float32, out []byte) {
 				amax, max = a, v
 			}
 		}
-		if amax == 0 {
+		if amax < qTiny { // zeros, or values so small that -128/max would overflow
 			for i := range ob {
 				ob[i] = 0
 			}
@@ -254,6 +254,17 @@ func sum16(a *[16]float32) float32 {
 		w[k] = (a[k] + a[k+8]) + (a[k+4] + a[k+12])
 	}
 	return (w[0] + w[1]) + (w[2] + w[3])
+}
+
+// sum32 adds 32 lanes in a fixed tree: a[i] += a[i+s] for i < s, s = 16, 8, 4, 2, 1. A simdgroup computes the same
+// tree with simd_shuffle_down (tree32 in gpu_det.metal).
+func sum32(a *[32]float32) float32 {
+	for s := 16; s > 0; s >>= 1 {
+		for i := 0; i < s; i++ {
+			a[i] += a[i+s]
+		}
+	}
+	return a[0]
 }
 
 // dotF16Tail sums the last n%16 elements in order.

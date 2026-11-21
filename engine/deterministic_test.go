@@ -22,8 +22,8 @@ const detTokens = 40
 
 // detGolden: sha256 of the tiny model's GGUF bytes and of the float32 bits of the serial logits for each fixture.
 var detGolden = map[string][2]string{
-	"f32":  {"76fe28e655f344d9f1fb4cf0d355ae5e311898ccf277f57ba774c30e3017c487", "9e65b308975754ada935ec86ae69540f9cf0514fd0eeff84c3cc5ea4f9f2f244"},
-	"q8_0": {"dc78f121bafe9d25f37d2345b8ff76d7be2a3001aac544035eaa0a8133cdd57f", "048d9eec0c033c2c1d878ac1fc757d7dc4fa14479b2dd0c732ecaefa7a625a45"},
+	"f32":  {"76fe28e655f344d9f1fb4cf0d355ae5e311898ccf277f57ba774c30e3017c487", "18df1aff304b66a51452125f1b3a639ae6fcff6c59be0cf29adf2c63559f46a9"},
+	"q8_0": {"dc78f121bafe9d25f37d2345b8ff76d7be2a3001aac544035eaa0a8133cdd57f", "7b24a4bc077b8ce0d642e7763d4a78a413a8691418cc838f4c23a0ad60ff6b18"},
 }
 
 func detFixture(t *testing.T, kind string) string {
@@ -118,7 +118,7 @@ func TestDeterministic(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			p := detFixture(t, kind)
 			load := func(threads int) *Model {
-				m, err := Load(p, LoadOptions{Threads: threads, Deterministic: true, PromptCache: 64 << 20})
+				m, err := Load(p, LoadOptions{Threads: threads, Deterministic: true, PromptCache: 64 << 20, GPU: "off"})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -182,6 +182,35 @@ func TestDeterministic(t *testing.T) {
 				}
 			}
 
+			// a GPU with deterministic kernels computes the same logits, serial and batched, and the same Score
+			mg, err := Load(p, LoadOptions{Deterministic: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer mg.Close()
+			if mg.Info().GPU == "" {
+				t.Logf("no deterministic GPU: %s", mg.Info().GPUNote)
+			} else {
+				t.Logf("GPU: %s", mg.Info().GPU)
+				for _, c := range []struct {
+					name  string
+					batch int
+				}{{"serial", 1}, {"batch=all", 0}, {"batch=7", 7}} {
+					if pos, d := firstDiff(ref, detLogits(mg, ids, c.batch)); pos >= 0 {
+						t.Errorf("GPU %s: position %d differs from the CPU (max |d| %g)", c.name, pos, d)
+					}
+				}
+				scg, err := mg.Score(context.Background(), ids, ScoreOptions{Batch: 64, TopLogprobs: 3})
+				if err != nil {
+					t.Fatal(err)
+				}
+				for i := range sc1 {
+					if math.Float64bits(sc1[i].Logprob.Logprob) != math.Float64bits(scg[i].Logprob.Logprob) {
+						t.Fatalf("GPU Score differs from the CPU at token %d: %v vs %v", i+1, scg[i], sc1[i])
+					}
+				}
+			}
+
 			// the default (assembly) path computes the same logits: every kernel follows the reference order
 			md, err := Load(p, LoadOptions{Threads: 2, GPU: "off"}) // the CPU kernels; the GPU has its own order
 			if err != nil {
@@ -214,12 +243,12 @@ func TestDeterministicGGUF(t *testing.T) {
 	if p == "" {
 		t.Skip("GGUF not set")
 	}
-	m1, err := Load(p, LoadOptions{Threads: 1, Deterministic: true})
+	m1, err := Load(p, LoadOptions{Threads: 1, Deterministic: true, GPU: "off"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer m1.Close()
-	m8, err := Load(p, LoadOptions{Threads: 8, Deterministic: true})
+	m8, err := Load(p, LoadOptions{Threads: 8, Deterministic: true, GPU: "off"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,6 +260,21 @@ func TestDeterministicGGUF(t *testing.T) {
 	}
 	if pos, d := firstDiff(detLogits(m1, ids[:12], 1), ref); pos >= 0 {
 		t.Errorf("1 thread: position %d differs (max |d| %g)", pos, d)
+	}
+	if mg, err := Load(p, LoadOptions{Deterministic: true}); err != nil {
+		t.Fatal(err)
+	} else if mg.Info().GPU == "" {
+		t.Logf("no deterministic GPU: %s", mg.Info().GPUNote)
+		mg.Close()
+	} else {
+		t.Logf("GPU: %s", mg.Info().GPU)
+		if pos, d := firstDiff(ref, detLogits(mg, ids, 1)); pos >= 0 {
+			t.Errorf("GPU serial: position %d differs from the CPU (max |d| %g)", pos, d)
+		}
+		if pos, d := firstDiff(ref, detLogits(mg, ids, 0)); pos >= 0 {
+			t.Errorf("GPU batch: position %d differs from the CPU (max |d| %g)", pos, d)
+		}
+		mg.Close()
 	}
 	h := logitsHash(ref)
 	t.Logf("serial logits %s (kernels on this CPU otherwise: %s)", h, kernelName)

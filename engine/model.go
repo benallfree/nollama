@@ -45,7 +45,8 @@ type LoadOptions struct {
 	// ThreadDir, snapshots saved without Full).
 	Deterministic bool
 	// GPU picks where the forward pass runs: "" or "auto" uses a GPU when one works and supports the model (Metal on
-	// Apple Silicon, CUDA on NVIDIA); "off" keeps it on the CPU. Deterministic and Respond models always use the CPU.
+	// Apple Silicon, CUDA on NVIDIA); "off" keeps it on the CPU. Respond models always use the CPU. Deterministic models
+	// use only a GPU with deterministic kernels (Metal so far), which give the CPU's results bit for bit.
 	// Info.GPU says which GPU, and Info.GPUNote why none. NOLLAMA_NO_GPU=1 in the environment also turns it off.
 	GPU string
 }
@@ -484,12 +485,10 @@ func newModel(g *ggufFile, opts LoadOptions) (*Model, error) {
 		m.info.GPUNote = "GPU off"
 	case g != "" && g != "auto":
 		return nil, fmt.Errorf("engine: GPU %q: want auto or off", opts.GPU)
-	case opts.Deterministic:
-		m.info.GPUNote = "deterministic mode runs on the CPU"
 	case opts.Respond != nil:
 		m.info.GPUNote = "scripted model"
 	default:
-		if gm, err := newGPUModel(m); err != nil {
+		if gm, err := newGPUModel(m, m.det); err != nil {
 			m.info.GPUNote = err.Error()
 		} else {
 			m.gpu, m.info.GPU = gm, gm.b.name()

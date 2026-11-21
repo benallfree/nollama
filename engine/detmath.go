@@ -139,6 +139,20 @@ func log64(x float64) float64 {
 	return float64(k*ln2hi) - ((hfsq - (float64(s*(hfsq+r)) + float64(k*ln2lo))) - f)
 }
 
+// ftz32 flushes a subnormal (below 2^-126 in magnitude) to a zero of the same sign. GPUs do this to every float32
+// input and result (Metal does even with fast math off), so the reference flushes where small values arise in practice:
+// rmsnorm, SwiGLU, the softmax probabilities, and activation blocks of only tiny values (qTiny).
+func ftz32(v float32) float32 {
+	if b := math.Float32bits(v); b&0x7F800000 == 0 {
+		return math.Float32frombits(b & 0x80000000)
+	}
+	return v
+}
+
+// qTiny is the largest magnitude below which an activation block quantizes to all zeros (Q8_0 and Q8_K), so that its
+// scale times any weight scale (even a subnormal f16) stays far above 2^-126, where a GPU would flush it.
+const qTiny = 0x1p-64
+
 // fma32 is a*b+c rounded once to float32, as the arm64 FMADD/FMLA and amd64 VFMADD instructions compute it. The
 // product is exact in float64; the sum is rounded to float64 "to odd" (an inexact result gets its lowest bit set), and
 // with 29 spare bits that makes the final rounding to float32 correct. The quantized dot products' reference order is

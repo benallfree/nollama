@@ -37,11 +37,11 @@ type gpuModel struct {
 var errGPUUnsupported = errors.New("engine: not supported on the GPU yet")
 
 // newGPUModel opens a GPU for m, or explains why m can't run on one.
-func newGPUModel(m *Model) (*gpuModel, error) {
+func newGPUModel(m *Model, det bool) (*gpuModel, error) {
 	if m.kvTyp != typeF32 {
 		return nil, fmt.Errorf("engine: GPU needs the f32 KV cache, not %s", kvTypeName(m.kvTyp))
 	}
-	b, err := openGPU(m.g)
+	b, err := openGPU(m.g, det)
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +106,7 @@ type gpuState struct {
 	bufs                       []gpuBuf
 	x, an, q, k, v, att, tmp   gpuRef
 	gate, up, hf, cs, sn, mask gpuRef
-	scratch, logits            gpuRef
+	scratch, logits, act       gpuRef // act: deterministic backends' quantized activations
 	allLogits                  gpuRef // maxN*vocab, allocated on the first Score
 	kc, vc                     []gpuRef
 	kStage, vStage             gpuRef // discrete GPUs: each layer's new keys and values, [layers][maxN][kvd]
@@ -144,6 +144,7 @@ func (g *gpuModel) stateFor(s *state) (*gpuState, error) {
 		{&gs.att, n * qd}, {&gs.tmp, n * hp.dim}, {&gs.gate, n * hp.ffn}, {&gs.up, n * hp.ffn}, {&gs.hf, n * hp.ffn},
 		{&gs.cs, n * hp.headDim / 2}, {&gs.sn, n * hp.headDim / 2}, {&gs.mask, 2 * n},
 		{&gs.scratch, gs.attnChunk * hp.heads * s.ctxP}, {&gs.logits, hp.vocab},
+		{&gs.act, gpuActBytes(n, max(hp.dim, qd, hp.ffn)) / 4},
 	} {
 		r, err := alloc(a.floats)
 		if err != nil {
@@ -281,9 +282,9 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 	for li := range m.layers {
 		l := &m.layers[li]
 		bt.rmsnorm(gs.x, g.attnNorm[li], gs.an, n, dim, hp.eps)
-		bt.matmul(l.wq, gs.an, gs.q, n)
-		bt.matmul(l.wk, gs.an, gs.k, n)
-		bt.matmul(l.wv, gs.an, gs.v, n)
+		bt.matmul(l.wq, gs.an, gs.q, n, gs.act)
+		bt.matmul(l.wk, gs.an, gs.k, n, gs.act)
+		bt.matmul(l.wv, gs.an, gs.v, n, gs.act)
 		bt.rmsnorm(gs.q, g.qNorm[li], gs.q, n*hp.heads, hd, hp.eps)
 		bt.rmsnorm(gs.k, g.kNorm[li], gs.k, n*hp.kvHeads, hd, hp.eps)
 		bt.rope(gs.q, gs.cs, gs.sn, n, hp.heads, hd)
@@ -301,13 +302,13 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 				n: c, pos: pos + t0, heads: hp.heads, kvHeads: hp.kvHeads, headDim: hd, ctxP: gs.ctxP,
 			})
 		}
-		bt.matmul(l.wo, gs.att, gs.tmp, n)
+		bt.matmul(l.wo, gs.att, gs.tmp, n, gs.act)
 		bt.add(gs.x, gs.tmp, n*dim)
 		bt.rmsnorm(gs.x, g.ffnNorm[li], gs.an, n, dim, hp.eps)
-		bt.matmul(l.wgate, gs.an, gs.gate, n)
-		bt.matmul(l.wup, gs.an, gs.up, n)
+		bt.matmul(l.wgate, gs.an, gs.gate, n, gs.act)
+		bt.matmul(l.wup, gs.an, gs.up, n, gs.act)
 		bt.swiglu(gs.gate, gs.up, gs.hf, n*hp.ffn)
-		bt.matmul(l.wdown, gs.hf, gs.tmp, n)
+		bt.matmul(l.wdown, gs.hf, gs.tmp, n, gs.act)
 		bt.add(gs.x, gs.tmp, n*dim)
 	}
 	last := gs.x.at(4 * (n - 1) * dim)
@@ -336,7 +337,7 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 		g.readFloats(gs.an, s.hidden[:dim])
 	case s.allLogits != nil: // Score: every position's logits
 		bt.rmsnorm(gs.x, g.outNorm, gs.an, n, dim, hp.eps)
-		bt.matmul(m.out, gs.an, gs.allLogits, n)
+		bt.matmul(m.out, gs.an, gs.allLogits, n, gs.act)
 		if err := bt.submit(); err != nil {
 			return err
 		}
@@ -344,7 +345,7 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 		copy(s.logits, s.allLogits[(n-1)*hp.vocab:n*hp.vocab])
 	default:
 		bt.rmsnorm(last, g.outNorm, gs.an, 1, dim, hp.eps)
-		bt.matmul(m.out, gs.an, gs.logits, 1)
+		bt.matmul(m.out, gs.an, gs.logits, 1, gs.act)
 		if err := bt.submit(); err != nil {
 			return err
 		}

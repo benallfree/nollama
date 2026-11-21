@@ -35,7 +35,7 @@ func TestGPUForward(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	g, err := newGPUModel(m)
+	g, err := newGPUModel(m, false)
 	if err != nil {
 		t.Skip(err)
 	}
@@ -106,7 +106,7 @@ func TestGPUForwardSpeed(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	g, err := newGPUModel(m)
+	g, err := newGPUModel(m, false)
 	if err != nil {
 		t.Skip(err)
 	}
@@ -146,7 +146,7 @@ func TestGPUScoreEmbed(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	g, err := newGPUModel(m)
+	g, err := newGPUModel(m, false)
 	if err != nil {
 		t.Skip(err)
 	}
@@ -190,13 +190,13 @@ func TestGPUForwardDiscrete(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	gu, err := newGPUModel(m)
+	gu, err := newGPUModel(m, false)
 	if err != nil {
 		t.Skip(err)
 	}
 	defer gu.close()
 	gpuForceDiscrete = true
-	gd, err := newGPUModel(m)
+	gd, err := newGPUModel(m, false)
 	gpuForceDiscrete = false
 	if err != nil {
 		t.Fatal(err)
@@ -250,7 +250,7 @@ func TestGPUSplitAttention(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	g, err := newGPUModel(m)
+	g, err := newGPUModel(m, false)
 	if err != nil {
 		t.Skip(err)
 	}

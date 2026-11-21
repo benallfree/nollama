@@ -53,8 +53,9 @@ func (r gpuRef) at(off int) gpuRef { return gpuRef{r.buf, r.off + off} }
 // gpuBatch records operations to run in order; submit runs them and waits.
 type gpuBatch interface {
 	// matmul: out[t*w.rows + r] = W row r · x[t*w.cols:], for n tokens. The backend picks its
-	// one-token or tiled kernel by n.
-	matmul(w *weight, x, out gpuRef, n int)
+	// one-token or tiled kernel by n. act is scratch for the quantized activations of deterministic
+	// backends (gpuActBytes); others ignore it.
+	matmul(w *weight, x, out gpuRef, n int, act gpuRef)
 	// rmsnorm normalizes rows rows of n floats from x into out (may equal x), scaled by w (n floats).
 	rmsnorm(x, w, out gpuRef, rows, n int, eps float64)
 	// rope applies NeoX RoPE in place to x [tokens][heads][headDim] with cos/sin tables [tokens][headDim/2].
@@ -82,15 +83,19 @@ type gpuAttention struct {
 	ctxP    int // cache rows, a multiple of 16
 }
 
-// gpuOpeners are the backends to try, in order of preference.
-var gpuOpeners = []func() (gpuBackend, error){openMetal, openCUDA}
+// gpuOpeners are the backends to try, in order of preference. det asks for the deterministic kernels: the CPU's
+// reference results bit for bit (a backend without them fails to open).
+var gpuOpeners = []func(det bool) (gpuBackend, error){openMetal, openCUDA}
+
+// gpuActBytes bounds the quantized form of n activation rows of k floats (Q8_0 or Q8_K blocks).
+func gpuActBytes(n, k int) int { return n * (k/qk + 1) * q8kBytes * 2 }
 
 // openGPU returns the first backend that works on this machine, with the model's weights loaded,
 // or an error listing why each failed.
-func openGPU(g *ggufFile) (gpuBackend, error) {
+func openGPU(g *ggufFile, det bool) (gpuBackend, error) {
 	var why []string
 	for _, open := range gpuOpeners {
-		b, err := open()
+		b, err := open(det)
 		if err != nil {
 			why = append(why, err.Error())
 			continue

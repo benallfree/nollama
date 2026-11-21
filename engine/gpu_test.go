@@ -41,7 +41,7 @@ func getFloat(b []byte, i int) float32 {
 func testBackend(t *testing.T) gpuBackend {
 	t.Helper()
 	for _, open := range gpuOpeners {
-		if b, err := open(); err == nil {
+		if b, err := open(false); err == nil {
 			t.Cleanup(b.close)
 			return b
 		}
@@ -115,7 +115,7 @@ func checkMatmul(t *testing.T, b gpuBackend, w *weight, r *rand.Rand) {
 	ref, mag := refMatmul(w, x, n)
 	for _, nt := range []int{1, 5, n} {
 		bt := b.batch()
-		bt.matmul(w, xr, or, nt)
+		bt.matmul(w, xr, or, nt, gpuRef{})
 		submit(t, bt)
 		got := download(b, or, nt*w.rows)
 		var worst float64
@@ -152,7 +152,7 @@ func openModelGPU(t *testing.T) (*Model, gpuBackend) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { m.Close() })
-	b, err := openGPU(m.g)
+	b, err := openGPU(m.g, false)
 	if err != nil {
 		t.Skip(err)
 	}
@@ -200,7 +200,7 @@ func TestGPUMatmul(t *testing.T) {
 		run := func() {
 			bt := b.batch()
 			for _, w := range ws {
-				bt.matmul(w, xr, or, n)
+				bt.matmul(w, xr, or, n, gpuRef{})
 			}
 			submit(t, bt)
 		}
@@ -405,7 +405,7 @@ func testGPUAttention(t *testing.T, b gpuBackend, pos, n int) {
 // TestGPUBackends reports which GPU backends open here and why the others don't.
 func TestGPUBackends(t *testing.T) {
 	for i, open := range gpuOpeners {
-		b, err := open()
+		b, err := open(false)
 		if err != nil {
 			t.Logf("backend %d: %v", i, err)
 			continue

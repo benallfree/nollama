@@ -53,6 +53,9 @@ var (
 	selExecWidth            = objc.RegisterName("threadExecutionWidth")
 	selHasUnifiedMemory     = objc.RegisterName("hasUnifiedMemory")
 	selRecommendedMaxWS     = objc.RegisterName("recommendedMaxWorkingSetSize")
+	selAlloc                = objc.RegisterName("alloc")
+	selInit                 = objc.RegisterName("init")
+	selSetFastMath          = objc.RegisterName("setFastMathEnabled:")
 
 	classNSString objc.Class // after Foundation loads
 )
@@ -171,11 +174,27 @@ type Pipeline struct {
 
 // Compile compiles Metal Shading Language source and returns a pipeline for each named kernel.
 func (d *Device) Compile(src string, kernels ...string) (map[string]*Pipeline, error) {
+	return d.compile(src, false, kernels)
+}
+
+// CompilePrecise is Compile with fast math off: IEEE division and square roots, no reassociation, and no fusing of
+// a multiply and an add written as separate operations into one multiply-add.
+func (d *Device) CompilePrecise(src string, kernels ...string) (map[string]*Pipeline, error) {
+	return d.compile(src, true, kernels)
+}
+
+func (d *Device) compile(src string, precise bool, kernels []string) (map[string]*Pipeline, error) {
 	out := map[string]*Pipeline{}
 	var err error
 	withPool(func() {
+		opts := objc.ID(0)
+		if precise {
+			opts = objc.ID(objc.GetClass("MTLCompileOptions")).Send(selAlloc).Send(selInit)
+			opts.Send(selSetFastMath, false)
+			defer opts.Send(selRelease)
+		}
 		var e objc.ID
-		lib := d.dev.Send(selNewLibrary, nsString(src), objc.ID(0), unsafe.Pointer(&e))
+		lib := d.dev.Send(selNewLibrary, nsString(src), opts, unsafe.Pointer(&e))
 		if lib == 0 {
 			err = fmt.Errorf("metal: compile: %w", nsError(e))
 			return

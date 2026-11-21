@@ -309,14 +309,20 @@ func (m *Model) matmul(p *pool, a *acts, t0 int, segs ...mmSeg) {
 	})
 }
 
+// rmsnorm is out = x·w / sqrt(mean(x²) + eps) in the reference order the GPU kernels follow too (rmsnorm_det in
+// gpu_det.metal), all in float32: lane l of 32 sums x[i]² for i ≡ l (mod 32) with single-rounding multiply-adds, the
+// lanes are added in the fixed tree sum32, and the square root and division are IEEE (correctly rounded). Subnormal
+// inputs and results are flushed to zero, as GPUs do (ftz32).
 func rmsnorm(out, x, w []float32, eps float64) {
-	var ss float64
-	for _, v := range x {
-		ss += float64(float64(v) * float64(v))
-	}
-	scale := float32(1 / math.Sqrt(ss/float64(len(x))+eps))
+	var a [32]float32
 	for i, v := range x {
-		out[i] = v * scale * w[i]
+		v = ftz32(v)
+		a[i&31] = ftz32(fma32(v, v, a[i&31]))
+	}
+	ss := sum32(&a)
+	scale := 1 / float32(math.Sqrt(float64(ss/float32(len(x))+float32(eps)))) // float32 sqrt, correctly rounded
+	for i, v := range x {
+		out[i] = ftz32(ftz32(ftz32(v)*scale) * ftz32(w[i]))
 	}
 }
 
@@ -573,7 +579,7 @@ func (m *Model) forward(s *state, tokens []int, pos int) {
 					}
 					inv := 1 / sum
 					for j := 0; j < ctx; j++ {
-						row[j] *= inv
+						row[j] = ftz32(row[j] * inv) // as a GPU computes it: probabilities can fall below 2^-126
 					}
 					clear(row[ctx:])
 				}
@@ -613,7 +619,7 @@ func (m *Model) forward(s *state, tokens []int, pos int) {
 				o := t*hp.ffn + b*bs
 				hf, g, u := s.af.f[o:o+bs], s.gate[o:o+bs], s.up[o:o+bs]
 				for i := range hf {
-					hf[i] = g[i] / (1 + expf(-g[i])) * u[i]
+					hf[i] = swiglu(g[i], u[i])
 				}
 				s.af.quantizeRow(t, b*bs, (b+1)*bs)
 			}

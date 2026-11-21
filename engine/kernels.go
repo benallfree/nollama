@@ -51,9 +51,9 @@ func quantizeQ8_0(x []float32, out []byte) {
 				amax = a
 			}
 		}
-		d := amax / 127
-		id := float32(0)
-		if d != 0 {
+		d, id := float32(0), float32(0)
+		if amax >= qTiny { // a block of only tiny values (or zeros) quantizes to zero: no huge or infinite 1/d
+			d = amax / 127
 			id = 1 / d
 		}
 		for j, v := range xb {
@@ -76,6 +76,12 @@ func dotQ8_0Go(x, y []byte, nb int) float32 {
 		sum = fma32(d, float32(s), sum) // reference order, as in dotQ4KQ8KGo: exact total, one multiply-add per block
 	}
 	return sum
+}
+
+// swiglu is silu(g)·u, flushing subnormals as a GPU does (swiglu_det in gpu_det.metal).
+func swiglu(g, u float32) float32 {
+	g = ftz32(g)
+	return ftz32(ftz32(g/(1+expf(-g))) * ftz32(u))
 }
 
 // expf is a fast float32 exp (max rel. error ~2e-7 on [-87, 88]).
