@@ -13,8 +13,8 @@ import (
 // call, with the CPU doing only the embedding lookup, the RoPE tables and reading back the logits.
 //
 // First cut: unified memory only (the KV cache is shared with the CPU, so the prompt cache and threads work
-// unchanged), the f32 KV cache, weights the backend supports, and the plain logits path. Score (every
-// position's logits) and Embed (hidden states) return errGPUUnsupported, and the caller uses forward.
+// unchanged), the f32 KV cache and weights the backend supports. Compact caches return errGPUUnsupported, and the
+// caller uses forward.
 type gpuModel struct {
 	m        *Model
 	b        gpuBackend
@@ -97,6 +97,7 @@ type gpuState struct {
 	x, an, q, k, v, att, tmp   gpuRef
 	gate, up, hf, cs, sn, mask gpuRef
 	scratch, logits            gpuRef
+	allLogits                  gpuRef // maxN*vocab, allocated on the first Score
 	kc, vc                     []gpuRef
 	maxN, ctxP, attnChunk      int
 }
@@ -186,12 +187,22 @@ func (g *gpuModel) close() {
 
 // forward is Model.forward on the GPU: it runs tokens at positions pos.. and fills s.logits for the last one.
 func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
-	if s.allLogits != nil || s.hidden != nil || s.kv != nil {
+	if s.kv != nil {
 		return errGPUUnsupported
 	}
 	gs, err := g.stateFor(s)
 	if err != nil {
 		return err
+	}
+	if s.allLogits != nil && gs.allLogits.buf == nil {
+		buf, err := g.b.alloc(4 * gs.maxN * g.m.hp.vocab)
+		if err != nil {
+			return err
+		}
+		g.mu.Lock()
+		gs.bufs = append(gs.bufs, buf)
+		g.mu.Unlock()
+		gs.allLogits = gpuRef{buf: buf}
 	}
 	m, hp, b := g.m, g.m.hp, g.b
 	n := len(tokens)
@@ -254,17 +265,44 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 		bt.add(gs.x, gs.tmp, n*dim)
 	}
 	last := gs.x.at(4 * (n - 1) * dim)
-	bt.rmsnorm(last, g.outNorm, gs.an, 1, dim, hp.eps)
-	bt.matmul(m.out, gs.an, gs.logits, 1)
-	if err := bt.submit(); err != nil {
-		return err
-	}
-	raw := make([]byte, 4*hp.vocab)
-	b.read(gs.logits, raw)
-	for i := range s.logits {
-		s.logits[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[4*i:]))
+	switch {
+	case s.hidden != nil: // Embed: the last token's normed hidden state, no LM head
+		bt.rmsnorm(last, g.outNorm, gs.an, 1, dim, hp.eps)
+		if err := bt.submit(); err != nil {
+			return err
+		}
+		readFloats(b, gs.an, s.hidden[:dim])
+	case s.allLogits != nil: // Score: every position's logits
+		bt.rmsnorm(gs.x, g.outNorm, gs.an, n, dim, hp.eps)
+		bt.matmul(m.out, gs.an, gs.allLogits, n)
+		if err := bt.submit(); err != nil {
+			return err
+		}
+		readFloats(b, gs.allLogits, s.allLogits[:n*hp.vocab])
+		copy(s.logits, s.allLogits[(n-1)*hp.vocab:n*hp.vocab])
+	default:
+		bt.rmsnorm(last, g.outNorm, gs.an, 1, dim, hp.eps)
+		bt.matmul(m.out, gs.an, gs.logits, 1)
+		if err := bt.submit(); err != nil {
+			return err
+		}
+		readFloats(b, gs.logits, s.logits)
 	}
 	return nil
+}
+
+// readFloats copies len(dst) floats from the device.
+func readFloats(b gpuBackend, src gpuRef, dst []float32) {
+	if b.unified() { // straight from the shared memory
+		mem := b.mapped(src.buf)[src.off:]
+		copy(dst, unsafe.Slice((*float32)(unsafe.Pointer(unsafe.SliceData(mem))), len(dst)))
+		return
+	}
+	raw := make([]byte, 4*len(dst))
+	b.read(src, raw)
+	for i := range dst {
+		dst[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[4*i:]))
+	}
 }
 
 func floatBytes(x []float32) []byte {

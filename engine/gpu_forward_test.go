@@ -137,3 +137,46 @@ func TestGPUForwardSpeed(t *testing.T) {
 	})
 	run("CPU", m.forward)
 }
+
+// TestGPUScoreEmbed checks the Score path (logits for every position) and the Embed path (the last hidden state)
+// against the CPU's float reference.
+func TestGPUScoreEmbed(t *testing.T) {
+	m, err := Load(testGGUF(t), LoadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	g, err := newGPUModel(m)
+	if err != nil {
+		t.Skip(err)
+	}
+	defer g.close()
+	ids := m.Tokenize("The quick brown fox jumps over the lazy dog.")
+	n, vocab, dim := len(ids), m.hp.vocab, m.hp.dim
+	sf, sg := m.newState(64, 32), m.newState(64, 32)
+	sf.allLogits, sg.allLogits = make([]float32, 32*vocab), make([]float32, 32*vocab)
+	floatRef = true
+	m.forward(sf, ids, 0)
+	floatRef = false
+	if err := g.forward(sg, ids, 0); err != nil {
+		t.Fatal(err)
+	}
+	var worst float64
+	for p := 0; p < n; p++ {
+		worst = max(worst, logitDiff(sf.allLogits[p*vocab:(p+1)*vocab], sg.allLogits[p*vocab:(p+1)*vocab]))
+	}
+	t.Logf("Score, %d positions: worst %.1e of the logits' spread vs the float reference", n, worst)
+	if worst > 1e-4 {
+		t.Errorf("Score: %.2e", worst)
+	}
+
+	ef, eg := m.newState(64, 32), m.newState(64, 32)
+	ef.hidden, eg.hidden = make([]float32, dim), make([]float32, dim)
+	floatRef = true
+	m.forward(ef, ids, 0)
+	floatRef = false
+	if err := g.forward(eg, ids, 0); err != nil {
+		t.Fatal(err)
+	}
+	maxRelDiff(t, "Embed hidden state vs float reference", eg.hidden, ef.hidden, 1e-3)
+}
