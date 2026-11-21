@@ -9,7 +9,8 @@ nothing else: no Ollama, no Python, no cgo.
 
 > nollama is alpha. Today it runs Qwen3 models on the CPU, with hand-tuned assembly for ARM64 and x86-64: good for small
 > models doing short, focused jobs, such as labeling a ticket, pulling JSON out of an email or summarizing a record.
-> It also makes embeddings, with Qwen3-Embedding. GPU support, more model families, tool calls and images aren't there yet.
+> It also calls tools and makes embeddings (with Qwen3-Embedding). GPU support, more model families and images aren't
+> there yet.
 
 ## Install
 
@@ -87,6 +88,30 @@ curl http://127.0.0.1:11434/api/embed -d '{
 Vectors are unit length, so a dot product is the cosine similarity. For retrieval, Qwen3-Embedding wants an instruction
 on queries (not on documents): `Instruct: Given a web search query, retrieve relevant passages that answer the
 query\nQuery:<the query>`. `dimensions` keeps the first n values (32 to 1024).
+
+### Tool calls
+
+Pass `tools` (and `tool_choice`: `auto`, `none`, `required` or a named function) on `/v1/chat/completions` or
+`/api/chat`. The model decides between answering and calling a tool; once it starts a call, nollama holds the rest of it
+to a tool you listed and to that tool's parameter schema, token by token. A call always parses, and its arguments match
+the schema. `required` or a named function makes the answer a call from the first token. Several calls in one answer
+come back as several entries in `tool_calls`.
+
+```python
+tools = [{"type": "function", "function": {
+    "name": "get_weather",
+    "description": "Current weather in a city",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+}}]
+messages = [{"role": "user", "content": "What's the weather in Paris?"}]
+r = client.chat.completions.create(model="qwen3-1.7b", messages=messages, tools=tools)
+call = r.choices[0].message.tool_calls[0]  # finish_reason is "tool_calls"
+print(call.function.name, call.function.arguments)  # get_weather {"city": "Paris"}
+
+messages += [r.choices[0].message, {"role": "tool", "tool_call_id": call.id, "content": '{"temp_c": 18, "sky": "sunny"}'}]
+r = client.chat.completions.create(model="qwen3-1.7b", messages=messages, tools=tools)
+print(r.choices[0].message.content)  # It's 18°C and sunny in Paris.
+```
 
 Other commands: `nollama pull <model>`, `nollama list`, `nollama rm <model>`, and `nollama bundle` to
 [ship a model inside the binary](#ship-the-model-inside-the-binary). `nollama serve --help` lists the server's

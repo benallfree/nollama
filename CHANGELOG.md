@@ -20,6 +20,7 @@ becomes `## vX.Y.Z` and its lines are the release notes (`release.sh` reads them
 - `prompt_eval_count` and `eval_count` are always in Ollama's final answer, even when 0. `/v1/completions` streams `usage` with `stream_options.include_usage`.
 - Engine: context errors are `*engine.ContextError` (matches `engine.ErrContextExceeded`) with the counts; `engine.TrimMessages` trims a conversation to a token budget.
 - Models inside the binary: `nollama bundle -o <file> <model>...` adds GGUF files to the end of nollama or any Go program built with it, found by name and mmapped from the executable; `nollama bundle -check` verifies them. Go programs can also compile a model in with `go:embed` and `models.Embed`. A built-in model's path is `bundled:<name>` or `embedded:<name>`, which `engine.Load` opens, so loading by `src.Path` works for every model. New `engine.LoadRange`, `engine.LoadBytes`, `models.Bundle`, `models.Builtin`, `models.Available` and `models.Verify`; `/api/tags`, `/v1/models` and `nollama list` show built-in models.
+- Tool calls: `tools` and `tool_choice` (`auto`, `none`, `required`, a named function) on `/v1/chat/completions` and `/api/chat`, streaming or not. Once the model starts a call, the rest of it is held to a listed tool and that tool's parameter schema, so calls always parse. `schema.CompileTools` and `engine.ChatPromptTools` do the same for Go programs.
 
 ## v0.0.1-alpha.1
 

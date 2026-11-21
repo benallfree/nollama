@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"github.com/benallfree/nollama/engine"
@@ -22,13 +23,14 @@ func truncatedOf(out genOutput) *truncated {
 }
 
 // chatTrim is genRequest.trim for a chat: drop the oldest messages until the prompt is within budget tokens.
-func chatTrim(msgs []engine.Message) func(m *engine.Model, budget int) ([]int, engine.Trimmed, error) {
+func chatTrim(msgs []engine.Message, tools []json.RawMessage) func(m *engine.Model, budget int) ([]int, engine.Trimmed, error) {
 	return func(m *engine.Model, budget int) ([]int, engine.Trimmed, error) {
-		kept, t, err := m.TrimMessages(msgs, budget)
+		count := func(ms []engine.Message) int { return len(m.Tokenize(m.ChatPromptTools(ms, tools))) }
+		kept, t, err := engine.TrimMessages(msgs, budget, count)
 		if err != nil {
 			return nil, t, err
 		}
-		return m.Tokenize(m.ChatPrompt(kept)), t, nil
+		return m.Tokenize(m.ChatPromptTools(kept, tools)), t, nil
 	}
 }
 

@@ -291,6 +291,7 @@ type sampling struct {
 	Stop        []string
 	Schema      json.RawMessage // constrain the output to this JSON schema
 	Truncate    *bool           // a chat that doesn't fit drops its oldest messages (nil: the server's default)
+	Tools       *toolSet        // tools the model may call (nil: none)
 }
 
 // genRequest is one generation: the model, its prompt as tokens (built once the model is loaded) and the sampling.
@@ -324,6 +325,19 @@ func (s *Server) generate(ctx context.Context, g genRequest) (genOutput, error) 
 			return out, badRequest{fmt.Errorf("format: %w", err)}
 		}
 		constraint = sc.Fit
+	}
+	stop := g.sampling.Stop
+	if ts := g.sampling.Tools; ts.calling() {
+		if constraint != nil {
+			return out, badRequest{errors.New("a response format and tool calls can't be used together; set tool_choice to none to use the format")}
+		}
+		c, err := ts.constraint()
+		if err != nil {
+			return out, badRequest{err}
+		}
+		constraint = c
+	} else if ts != nil {
+		stop = append(append([]string(nil), stop...), schema.CallOpen) // tool_choice none: no calls
 	}
 	l, load, err := s.acquire(g.model)
 	if err != nil {
@@ -366,7 +380,7 @@ func (s *Server) generate(ctx context.Context, g genRequest) (genOutput, error) 
 	if maxTokens <= 0 || maxTokens > room {
 		maxTokens = room
 	}
-	o := engine.GenerateOptions{MaxTokens: maxTokens, Temperature: 0.8, TopP: 0.9, TopK: 40, Stop: g.sampling.Stop, Constraint: constraint}
+	o := engine.GenerateOptions{MaxTokens: maxTokens, Temperature: 0.8, TopP: 0.9, TopK: 40, Stop: stop, Constraint: constraint}
 	if t := g.sampling.Temperature; t != nil {
 		o.Temperature = *t
 	}

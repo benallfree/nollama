@@ -20,6 +20,7 @@ type schemaNode struct {
 	order    []string // property names, as written
 	required map[string]bool
 	closed   bool // no properties beyond props
+	ordered  bool // the properties come in order's order (set by this package, not by a schema keyword)
 	items    *schemaNode
 	minItems int
 	maxItems int // -1: no limit
@@ -483,6 +484,9 @@ func (p *jparser) object(n *schemaNode) result {
 			for _, k := range n.order {
 				if !seen[k] {
 					keys = append(keys, k)
+					if n.ordered {
+						break
+					}
 				}
 			}
 			if len(keys) == 0 {

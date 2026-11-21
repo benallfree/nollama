@@ -63,9 +63,6 @@ func TestNoModels(t *testing.T) {
 		out["error"].(map[string]any)["type"] != "not_found_error" {
 		t.Errorf("v1 chat, missing model: %d %v", code, out)
 	}
-	if code, _ := call(t, ts, "POST", "/api/chat", `{"model":"x","messages":[{"role":"user","content":"hi"}],"tools":[{}]}`); code != 400 {
-		t.Errorf("tools: %d", code)
-	}
 	if code, _ := call(t, ts, "POST", "/api/generate", `{"model":"x","prompt":"hi","format":"yaml"}`); code != 400 && code != 404 {
 		t.Errorf("bad format: %d", code)
 	}
@@ -266,5 +263,55 @@ func TestChat(t *testing.T) {
 	}
 	if len(events) < 3 || events[len(events)-1] != "[DONE]" || !strings.Contains(events[len(events)-2], `"finish_reason":"length"`) {
 		t.Errorf("stream: %v", events)
+	}
+}
+
+func TestToolsRequests(t *testing.T) {
+	ts := newTest(t, t.TempDir())
+	weather := `{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}`
+	for _, c := range []struct{ path, body string }{
+		{"/v1/chat/completions", `{"model":"x","messages":[{"role":"user","content":"hi"}],"tools":[{}]}`},
+		{"/v1/chat/completions", `{"model":"x","messages":[{"role":"user","content":"hi"}],"tools":[` + weather + `],"tool_choice":"sometimes"}`},
+		{"/v1/chat/completions", `{"model":"x","messages":[{"role":"user","content":"hi"}],"tools":[` + weather + `],"tool_choice":{"type":"function","function":{"name":"nope"}}}`},
+		{"/v1/chat/completions", `{"model":"x","messages":[{"role":"user","content":"hi"}],"tools":[` + weather + `],"response_format":{"type":"json_object"}}`},
+		{"/v1/chat/completions", `{"model":"x","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"a","parameters":"object"}}]}`},
+		{"/v1/completions", `{"model":"x","prompt":"hi","tools":[` + weather + `]}`},
+		{"/api/chat", `{"model":"x","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{}}]}`},
+		{"/api/chat", `{"model":"x","messages":[{"role":"user","content":"hi"}],"tools":[` + weather + `],"format":"json"}`},
+	} {
+		if code, out := call(t, ts, "POST", c.path, c.body); code != 400 {
+			t.Errorf("%s %s: %d %v, want 400", c.path, c.body, code, out)
+		}
+	}
+	// well-formed tools get as far as loading the model
+	if code, _ := call(t, ts, "POST", "/api/chat", `{"model":"qwen3:1.7b","messages":[{"role":"user","content":"hi"}],"tools":[`+weather+`]}`); code != 404 {
+		t.Errorf("good tools: %d, want 404 (no model)", code)
+	}
+}
+
+func TestToolStream(t *testing.T) {
+	var ts toolStream
+	var content strings.Builder
+	var names []string
+	answer := "Let me check.\n<tool_call>\n{\"name\": \"a\", \"arguments\": {}}\n</tool_call>\n<tool_call>\n{\"name\": \"b\", \"arguments\": {\"x\": 1}}\n</tool_call>"
+	for i := 0; i < len(answer); i += 3 { // pieces that cut the tags apart
+		c, calls := ts.feed(answer[i:min(i+3, len(answer))])
+		if strings.Contains(c, "<") {
+			t.Errorf("passed on part of a tag: %q", c)
+		}
+		content.WriteString(c)
+		for _, call := range calls {
+			names = append(names, call.Name)
+		}
+	}
+	content.WriteString(ts.rest())
+	if content.String() != "Let me check." || strings.Join(names, ",") != "a,b" {
+		t.Errorf("got %q %v", content.String(), names)
+	}
+	var plain toolStream
+	got, _ := plain.feed("1 < 2 and ")
+	got2, _ := plain.feed("<b> ")
+	if got+got2+plain.rest() != "1 < 2 and <b> " {
+		t.Errorf("plain text: %q %q", got, got2)
 	}
 }

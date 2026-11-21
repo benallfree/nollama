@@ -10,6 +10,7 @@ import (
 
 	"github.com/benallfree/nollama/engine"
 	"github.com/benallfree/nollama/models"
+	"github.com/benallfree/nollama/schema"
 )
 
 // Ollama's API: https://github.com/ollama/ollama/blob/main/docs/api.md
@@ -50,10 +51,32 @@ func ollamaFormat(raw json.RawMessage) (json.RawMessage, error) {
 }
 
 type ollamaMessage struct {
-	Role      string            `json:"role"`
-	Content   string            `json:"content"`
-	Images    []string          `json:"images,omitempty"`
-	ToolCalls []json.RawMessage `json:"tool_calls,omitempty"`
+	Role      string           `json:"role"`
+	Content   string           `json:"content"`
+	Images    []string         `json:"images,omitempty"`
+	ToolCalls []ollamaToolCall `json:"tool_calls,omitempty"`
+	ToolName  string           `json:"tool_name,omitempty"`
+}
+
+// ollamaToolCall is a call in an assistant message: arguments are an object.
+type ollamaToolCall struct {
+	ID       string `json:"id,omitempty"`
+	Function struct {
+		Index     int             `json:"index"`
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	} `json:"function"`
+}
+
+func ollamaCalls(calls []schema.ToolCall, from int) []ollamaToolCall {
+	out := make([]ollamaToolCall, len(calls))
+	for i, c := range calls {
+		out[i].ID = callID()
+		out[i].Function.Index = from + i
+		out[i].Function.Name = c.Name
+		out[i].Function.Arguments = c.Arguments
+	}
+	return out
 }
 
 type ollamaGenerateRequest struct {
@@ -71,14 +94,16 @@ type ollamaGenerateRequest struct {
 }
 
 type ollamaChatRequest struct {
-	Model     string            `json:"model"`
-	Messages  []ollamaMessage   `json:"messages"`
-	Format    json.RawMessage   `json:"format"`
-	Options   ollamaOptions     `json:"options"`
-	Stream    *bool             `json:"stream"`
-	Tools     []json.RawMessage `json:"tools"`
-	KeepAlive json.RawMessage   `json:"keep_alive"`
-	Truncate  *bool             `json:"truncate"` // drop the oldest messages if the chat doesn't fit (nollama's; nil: the server's default)
+	Model    string            `json:"model"`
+	Messages []ollamaMessage   `json:"messages"`
+	Format   json.RawMessage   `json:"format"`
+	Options  ollamaOptions     `json:"options"`
+	Stream   *bool             `json:"stream"`
+	Tools    []json.RawMessage `json:"tools"`
+	// ToolChoice isn't in Ollama's API; nollama takes OpenAI's (auto, none, required, a function) here too
+	ToolChoice json.RawMessage `json:"tool_choice"`
+	KeepAlive  json.RawMessage `json:"keep_alive"`
+	Truncate   *bool           `json:"truncate"` // drop the oldest messages if the chat doesn't fit (nollama's; nil: the server's default)
 }
 
 // ollamaDone is the closing fields of a generate or chat answer.
@@ -221,8 +246,9 @@ func (s *Server) ollamaChat(w http.ResponseWriter, r *http.Request) {
 		ollamaError(w, err)
 		return
 	}
-	if len(req.Tools) > 0 {
-		ollamaError(w, badRequest{errors.New("tools aren't supported yet")})
+	ts, err := parseTools(req.Tools, req.ToolChoice)
+	if err != nil {
+		ollamaError(w, err)
 		return
 	}
 	msgs := make([]engine.Message, 0, len(req.Messages))
@@ -231,7 +257,11 @@ func (s *Server) ollamaChat(w http.ResponseWriter, r *http.Request) {
 			ollamaError(w, badRequest{errors.New("images aren't supported: nollama runs text models")})
 			return
 		}
-		msgs = append(msgs, engine.Message{Role: m.Role, Content: m.Content})
+		em := engine.Message{Role: m.Role, Content: m.Content}
+		for _, c := range m.ToolCalls {
+			em.ToolCalls = append(em.ToolCalls, engine.ToolCall{Name: c.Function.Name, Arguments: argsText(c.Function.Arguments)})
+		}
+		msgs = append(msgs, em)
 	}
 	if len(msgs) == 0 {
 		s.loadOnly(w, req.Model, ka, func(name string, unloading bool) any {
@@ -249,15 +279,36 @@ func (s *Server) ollamaChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sp.Truncate = req.Truncate
-	g := genRequest{model: req.Model, sampling: sp, keepAlive: ka, trim: chatTrim(msgs),
-		tokens: func(m *engine.Model) ([]int, error) { return m.Tokenize(m.ChatPrompt(msgs)), nil }}
+	sp.Tools = ts
+	tools := ts.prompt()
+	g := genRequest{model: req.Model, sampling: sp, keepAlive: ka, trim: chatTrim(msgs, tools),
+		tokens: func(m *engine.Model) ([]int, error) { return m.Tokenize(m.ChatPromptTools(msgs, tools)), nil }}
 	stream := req.Stream == nil || *req.Stream
 	nd := &ndjson{w: w}
 	model := req.Model
+	send := func(msg ollamaMessage) bool {
+		return nd.send(map[string]any{"model": model, "created_at": now(), "message": msg, "done": false})
+	}
+	var split *toolStream
+	ncalls := 0
 	if stream {
-		g.onText = func(piece string) bool {
-			return nd.send(map[string]any{"model": model, "created_at": now(),
-				"message": ollamaMessage{Role: "assistant", Content: piece}, "done": false})
+		if ts.calling() {
+			split = &toolStream{}
+			g.onText = func(piece string) bool {
+				content, calls := split.feed(piece)
+				if content != "" && !send(ollamaMessage{Role: "assistant", Content: content}) {
+					return false
+				}
+				if len(calls) > 0 {
+					if !send(ollamaMessage{Role: "assistant", ToolCalls: ollamaCalls(calls, ncalls)}) {
+						return false
+					}
+					ncalls += len(calls)
+				}
+				return true
+			}
+		} else {
+			g.onText = func(piece string) bool { return send(ollamaMessage{Role: "assistant", Content: piece}) }
 		}
 	}
 	out, err := s.generate(r.Context(), g)
@@ -278,8 +329,18 @@ func (s *Server) ollamaChat(w http.ResponseWriter, r *http.Request) {
 	}{Model: model, CreatedAt: now(), Message: ollamaMessage{Role: "assistant"}, Done: true, ollamaDone: doneOf(out)}
 	if !stream {
 		final.Message.Content = out.res.Text
+		if ts.calling() {
+			content, calls := schema.SplitToolCalls(out.res.Text)
+			final.Message.Content = content
+			final.Message.ToolCalls = ollamaCalls(calls, 0)
+		}
 		writeJSON(w, 200, final)
 		return
+	}
+	if split != nil {
+		if rest := split.rest(); rest != "" {
+			send(ollamaMessage{Role: "assistant", Content: rest})
+		}
 	}
 	nd.send(final)
 }
@@ -403,7 +464,7 @@ func (s *Server) show(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.release(l, nil)
 	info := l.m.Info()
-	caps := []string{"completion"}
+	caps := []string{"completion", "tools"}
 	if info.Pooling != "" { // an embedding model, as Ollama reports one
 		caps = []string{"embedding"}
 	}

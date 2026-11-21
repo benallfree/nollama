@@ -1,11 +1,15 @@
 package engine
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"math"
 	"math/rand/v2"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -44,6 +48,9 @@ const (
 	FitPrefix              // a valid start; more must follow
 	FitComplete            // complete, though more could follow (a number)
 	FitDone                // complete, and nothing can follow
+	// FitFree: nothing limits the next token here; it is sampled as with no constraint (end-of-turn allowed). A
+	// constraint that only starts partway (a tool call after free text) says this until it begins.
+	FitFree
 )
 
 // Result reports what Generate produced.
@@ -60,14 +67,56 @@ type Result struct {
 
 // Message is one chat turn.
 type Message struct {
-	Role    string // system, user, assistant
-	Content string
+	Role      string // system, user, assistant, tool
+	Content   string
+	ToolCalls []ToolCall // calls an assistant turn made
+}
+
+// ToolCall is a call an assistant turn made, as the chat template writes it back.
+type ToolCall struct {
+	Name      string
+	Arguments string // a JSON object
 }
 
 // ChatPrompt applies Qwen3's ChatML template with thinking turned off.
-func ChatPrompt(messages []Message) string {
+func ChatPrompt(messages []Message) string { return ChatPromptTools(messages, nil) }
+
+// ChatPromptTools is ChatPrompt with tools the model may call: each a JSON tool definition as the client sent it
+// ({"type": "function", "function": {"name": ..., "parameters": ...}}), listed in the system turn the way Qwen3's
+// template does. Assistant turns write their calls back in <tool_call> tags, and tool turns become <tool_response>
+// blocks in a user turn.
+func ChatPromptTools(messages []Message, tools []json.RawMessage) string {
 	var b strings.Builder
-	for _, m := range messages {
+	if len(tools) > 0 {
+		b.WriteString("<|im_start|>system\n")
+		if len(messages) > 0 && messages[0].Role == "system" {
+			b.WriteString(messages[0].Content)
+			b.WriteString("\n\n")
+			messages = messages[1:]
+		}
+		b.WriteString("# Tools\n\nYou may call one or more functions to assist with the user query.\n\n" +
+			"You are provided with function signatures within <tools></tools> XML tags:\n<tools>")
+		for _, t := range tools {
+			b.WriteString("\n")
+			b.WriteString(PyJSON(t))
+		}
+		b.WriteString("\n</tools>\n\nFor each function call, return a json object with function name and arguments within " +
+			"<tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n" +
+			"</tool_call><|im_end|>\n")
+	}
+	for i, m := range messages {
+		if m.Role == "tool" {
+			if i == 0 || messages[i-1].Role != "tool" {
+				b.WriteString("<|im_start|>user")
+			}
+			b.WriteString("\n<tool_response>\n")
+			b.WriteString(m.Content)
+			b.WriteString("\n</tool_response>")
+			if i == len(messages)-1 || messages[i+1].Role != "tool" {
+				b.WriteString("<|im_end|>\n")
+			}
+			continue
+		}
 		b.WriteString("<|im_start|>")
 		b.WriteString(m.Role)
 		b.WriteString("\n")
@@ -77,6 +126,20 @@ func ChatPrompt(messages []Message) string {
 			b.WriteString("<think>\n\n</think>\n\n")
 		}
 		b.WriteString(m.Content)
+		for j, c := range m.ToolCalls {
+			if j > 0 || m.Content != "" {
+				b.WriteString("\n")
+			}
+			args := c.Arguments
+			if strings.TrimSpace(args) == "" {
+				args = "{}"
+			}
+			b.WriteString("<tool_call>\n{\"name\": \"")
+			b.WriteString(c.Name)
+			b.WriteString("\", \"arguments\": ")
+			b.WriteString(args)
+			b.WriteString("}\n</tool_call>")
+		}
 		b.WriteString("<|im_end|>\n")
 	}
 	b.WriteString("<|im_start|>assistant\n<think>\n\n</think>\n\n")
@@ -85,6 +148,72 @@ func ChatPrompt(messages []Message) string {
 
 // ChatPrompt is the method form of the package function.
 func (m *Model) ChatPrompt(messages []Message) string { return ChatPrompt(messages) }
+
+// ChatPromptTools is the method form of the package function.
+func (m *Model) ChatPromptTools(messages []Message, tools []json.RawMessage) string {
+	return ChatPromptTools(messages, tools)
+}
+
+// PyJSON rewrites JSON text the way Python's json.dumps writes it (and so the chat template's tojson): ", " and ": "
+// between items, keys in their order, non-ASCII kept. Text that isn't JSON comes back as it is.
+func PyJSON(raw []byte) string {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var b strings.Builder
+	type level struct {
+		object bool
+		n      int // items written
+	}
+	var stack []level
+	str := func(s string) {
+		var sb bytes.Buffer
+		enc := json.NewEncoder(&sb)
+		enc.SetEscapeHTML(false)
+		_ = enc.Encode(s)
+		b.Write(bytes.TrimRight(sb.Bytes(), "\n"))
+	}
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return string(raw)
+		}
+		if d, ok := tok.(json.Delim); ok && (d == '}' || d == ']') {
+			stack = stack[:len(stack)-1]
+			b.WriteRune(rune(d))
+			continue
+		}
+		if len(stack) > 0 {
+			top := &stack[len(stack)-1]
+			if top.object {
+				if top.n%2 == 1 {
+					b.WriteString(": ") // a value after its key
+				} else if top.n > 0 {
+					b.WriteString(", ")
+				}
+			} else if top.n > 0 {
+				b.WriteString(", ")
+			}
+			top.n++
+		}
+		switch v := tok.(type) {
+		case json.Delim:
+			b.WriteRune(rune(v))
+			stack = append(stack, level{object: v == '{'})
+		case string:
+			str(v)
+		case json.Number:
+			b.WriteString(v.String())
+		case bool:
+			b.WriteString(strconv.FormatBool(v))
+		case nil:
+			b.WriteString("null")
+		}
+	}
+	return b.String()
+}
 
 const prefillBatch = 512
 
@@ -165,9 +294,13 @@ func (m *Model) GenerateTokens(ctx context.Context, ids []int, o GenerateOptions
 	for {
 		var tok int
 		done := false
+		cur := FitFree
 		if o.Constraint != nil {
+			cur = o.Constraint(string(raw))
+		}
+		if cur != FitFree {
 			var ok bool
-			tok, done, ok = m.sampleConstrained(s.logits, o, rng, raw)
+			tok, done, ok = m.sampleConstrained(s.logits, o, rng, raw, cur)
 			if !ok {
 				finish("stop") // nothing allowed can follow
 				break
@@ -334,20 +467,20 @@ func (m *Model) sample(logits []float32, o GenerateOptions, rng *rand.Rand) int 
 }
 
 // sampleConstrained picks the next token among those o.Constraint accepts after out: the best-scoring one when greedy,
-// else a sample from the top accepted ones. done says the output is finished after it; ok is false when no token fits.
-func (m *Model) sampleConstrained(logits []float32, o GenerateOptions, rng *rand.Rand, out []byte) (tok int, done, ok bool) {
+// else a sample from the top accepted ones. cur is the constraint's verdict on out. done says the output is finished
+// after it; ok is false when no token fits.
+func (m *Model) sampleConstrained(logits []float32, o GenerateOptions, rng *rand.Rand, out []byte, cur Fit) (tok int, done, ok bool) {
 	type cand struct {
 		id int
 		v  float32
 	}
 	prefix := string(out)
-	cur := o.Constraint(prefix)
 	try := func(id int) (Fit, bool) {
 		if m.tok.eos[id] {
 			return FitDone, cur == FitComplete || cur == FitDone
 		}
-		if m.tok.isSpecial(id) {
-			return FitNo, false
+		if m.tok.isControl(id) {
+			return FitNo, false // <|im_start|> and the like; user-defined ones such as <tool_call> are text the constraint judges
 		}
 		f := o.Constraint(prefix + string(m.tok.tokenBytes(id)))
 		return f, f != FitNo

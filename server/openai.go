@@ -10,6 +10,7 @@ import (
 
 	"github.com/benallfree/nollama/engine"
 	"github.com/benallfree/nollama/models"
+	"github.com/benallfree/nollama/schema"
 )
 
 // OpenAI's API, the parts a local model answers: models, chat completions and (legacy) completions.
@@ -76,9 +77,10 @@ type openaiCommon struct {
 			Schema json.RawMessage `json:"schema"`
 		} `json:"json_schema"`
 	} `json:"response_format"`
-	N        int               `json:"n"`
-	Tools    []json.RawMessage `json:"tools"`
-	Truncate *bool             `json:"truncate"` // nollama's: drop the oldest messages if the chat doesn't fit
+	N          int               `json:"n"`
+	Tools      []json.RawMessage `json:"tools"`
+	ToolChoice json.RawMessage   `json:"tool_choice"`
+	Truncate   *bool             `json:"truncate"` // nollama's: drop the oldest messages if the chat doesn't fit
 }
 
 func (c openaiCommon) sampling() (sampling, error) {
@@ -93,9 +95,11 @@ func (c openaiCommon) sampling() (sampling, error) {
 	if c.N > 1 {
 		return sp, badRequest{errors.New("n > 1 isn't supported")}
 	}
-	if len(c.Tools) > 0 {
-		return sp, badRequest{errors.New("tools aren't supported yet")}
+	ts, err := parseTools(c.Tools, c.ToolChoice)
+	if err != nil {
+		return sp, err
 	}
+	sp.Tools = ts
 	if rf := c.ResponseFormat; rf != nil {
 		switch rf.Type {
 		case "", "text":
@@ -191,12 +195,33 @@ func completionID(prefix string) string {
 	return fmt.Sprintf("%s-%x", prefix, time.Now().UnixNano())
 }
 
+// openaiToolCall is a call in an assistant message: arguments are a string holding JSON.
+type openaiToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	} `json:"function"`
+}
+
+func openaiCalls(calls []schema.ToolCall, from int) []any {
+	out := make([]any, len(calls))
+	for i, c := range calls {
+		out[i] = map[string]any{"index": from + i, "id": callID(), "type": "function",
+			"function": map[string]any{"name": c.Name, "arguments": string(c.Arguments)}}
+	}
+	return out
+}
+
 func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		openaiCommon
 		Messages []struct {
-			Role    string        `json:"role"`
-			Content openaiContent `json:"content"`
+			Role       string           `json:"role"`
+			Content    openaiContent    `json:"content"`
+			ToolCalls  []openaiToolCall `json:"tool_calls"`
+			ToolCallID string           `json:"tool_call_id"`
 		} `json:"messages"`
 	}
 	if err := decode(r, &req); err != nil {
@@ -219,24 +244,47 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			role = "system"
 		}
 		msgs[i] = engine.Message{Role: role, Content: string(m.Content)}
+		for _, c := range m.ToolCalls {
+			msgs[i].ToolCalls = append(msgs[i].ToolCalls, engine.ToolCall{Name: c.Function.Name, Arguments: argsText(c.Function.Arguments)})
+		}
 	}
 	id, created, model := completionID("chatcmpl"), time.Now().Unix(), req.Model
 	chunk := func(delta map[string]any, finish any) map[string]any {
 		return map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
 			"choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}}}
 	}
-	g := genRequest{model: req.Model, sampling: sp, trim: chatTrim(msgs),
-		tokens: func(m *engine.Model) ([]int, error) { return m.Tokenize(m.ChatPrompt(msgs)), nil }}
+	tools := sp.Tools.prompt()
+	g := genRequest{model: req.Model, sampling: sp, trim: chatTrim(msgs, tools),
+		tokens: func(m *engine.Model) ([]int, error) { return m.Tokenize(m.ChatPromptTools(msgs, tools)), nil }}
 	ev := &sse{w: w}
+	first := true
+	send := func(d map[string]any) bool {
+		if first {
+			d["role"] = "assistant"
+			first = false
+		}
+		return ev.send(chunk(d, nil))
+	}
+	var split *toolStream
+	ncalls := 0
 	if req.Stream {
-		first := true
-		g.onText = func(piece string) bool {
-			d := map[string]any{"content": piece}
-			if first {
-				d["role"] = "assistant"
-				first = false
+		if sp.Tools.calling() {
+			split = &toolStream{}
+			g.onText = func(piece string) bool {
+				content, calls := split.feed(piece)
+				if content != "" && !send(map[string]any{"content": content}) {
+					return false
+				}
+				if len(calls) > 0 {
+					if !send(map[string]any{"tool_calls": openaiCalls(calls, ncalls)}) {
+						return false
+					}
+					ncalls += len(calls)
+				}
+				return true
 			}
-			return ev.send(chunk(d, nil))
+		} else {
+			g.onText = func(piece string) bool { return send(map[string]any{"content": piece}) }
 		}
 	}
 	out, err := s.generate(r.Context(), g)
@@ -249,18 +297,44 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	finish := out.reason
 	if !req.Stream {
+		msg := map[string]any{"role": "assistant", "content": out.res.Text}
+		if sp.Tools.calling() {
+			content, calls := schema.SplitToolCalls(out.res.Text)
+			msg["content"] = content
+			if len(calls) > 0 {
+				calls := openaiCalls(calls, 0)
+				for _, c := range calls {
+					delete(c.(map[string]any), "index")
+				}
+				msg["tool_calls"] = calls
+				if content == "" {
+					msg["content"] = nil
+				}
+				if finish == "stop" {
+					finish = "tool_calls"
+				}
+			}
+		}
 		res := map[string]any{"id": id, "object": "chat.completion", "created": created, "model": model,
-			"choices": []any{map[string]any{"index": 0, "message": map[string]any{"role": "assistant", "content": out.res.Text},
-				"finish_reason": out.reason}},
-			"usage": usageOf(out)}
+			"choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": finish}},
+			"usage":   usageOf(out)}
 		if t := truncatedOf(out); t != nil {
 			res["truncated"] = t
 		}
 		writeJSON(w, 200, res)
 		return
 	}
-	last := chunk(map[string]any{}, out.reason)
+	if split != nil {
+		if rest := split.rest(); rest != "" {
+			send(map[string]any{"content": rest})
+		}
+		if ncalls > 0 && finish == "stop" {
+			finish = "tool_calls"
+		}
+	}
+	last := chunk(map[string]any{}, finish)
 	if t := truncatedOf(out); t != nil {
 		last["truncated"] = t
 	}
@@ -294,6 +368,10 @@ func (s *Server) openaiCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		prompt = list[0]
+	}
+	if sp.Tools != nil {
+		openaiError(w, badRequest{errors.New("tools need /v1/chat/completions")})
+		return
 	}
 	if sp.MaxTokens == 0 {
 		sp.MaxTokens = 16 // OpenAI's default for completions

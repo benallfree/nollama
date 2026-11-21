@@ -42,12 +42,12 @@ func words(ms []Message) int {
 
 func TestTrimMessages(t *testing.T) {
 	msgs := []Message{
-		{"system", "be brief"},           // 4
-		{"user", "one two three"},        // 5
-		{"assistant", "four five six"},   // 5
-		{"user", "seven eight nine ten"}, // 6
-		{"assistant", "eleven"},          // 3
-		{"user", "last question here"},   // 5
+		{Role: "system", Content: "be brief"},           // 4
+		{Role: "user", Content: "one two three"},        // 5
+		{Role: "assistant", Content: "four five six"},   // 5
+		{Role: "user", Content: "seven eight nine ten"}, // 6
+		{Role: "assistant", Content: "eleven"},          // 3
+		{Role: "user", Content: "last question here"},   // 5
 	} // 28 in all
 	got, tr, err := TrimMessages(msgs, 28, words)
 	if err != nil || len(got) != 6 || tr.Messages != 0 {
@@ -76,7 +76,7 @@ func TestTrimMessages(t *testing.T) {
 		t.Errorf("too small: %v", err)
 	}
 	// one message that doesn't fit
-	if _, _, err := TrimMessages([]Message{{"user", "a b c"}}, 2, words); !errors.Is(err, ErrContextExceeded) {
+	if _, _, err := TrimMessages([]Message{{Role: "user", Content: "a b c"}}, 2, words); !errors.Is(err, ErrContextExceeded) {
 		t.Errorf("single: %v", err)
 	}
 }
@@ -107,9 +107,9 @@ func TestContextReal(t *testing.T) {
 	// TrimMessages with the real template and tokenizer
 	var long []Message
 	for range 20 {
-		long = append(long, Message{"user", strings.Repeat("lorem ipsum ", 20)}, Message{"assistant", "ok"})
+		long = append(long, Message{Role: "user", Content: strings.Repeat("lorem ipsum ", 20)}, Message{Role: "assistant", Content: "ok"})
 	}
-	long = append(long, Message{"user", "What is two plus two?"})
+	long = append(long, Message{Role: "user", Content: "What is two plus two?"})
 	kept, tr, err := m.TrimMessages(long, 200)
 	if err != nil || tr.Messages == 0 || m.CountTokens(m.ChatPrompt(kept)) > 200 || kept[len(kept)-1].Content != "What is two plus two?" {
 		t.Errorf("trim: %d kept, %+v %v", len(kept), tr, err)

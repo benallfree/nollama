@@ -18,7 +18,7 @@ func TestGenerateSmoke(t *testing.T) {
 	}
 	defer m.Close()
 	fmt.Printf("%+v\n", m.Info())
-	prompt := ChatPrompt([]Message{{"user", "What is the capital of France? Answer in one sentence."}})
+	prompt := ChatPrompt([]Message{{Role: "user", Content: "What is the capital of France? Answer in one sentence."}})
 	ids := m.Tokenize(prompt)
 	fmt.Println(len(ids), ids)
 	res, err := m.Generate(context.Background(), prompt, GenerateOptions{MaxTokens: 40}, func(s string) bool { fmt.Print(s); return true })

@@ -76,6 +76,12 @@ func (t *tokenizer) isSpecial(id int) bool {
 	return id < len(t.types) && (t.types[id] == 3 || t.types[id] == 4)
 }
 
+// isControl is a control token (<|im_start|>), as opposed to a user-defined one (<tool_call>, <think>) that stands for
+// its text.
+func (t *tokenizer) isControl(id int) bool {
+	return id < len(t.types) && t.types[id] == 3
+}
+
 // encode tokenizes text, matching special tokens as whole tokens first.
 func (t *tokenizer) encode(s string) []int {
 	var out []int
