@@ -4,6 +4,8 @@
 //	bench bench   [-models ...] [-runs 3] [-gen 128]     full benchmark table
 //	bench requant -in qwen3:0.6b -out FILE.gguf                (write a Q8_0 copy for testing)
 //	bench run     -gguf FILE -threads N -prompt short|long -gen 128   (one engine run, JSON)
+//	bench vps     -models name:QUANT=spec,... [-ollama] [-json out.json]   (cold/warm first token, peak RAM; see vps.go)
+//	bench vpstable FILE.json...                                (markdown table from saved vps reports)
 package main
 
 import (
@@ -31,7 +33,7 @@ var ollamaURL = "http://127.0.0.1:11434"
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: bench compare|bench|run [flags]")
+		fmt.Fprintln(os.Stderr, "usage: bench compare|bench|run|vps|vpstable [flags]")
 		os.Exit(2)
 	}
 	if u := os.Getenv("OLLAMA_URL"); u != "" {
@@ -41,6 +43,12 @@ func main() {
 	switch os.Args[1] {
 	case "run":
 		err = cmdRun(os.Args[2:])
+	case "vps":
+		err = cmdVPS(os.Args[2:])
+	case "vpsrun":
+		err = cmdVPSRun(os.Args[2:])
+	case "vpstable":
+		err = cmdVPSTable(os.Args[2:])
 	case "compare":
 		err = cmdCompare(os.Args[2:])
 	case "bench":
