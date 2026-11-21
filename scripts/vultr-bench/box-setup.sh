@@ -65,6 +65,12 @@ say "models: $args"
 if [ "$WITH_OLLAMA" = 1 ] && [ "$DRY" != 1 ]; then
 	say "installing Ollama"
 	curl -fsSL -m 600 https://ollama.com/install.sh | sh || fail "ollama install"
+	# cloud-init runs while systemd is still booting, so the installer writes the service without starting it
+	systemctl daemon-reload || true
+	if ! systemctl enable --now ollama; then
+		say "systemctl couldn't start ollama; running ollama serve directly"
+		setsid nohup ollama serve </dev/null >/var/log/ollama.log 2>&1 &
+	fi
 	for i in $(seq 1 30); do
 		curl -fsS -m 2 http://127.0.0.1:11434/api/version && break
 		say "waiting for ollama ($i)"
