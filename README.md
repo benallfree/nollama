@@ -133,7 +133,8 @@ print(r.choices[0].message.content)  # It's 18°C and sunny in Paris.
 Other commands: `nollama pull <model>`, `nollama list`, `nollama rm <model>`, and `nollama bundle` to
 [ship a model inside the binary](#ship-the-model-inside-the-binary). `nollama serve --help` lists the server's
 flags (threads, answers at once, how long an idle model stays loaded, context window, KV cache type). `NOLLAMA_HOST`
-sets the address, `NOLLAMA_MODELS` the models folder and `NOLLAMA_KV_CACHE_TYPE` the KV cache's format.
+sets the address, `NOLLAMA_MODELS` the models folder, `NOLLAMA_KV_CACHE_TYPE` the KV cache's format and
+`NOLLAMA_KEEP_ALIVE` how long an idle model stays loaded (see [Loading and keep_alive](#loading-and-keep_alive)).
 
 ## Context limits
 
