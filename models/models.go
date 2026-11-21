@@ -78,7 +78,7 @@ type Source struct {
 // Anything else comes back as it is.
 func Normalize(spec string) string {
 	spec = strings.TrimSpace(spec)
-	if strings.HasPrefix(spec, "hf:") || strings.HasSuffix(spec, ".gguf") || strings.ContainsRune(spec, os.PathSeparator) {
+	if strings.HasPrefix(spec, "hf:") || IsPath(spec) {
 		return spec
 	}
 	spec = strings.TrimSuffix(spec, ":latest")
@@ -97,14 +97,45 @@ func Resolve(spec, dir string) (Source, error) {
 		if len(parts) != 3 || !strings.HasSuffix(parts[2], ".gguf") {
 			return Source{}, fmt.Errorf("model %q: want hf:<org>/<repo>/<file>.gguf", spec)
 		}
-		file := strings.NewReplacer("/", "_", "..", "_").Replace(rest)
-		return Source{Name: spec, Path: filepath.Join(dir, "hf", file),
+		return Source{Name: spec, Path: filepath.Join(dir, "hf", safeFile(rest)),
 			URL: "https://huggingface.co/" + parts[0] + "/" + parts[1] + "/resolve/main/" + parts[2]}, nil
 	}
-	if strings.HasSuffix(spec, ".gguf") || strings.ContainsRune(spec, os.PathSeparator) {
+	if IsPath(spec) {
 		return Source{Name: strings.TrimSuffix(filepath.Base(spec), ".gguf"), Path: ExpandHome(spec)}, nil
 	}
+	if spec != "" && safeFile(spec) == spec && !strings.HasPrefix(spec, ".") {
+		// a file someone put in the models folder, by the name List gives it
+		if p := filepath.Join(dir, spec+".gguf"); fileExists(p) {
+			return Source{Name: spec, Path: p}, nil
+		}
+	}
 	return Source{}, fmt.Errorf("model %q: not a model nollama knows (%s), an hf:<org>/<repo>/<file>.gguf, or a path to a .gguf file", spec, Names())
+}
+
+// IsPath reports whether spec names a file by path (it ends in .gguf or has a path separator) rather than a model
+// by name.
+func IsPath(spec string) bool {
+	return strings.HasSuffix(spec, ".gguf") || strings.ContainsAny(spec, `/\`) || strings.ContainsRune(spec, os.PathSeparator) ||
+		strings.HasPrefix(spec, "~")
+}
+
+// safeFile maps s to a file name that stays in its folder on every OS: letters, digits, '.', '-' and '_' are kept,
+// anything else (separators, ':', which is a drive or an NTFS stream on Windows) becomes '_', and ".." becomes "_".
+func safeFile(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '-', c == '_':
+		default:
+			b[i] = '_'
+		}
+	}
+	return strings.ReplaceAll(string(b), "..", "_")
+}
+
+func fileExists(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.Mode().IsRegular()
 }
 
 // ExpandHome expands a leading ~/ to the user's home folder.

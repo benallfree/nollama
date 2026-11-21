@@ -41,8 +41,11 @@ Models: %s, hf:<org>/<repo>/<file>.gguf, or a path to a .gguf file.
 Ollama spellings work too (qwen3:1.7b).
 
 Environment:
-  NOLLAMA_HOST     address serve listens on (default 127.0.0.1:11434)
-  NOLLAMA_MODELS   where models are downloaded (default %s)
+  NOLLAMA_HOST             address serve listens on (default 127.0.0.1:11434)
+  NOLLAMA_MODELS           where models are downloaded (default %s)
+  NOLLAMA_API_KEY          key serve requires (Authorization: Bearer <key>)
+  NOLLAMA_ORIGINS          browser origins serve allows, comma-separated
+  NOLLAMA_ALLOWED_HOSTS    host names serve answers to, comma-separated
 `
 
 var version = "dev"
@@ -97,21 +100,45 @@ func cmdServe(args []string) error {
 	numCtx := fs.Int("num-ctx", 4096, "context window when a request doesn't set num_ctx")
 	cacheMB := fs.Int("prompt-cache-mb", 256, "memory for reusing the start of recent prompts (0: off)")
 	quiet := fs.Bool("quiet", false, "don't log requests")
+	apiKey := fs.String("api-key", os.Getenv("NOLLAMA_API_KEY"), "require this key (Authorization: Bearer <key>); prefer NOLLAMA_API_KEY, which other users can't see in ps")
+	readOnly := fs.Bool("read-only", false, "turn off model management (pull, delete, create, copy, push)")
+	noPull := fs.Bool("no-pull", false, "turn off /api/pull")
+	noDelete := fs.Bool("no-delete", false, "turn off /api/delete")
+	allow := fs.String("models", "", "the only models clients may use, comma-separated (default: any)")
+	allowPaths := fs.Bool("allow-paths", false, "let requests load a .gguf by path outside the models folder")
+	origins := fs.String("allowed-origins", os.Getenv("NOLLAMA_ORIGINS"), "browser origins allowed besides pages on this machine, comma-separated (*: any)")
+	hosts := fs.String("allowed-hosts", os.Getenv("NOLLAMA_ALLOWED_HOSTS"), "host names served without an API key besides IPs and localhost, comma-separated (*: any)")
+	maxBodyMB := fs.Int("max-body-mb", 8, "largest request body, in MB")
+	maxTokens := fs.Int("max-tokens", 0, "longest answer a request may ask for (0: up to the context window)")
+	maxNumCtx := fs.Int("max-num-ctx", 32768, "largest context window a request may ask for")
+	perClient := fs.Int("per-client", 8, "requests one client IP may have open at once (negative: no limit)")
+	public := fs.Bool("insecure-public", false, "listen on a non-loopback address without an API key (anyone who can reach it can use it)")
 	fs.Parse(args)
 	if !strings.Contains(addr, ":") {
 		addr += ":11434"
 	}
 	cfg := server.Config{ModelsDir: modelsDir(), Threads: *threads, Parallel: *parallel, KeepAlive: *keepAlive,
-		NumCtx: *numCtx, PromptCache: int64(*cacheMB) << 20}
+		NumCtx: *numCtx, PromptCache: int64(*cacheMB) << 20,
+		APIKey: strings.TrimSpace(*apiKey), ReadOnly: *readOnly, NoPull: *noPull, NoDelete: *noDelete,
+		Models: list(*allow), AllowPaths: *allowPaths, AllowedOrigins: list(*origins), AllowedHosts: list(*hosts),
+		MaxBodyBytes: int64(*maxBodyMB) << 20, MaxTokens: *maxTokens, MaxNumCtx: *maxNumCtx, PerClient: *perClient}
 	if !*quiet {
 		cfg.Logf = log.Printf
+	}
+	if cfg.APIKey == "" && !loopback(addr) {
+		if !*public {
+			return fmt.Errorf("refusing to listen on %s without an API key: anyone who can reach it could use it and download "+
+				"models to this machine. Set NOLLAMA_API_KEY, listen on 127.0.0.1, or pass --insecure-public", addr)
+		}
+		log.Printf("WARNING: listening on %s with no API key. Anyone who can reach this address can use it.", addr)
 	}
 	srv := server.New(cfg)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("%w (is Ollama or another nollama already on %s? stop it, or set NOLLAMA_HOST)", err, addr)
 	}
-	hs := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	hs := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: time.Minute,
+		IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 64 << 10}
 	log.Printf("nollama %s listening on http://%s (models in %s)", version, ln.Addr(), cfg.ModelsDir)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -127,6 +154,30 @@ func cmdServe(args []string) error {
 	defer cancel()
 	_ = hs.Shutdown(sctx)
 	return srv.Close()
+}
+
+// loopback reports whether addr (host:port) listens only on this machine.
+func loopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback() // "", 0.0.0.0 and :: listen everywhere
+}
+
+// list splits a comma-separated flag, dropping blanks.
+func list(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func pull(spec string) (models.Source, error) {

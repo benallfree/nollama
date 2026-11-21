@@ -150,6 +150,8 @@ nfpms:
       - src: packaging/nollama.env
         dst: /etc/nollama/nollama.env
         type: config|noreplace
+        file_info:
+          mode: 0640 # it can hold NOLLAMA_API_KEY; systemd reads it as root
     scripts:
       postinstall: packaging/postinstall.sh
       preremove: packaging/preremove.sh

@@ -33,6 +33,21 @@ type Config struct {
 	NumCtx      int           // context window when a request doesn't set num_ctx (default 4096, capped at the model's)
 	Client      *http.Client  // for pulls (default http.DefaultClient)
 	Logf        func(format string, args ...any)
+
+	// Who may call the server and what they may do. See the README's Security section.
+
+	APIKey         string   // when set, every request but GET / needs Authorization: Bearer <key> (or X-API-Key)
+	ReadOnly       bool     // turn off all model management: pull, delete, create, copy, push
+	NoPull         bool     // turn off /api/pull only
+	NoDelete       bool     // turn off /api/delete only
+	Models         []string // the models clients may use (Ollama spellings match); empty: any
+	AllowPaths     bool     // let requests load a .gguf by path outside ModelsDir (off: only names and files in ModelsDir)
+	AllowedHosts   []string // Host names served besides IP addresses and localhost, when there's no APIKey ("*": any; ".example.com": its subdomains)
+	AllowedOrigins []string // browser origins allowed besides pages on this machine ("*": any)
+	MaxBodyBytes   int64    // largest request body (default 8 MiB)
+	MaxTokens      int      // longest answer a request may ask for (0: up to the context window)
+	MaxNumCtx      int      // largest context window a request may ask for with num_ctx (default 32768, capped at the model's)
+	PerClient      int      // requests one client IP may have open at once (default 8; negative: no limit)
 }
 
 // Server holds at most one loaded model and answers both APIs with it, loading the model a request names (and
@@ -43,6 +58,8 @@ type Server struct {
 	mu   sync.Mutex
 	cur  *loaded
 	pull sync.Mutex // one download at a time
+
+	clients clientCounts
 }
 
 type loaded struct {
@@ -73,6 +90,15 @@ func New(cfg Config) *Server {
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
+	if cfg.MaxBodyBytes <= 0 {
+		cfg.MaxBodyBytes = 8 << 20
+	}
+	if cfg.MaxNumCtx <= 0 {
+		cfg.MaxNumCtx = 32768
+	}
+	if cfg.PerClient == 0 {
+		cfg.PerClient = 8
+	}
 	return &Server{cfg: cfg, sem: make(chan struct{}, cfg.Parallel)}
 }
 
@@ -85,21 +111,21 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tags", s.tags)
 	mux.HandleFunc("GET /api/ps", s.ps)
 	mux.HandleFunc("POST /api/show", s.show)
-	mux.HandleFunc("POST /api/pull", s.pullModel)
-	mux.HandleFunc("DELETE /api/delete", s.deleteModel)
+	mux.HandleFunc("POST /api/pull", s.manage("pulling models", s.cfg.NoPull, s.pullModel))
+	mux.HandleFunc("DELETE /api/delete", s.manage("deleting models", s.cfg.NoDelete, s.deleteModel))
 	mux.HandleFunc("POST /api/generate", s.ollamaGenerate)
 	mux.HandleFunc("POST /api/chat", s.ollamaChat)
 	mux.HandleFunc("POST /api/embed", s.notSupported)
 	mux.HandleFunc("POST /api/embeddings", s.notSupported)
-	mux.HandleFunc("POST /api/create", s.notSupported)
-	mux.HandleFunc("POST /api/copy", s.notSupported)
-	mux.HandleFunc("POST /api/push", s.notSupported)
+	mux.HandleFunc("POST /api/create", s.manage("creating models", false, s.notSupported))
+	mux.HandleFunc("POST /api/copy", s.manage("copying models", false, s.notSupported))
+	mux.HandleFunc("POST /api/push", s.manage("pushing models", false, s.notSupported))
 	mux.HandleFunc("GET /v1/models", s.openaiModels)
 	mux.HandleFunc("GET /v1/models/{model...}", s.openaiModel)
 	mux.HandleFunc("POST /v1/chat/completions", s.openaiChat)
 	mux.HandleFunc("POST /v1/completions", s.openaiCompletions)
 	mux.HandleFunc("POST /v1/embeddings", s.openaiNotSupported)
-	return s.logged(mux)
+	return s.logged(s.guard(mux))
 }
 
 func (s *Server) logged(h http.Handler) http.Handler {
@@ -158,10 +184,7 @@ func (e errNotFound) Error() string {
 // acquire returns the model named, loading it (and unloading the one before) when it isn't the loaded one. The caller
 // calls release when done.
 func (s *Server) acquire(name string) (*loaded, time.Duration, error) {
-	if strings.TrimSpace(name) == "" {
-		return nil, 0, errors.New("model is required")
-	}
-	src, err := models.Resolve(name, s.cfg.ModelsDir)
+	src, err := s.resolve(name)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -314,6 +337,9 @@ func (s *Server) generate(ctx context.Context, g genRequest) (genOutput, error) 
 	if numCtx <= 0 {
 		numCtx = s.cfg.NumCtx
 	}
+	if numCtx > s.cfg.MaxNumCtx {
+		numCtx = s.cfg.MaxNumCtx
+	}
 	if modelCtx > 0 && numCtx > modelCtx {
 		numCtx = modelCtx
 	}
@@ -322,6 +348,9 @@ func (s *Server) generate(ctx context.Context, g genRequest) (genOutput, error) 
 		return out, badRequest{fmt.Errorf("the prompt is %d tokens, more than the context window (%d); set a larger num_ctx", len(ids), numCtx)}
 	}
 	maxTokens := g.sampling.MaxTokens
+	if s.cfg.MaxTokens > 0 && (maxTokens <= 0 || maxTokens > s.cfg.MaxTokens) {
+		maxTokens = s.cfg.MaxTokens
+	}
 	if maxTokens <= 0 || maxTokens > room {
 		maxTokens = room
 	}
@@ -360,7 +389,18 @@ type badRequest struct{ error }
 func statusOf(err error) int {
 	var nf errNotFound
 	var br badRequest
+	var fb errForbidden
+	var bz errBusy
+	var mb *http.MaxBytesError
 	switch {
+	case errors.Is(err, errUnauthorized):
+		return http.StatusUnauthorized
+	case errors.As(err, &fb):
+		return http.StatusForbidden
+	case errors.As(err, &bz):
+		return http.StatusTooManyRequests
+	case errors.As(err, &mb):
+		return http.StatusRequestEntityTooLarge
 	case errors.As(err, &nf):
 		return http.StatusNotFound
 	case errors.As(err, &br):
@@ -378,8 +418,12 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func decode(r *http.Request, v any) error {
-	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 32<<20))
-	if err := dec.Decode(v); err != nil {
+	// the body's size is capped in guard (Config.MaxBodyBytes)
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		var mb *http.MaxBytesError
+		if errors.As(err, &mb) {
+			return fmt.Errorf("the request is larger than this server takes (%d bytes): %w", mb.Limit, err)
+		}
 		return badRequest{fmt.Errorf("reading the request: %w", err)}
 	}
 	return nil

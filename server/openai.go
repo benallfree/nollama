@@ -136,6 +136,14 @@ func openaiError(w http.ResponseWriter, err error) {
 		typ = "invalid_request_error"
 	case http.StatusNotFound:
 		typ = "not_found_error"
+	case http.StatusUnauthorized:
+		typ = "authentication_error"
+	case http.StatusForbidden:
+		typ = "permission_error"
+	case http.StatusTooManyRequests:
+		typ = "rate_limit_error"
+	case http.StatusRequestEntityTooLarge:
+		typ = "invalid_request_error"
 	}
 	writeJSON(w, status, map[string]any{"error": map[string]any{"message": err.Error(), "type": typ, "code": nil}})
 }
@@ -320,6 +328,9 @@ func (s *Server) openaiModels(w http.ResponseWriter, r *http.Request) {
 	}
 	data := []any{}
 	for _, m := range local {
+		if !s.modelAllowed(m.Name) {
+			continue
+		}
 		data = append(data, map[string]any{"id": m.Name, "object": "model", "created": m.ModTime, "owned_by": "nollama"})
 	}
 	writeJSON(w, 200, map[string]any{"object": "list", "data": data})
@@ -327,7 +338,7 @@ func (s *Server) openaiModels(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) openaiModel(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("model")
-	src, err := models.Resolve(name, s.cfg.ModelsDir)
+	src, err := s.resolve(name)
 	if err != nil || !src.Present() {
 		openaiError(w, errNotFound{name})
 		return

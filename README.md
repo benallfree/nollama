@@ -122,7 +122,9 @@ and can keep a conversation's state between calls (`GenerateOptions.Thread`).
 | `qwen3-4b` | 2.5 GB | about 3 GB | better answers, slower |
 
 These come from Qwen's own Hugging Face repository and are checked against their SHA-256. Ollama's spellings work too
-(`qwen3:1.7b`). Any other Qwen3 GGUF works by `hf:<org>/<repo>/<file>.gguf` or by path to a `.gguf` file. The engine
+(`qwen3:1.7b`). Any other Qwen3 GGUF works by `hf:<org>/<repo>/<file>.gguf`, by path to a `.gguf` file (in
+`nollama run`; the server takes paths only with `--allow-paths`), or, for the server too, by name once the file is in
+the models folder (`mymodel.gguf` there is `mymodel`). The engine
 runs Qwen3 dense models in Q8_0, Q4_K_M, F16 and BF16; other architectures are not supported yet.
 
 ## Benchmarks
@@ -174,7 +176,36 @@ and not, `response_format` (`json_object`, `json_schema`), `max_tokens`/`max_com
 
 Not yet: GPUs, model families other than Qwen3, tool calls, images, embeddings, `/api/create`, thinking mode
 (Qwen3's thinking is always off), and several models loaded at once (nollama holds one and swaps on demand).
-The server has no authentication; keep it on `127.0.0.1` or put it behind something that has.
+
+## Security
+
+`nollama serve` listens on `127.0.0.1` with no API key, which is safe on a machine you alone use. It also guards
+against the attacks that have hit local LLM servers:
+
+- **Web pages.** A page you visit can send requests to a server on your machine. nollama refuses any request from a
+  browser page that isn't served from this machine (its `Origin` header), and any request whose `Host` header names a
+  domain rather than an IP address or `localhost`, which stops DNS rebinding. `--allowed-origins` (`NOLLAMA_ORIGINS`)
+  and `--allowed-hosts` (`NOLLAMA_ALLOWED_HOSTS`) widen these.
+- **Files on disk.** A request names models, not files: catalog names, `hf:` specs, and `.gguf` files in the models
+  folder. A path anywhere else (`/etc/passwd`, `../../x.gguf`) is refused unless you pass `--allow-paths`. Downloads
+  always land inside the models folder, whatever the `hf:` spec says.
+- **Open to the network.** `serve` won't listen on anything but a loopback address without an API key. Set
+  `NOLLAMA_API_KEY` (better than `--api-key`, which other users can see in `ps`) and clients send
+  `Authorization: Bearer <key>`: OpenAI clients through `api_key`, Ollama's through their `headers` option. `GET /`
+  answers without the key, for health checks. `--insecure-public` listens without one anyway, with a warning.
+- **Limits.** Request bodies are capped at 8 MB (`--max-body-mb`), the context window a request may ask for at 32768
+  tokens (`--max-num-ctx`), and one client IP to 8 requests at once (`--per-client`; behind a reverse proxy, set it
+  there). `--max-tokens` caps how long an answer may be.
+- **Model management.** `--read-only` turns off pulls, deletes, create, copy and push; `--no-pull` and `--no-delete`
+  turn off one each. `--models qwen3-1.7b,qwen3-0.6b` limits the models clients may use, and the listings show only
+  those.
+
+Embedding the server, the same settings are fields of `server.Config`. A typical embedded server serves one model and
+manages nothing:
+
+```go
+srv := server.New(server.Config{ModelsDir: "./models", ReadOnly: true, Models: []string{"qwen3-1.7b"}, APIKey: key})
+```
 
 ## License
 

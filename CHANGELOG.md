@@ -5,6 +5,13 @@ becomes `## vX.Y.Z` and its lines are the release notes (`release.sh` reads them
 
 ## Unreleased
 
+- `nollama serve` can require an API key (`NOLLAMA_API_KEY` or `--api-key`; clients send `Authorization: Bearer <key>` or `X-API-Key`), and refuses to listen on a non-loopback address without one unless you pass `--insecure-public`.
+- Requests from web pages not served from this machine, and requests whose `Host` is a domain other than `localhost` (DNS rebinding), are refused unless allowed with `--allowed-origins` / `--allowed-hosts` (or an API key is set, for hosts).
+- The server no longer loads a model by a path outside its models folder (`"model": "/etc/passwd"`); `--allow-paths` turns that back on. A `.gguf` file in the models folder can be used by its name, and `hf:` downloads can't write outside the folder.
+- `--read-only`, `--no-pull` and `--no-delete` turn off model management; `--models` limits which models clients may use.
+- Request limits: body size (`--max-body-mb`, default 8), context window (`--max-num-ctx`, default 32768), answer length (`--max-tokens`), and requests open at once per client IP (`--per-client`, default 8).
+- The same settings are fields of `server.Config` for embedders.
+
 ## v0.0.1-alpha.1
 
 First release.

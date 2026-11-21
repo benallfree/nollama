@@ -3,6 +3,7 @@ package models
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -73,5 +74,34 @@ func TestList(t *testing.T) {
 	}
 	if got[1].Name != "qwen3-0.6b" || got[1].Size != 1 {
 		t.Errorf("catalog file: %+v", got[1])
+	}
+}
+
+func TestResolveSafety(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "mine.gguf"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src, err := Resolve("mine", dir)
+	if err != nil || src.Path != filepath.Join(dir, "mine.gguf") || src.URL != "" {
+		t.Errorf("a file in the models folder by name: %+v %v", src, err)
+	}
+	for _, name := range []string{"missing", "..", ".hidden"} {
+		if _, err := Resolve(name, dir); err == nil {
+			t.Errorf("%q: want an error", name)
+		}
+	}
+	// hf: files stay in dir/hf whatever the spec holds: no separators, no "..", no ':' (a Windows drive or NTFS stream)
+	for _, spec := range []string{`hf:a/b/..\..\..\x.gguf`, "hf:a/b/c:evil.gguf", "hf:../../x/y.gguf"} {
+		src, err := Resolve(spec, dir)
+		if err != nil {
+			continue
+		}
+		if filepath.Dir(src.Path) != filepath.Join(dir, "hf") || strings.ContainsAny(filepath.Base(src.Path), `:\/`) {
+			t.Errorf("%s: path %s escapes %s/hf", spec, src.Path, dir)
+		}
+	}
+	if !IsPath(`C:\models\x.gguf`) || !IsPath("~/x") || !IsPath("a/b") || IsPath("qwen3-0.6b") || IsPath("hf-model") {
+		t.Error("IsPath")
 	}
 }

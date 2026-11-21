@@ -287,7 +287,7 @@ func (s *Server) loadOnly(w http.ResponseWriter, name string, ka *time.Duration,
 	if unloading {
 		s.mu.Lock()
 		if s.cur != nil {
-			if src, err := models.Resolve(name, s.cfg.ModelsDir); err == nil && src.Path == s.cur.src.Path {
+			if src, err := s.resolve(name); err == nil && src.Path == s.cur.src.Path {
 				if s.cur.active > 0 {
 					s.cur.drop = true // after the answers it is writing
 				} else {
@@ -334,6 +334,9 @@ func (s *Server) tags(w http.ResponseWriter, r *http.Request) {
 	}
 	out := []tag{}
 	for _, m := range local {
+		if !s.modelAllowed(m.Name) {
+			continue
+		}
 		d := ollamaDetails{Format: "gguf", Family: family(m.Name), Families: []string{family(m.Name)}}
 		digest := ""
 		if k, ok := models.Find(m.Name); ok {
@@ -435,9 +438,9 @@ func (s *Server) pullModel(w http.ResponseWriter, r *http.Request) {
 	if req.Model == "" {
 		req.Model = req.Name
 	}
-	src, err := models.Resolve(req.Model, s.cfg.ModelsDir)
+	src, err := s.resolve(req.Model)
 	if err != nil {
-		ollamaError(w, badRequest{err})
+		ollamaError(w, err)
 		return
 	}
 	stream := req.Stream == nil || *req.Stream
@@ -484,13 +487,13 @@ func (s *Server) deleteModel(w http.ResponseWriter, r *http.Request) {
 	if req.Model == "" {
 		req.Model = req.Name
 	}
-	src, err := models.Resolve(req.Model, s.cfg.ModelsDir)
+	src, err := s.resolve(req.Model)
 	if err != nil {
-		ollamaError(w, badRequest{err})
+		ollamaError(w, err)
 		return
 	}
 	if src.URL == "" {
-		ollamaError(w, badRequest{fmt.Errorf("%s is a file you named, not a download; nollama leaves it alone", src.Path)})
+		ollamaError(w, badRequest{fmt.Errorf("%s is a file you named, not a download; nollama leaves it alone", src.Name)})
 		return
 	}
 	if !src.Present() {
