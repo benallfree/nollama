@@ -53,9 +53,14 @@ func newGPUModel(m *Model) (*gpuModel, error) {
 	for _, l := range m.layers {
 		ws = append(ws, l.wq, l.wk, l.wv, l.wo, l.wgate, l.wup, l.wdown)
 	}
+	lo := uintptr(unsafe.Pointer(unsafe.SliceData(m.g.data)))
+	hi := lo + uintptr(len(m.g.data))
 	for _, w := range ws {
 		if !b.supports(w.typ) {
 			return fail(fmt.Errorf("engine: %s doesn't support %s weights", b.name(), typeName(w.typ)))
+		}
+		if p := uintptr(unsafe.Pointer(unsafe.SliceData(w.data))); p < lo || p+uintptr(len(w.data)) > hi {
+			return fail(errors.New("engine: GPU needs the weights in the model file as it is"))
 		}
 	}
 
@@ -185,6 +190,16 @@ func (gs *gpuState) release() {
 		b.release()
 	}
 	gs.bufs = nil
+}
+
+// forget frees s's GPU buffers when the model drops s. s mustn't be used again.
+func (g *gpuModel) forget(s *state) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if gs := g.states[s]; gs != nil {
+		gs.release()
+		delete(g.states, s)
+	}
 }
 
 // close frees the GPU. States it ran get their KV caches back in ordinary memory, so they stay usable.

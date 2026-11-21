@@ -37,6 +37,7 @@ type Config struct {
 	Resources   *engine.Resources
 	PromptCache int64         // bytes for the engine's prompt cache (0: off)
 	KVCacheType string        // the KV cache's format: "f32" (default), "f16", "q8_0" or "q4_0" (engine.KVCacheTypes)
+	GPU         string        // engine.LoadOptions.GPU: "" or "auto" uses a GPU when one works, "off" the CPU only
 	Parallel    int           // answers written at once (default 1); the rest wait their turn
 	KeepAlive   time.Duration // how long an idle model stays loaded (default 5m; negative: forever)
 	NumCtx      int           // context window when a request doesn't set num_ctx (default 4096, capped at the model's)
@@ -249,14 +250,21 @@ func (s *Server) acquire(name string) (*loaded, time.Duration, error) {
 		s.retire(old)
 	}
 	m, err := s.cfg.Load(src.Path, engine.LoadOptions{Resources: s.res, PromptCache: s.cfg.PromptCache,
-		KVCacheType: s.cfg.KVCacheType, Deterministic: s.cfg.Deterministic})
+		KVCacheType: s.cfg.KVCacheType, Deterministic: s.cfg.Deterministic, GPU: s.cfg.GPU})
 	if err != nil {
 		return nil, 0, fmt.Errorf("loading %s: %w", src.Name, err)
 	}
 	s.cur = &loaded{name: src.Name, src: src, m: m, draft: s.loadDraft(src, m)}
 	s.hold(s.cur)
 	load := time.Since(start)
-	s.cfg.Logf("loaded %s in %s (%s, KV cache %s)", src.Name, load.Round(time.Millisecond), m.Info().Kernels, m.Info().KVCacheType)
+	where := m.Info().GPU
+	if where == "" {
+		where = "CPU, " + m.Info().Kernels
+		if note := m.Info().GPUNote; note != "" {
+			where += "; no GPU: " + note
+		}
+	}
+	s.cfg.Logf("loaded %s in %s (%s, KV cache %s)", src.Name, load.Round(time.Millisecond), where, m.Info().KVCacheType)
 	return s.cur, load, nil
 }
 
@@ -278,7 +286,7 @@ func (s *Server) loadDraft(target models.Source, m *engine.Model) *engine.Model 
 		return nil
 	}
 	d, err := s.cfg.Load(src.Path, engine.LoadOptions{Resources: s.res, PromptCache: s.cfg.PromptCache / 4,
-		KVCacheType: s.cfg.KVCacheType, Deterministic: s.cfg.Deterministic})
+		KVCacheType: s.cfg.KVCacheType, Deterministic: s.cfg.Deterministic, GPU: s.cfg.GPU})
 	if err != nil {
 		s.cfg.Logf("draft %s: %v", src.Name, err)
 		return nil

@@ -30,7 +30,7 @@ func logitDiff(a, b []float32) float64 {
 // moves logits by about 1% of their spread, so against it the test checks the top token and a loose bound, while
 // decoding 8 tokens. The GPU reads the prompt in two batches, so the second starts mid-cache.
 func TestGPUForward(t *testing.T) {
-	m, err := Load(testGGUF(t), LoadOptions{})
+	m, err := Load(testGGUF(t), LoadOptions{GPU: "off"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestGPUForwardSpeed(t *testing.T) {
 	if testing.Short() {
 		t.Skip("short")
 	}
-	m, err := Load(testGGUF(t), LoadOptions{})
+	m, err := Load(testGGUF(t), LoadOptions{GPU: "off"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestGPUForwardSpeed(t *testing.T) {
 // TestGPUScoreEmbed checks the Score path (logits for every position) and the Embed path (the last hidden state)
 // against the CPU's float reference.
 func TestGPUScoreEmbed(t *testing.T) {
-	m, err := Load(testGGUF(t), LoadOptions{})
+	m, err := Load(testGGUF(t), LoadOptions{GPU: "off"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestGPUScoreEmbed(t *testing.T) {
 // re-upload when a call doesn't continue the last) on this GPU, in lockstep with the unified path: prompt in two
 // batches, decode, then a rewind into the prompt (which forces the upload). Logits and caches must match.
 func TestGPUForwardDiscrete(t *testing.T) {
-	m, err := Load(testGGUF(t), LoadOptions{})
+	m, err := Load(testGGUF(t), LoadOptions{GPU: "off"})
 	if err != nil {
 		t.Fatal(err)
 	}

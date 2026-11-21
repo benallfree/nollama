@@ -427,6 +427,13 @@ func (m *Model) newState(maxCtx, maxN int) *state {
 // forward runs tokens (at positions pos..pos+len-1) through the model and
 // fills s.logits for the last token. len(tokens) <= s.maxN.
 func (m *Model) forward(s *state, tokens []int, pos int) {
+	if m.gpu != nil && !floatRef { // floatRef is the CPU's own reference
+		if err := m.gpu.forward(s, tokens, pos); err == nil {
+			return
+		} else if err != errGPUUnsupported {
+			panic(err) // a GPU that fails mid-pass (device lost) can't be trusted with the next one either
+		}
+	}
 	hp := m.hp
 	p := m.pool
 	n := len(tokens)

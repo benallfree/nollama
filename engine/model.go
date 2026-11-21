@@ -44,6 +44,10 @@ type LoadOptions struct {
 	// would break exactness: a compact KV cache, and continuing from half-precision state (thread files in a
 	// ThreadDir, snapshots saved without Full).
 	Deterministic bool
+	// GPU picks where the forward pass runs: "" or "auto" uses a GPU when one works and supports the model (Metal on
+	// Apple Silicon, CUDA on NVIDIA); "off" keeps it on the CPU. Deterministic and Respond models always use the CPU.
+	// Info.GPU says which GPU, and Info.GPUNote why none. NOLLAMA_NO_GPU=1 in the environment also turns it off.
+	GPU string
 }
 
 // Info describes a loaded model.
@@ -63,6 +67,8 @@ type Info struct {
 	// embedding model such as Qwen3-Embedding, "" when it doesn't say (a chat model; Embed still uses the last token).
 	Pooling     string
 	KVCacheType string // the KV cache's format, e.g. "q8_0"
+	GPU         string // the GPU running the forward pass, e.g. "metal (Apple M1 Max)"; "" for the CPU
+	GPUNote     string // why the CPU runs it, when GPU is ""
 }
 
 type weight struct {
@@ -103,7 +109,8 @@ type Model struct {
 	weightBytes int64 // reserved in res for the weights
 	info        Info
 	invFrq      []float64
-	det         bool // LoadOptions.Deterministic
+	det         bool      // LoadOptions.Deterministic
+	gpu         *gpuModel // nil: the CPU runs the forward pass
 
 	stateMu sync.Mutex
 	states  []*state // idle generation states (KV caches), reused to avoid GC churn
@@ -149,6 +156,9 @@ func (m *Model) putState(s *state) {
 		return
 	}
 	m.stateMu.Unlock()
+	if m.gpu != nil {
+		m.gpu.forget(s)
+	}
 	m.res.release(s.bytes)
 }
 
@@ -469,6 +479,22 @@ func newModel(g *ggufFile, opts LoadOptions) (*Model, error) {
 	if opts.Deterministic {
 		m.det, m.info.Kernels = true, kernelName+" (deterministic)"
 	}
+	switch g := strings.ToLower(strings.TrimSpace(opts.GPU)); {
+	case g == "off":
+		m.info.GPUNote = "GPU off"
+	case g != "" && g != "auto":
+		return nil, fmt.Errorf("engine: GPU %q: want auto or off", opts.GPU)
+	case opts.Deterministic:
+		m.info.GPUNote = "deterministic mode runs on the CPU"
+	case opts.Respond != nil:
+		m.info.GPUNote = "scripted model"
+	default:
+		if gm, err := newGPUModel(m); err != nil {
+			m.info.GPUNote = err.Error()
+		} else {
+			m.gpu, m.info.GPU = gm, gm.b.name()
+		}
+	}
 	ok = true
 	return m, nil
 }
@@ -478,6 +504,10 @@ func (m *Model) Close() error {
 	m.FlushThreads() // a thread file being written reads the state it copied, not the model, but finish it
 	if m.res != nil {
 		m.detachResources()
+	}
+	if m.gpu != nil { // before the unmap: the GPU may be reading the file's pages in place
+		m.gpu.close()
+		m.gpu = nil
 	}
 	return m.g.close()
 }

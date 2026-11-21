@@ -183,7 +183,7 @@ func TestDeterministic(t *testing.T) {
 			}
 
 			// the default (assembly) path computes the same logits: every kernel follows the reference order
-			md, err := Load(p, LoadOptions{Threads: 2})
+			md, err := Load(p, LoadOptions{Threads: 2, GPU: "off"}) // the CPU kernels; the GPU has its own order
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -246,7 +246,7 @@ func TestBatchInvariantGGUF(t *testing.T) {
 	if p == "" {
 		t.Skip("GGUF not set")
 	}
-	m, err := Load(p, LoadOptions{Threads: 8})
+	m, err := Load(p, LoadOptions{Threads: 8, GPU: "off"})
 	if err != nil {
 		t.Fatal(err)
 	}

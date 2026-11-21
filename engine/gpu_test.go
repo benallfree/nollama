@@ -147,7 +147,7 @@ func TestGPUMatmulQ4KSynthetic(t *testing.T) {
 
 // openModelGPU loads the test model and opens a backend with its weights, or skips.
 func openModelGPU(t *testing.T) (*Model, gpuBackend) {
-	m, err := Load(testGGUF(t), LoadOptions{})
+	m, err := Load(testGGUF(t), LoadOptions{GPU: "off"})
 	if err != nil {
 		t.Fatal(err)
 	}
