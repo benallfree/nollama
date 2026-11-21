@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"sort"
 )
@@ -23,7 +24,7 @@ type TokenLogprob struct {
 // ScoreOptions configures Score.
 type ScoreOptions struct {
 	TopLogprobs int // also return this many most likely tokens at each position (0: none)
-	Batch       int // tokens per forward pass (default 64); each needs a vocabulary of logits, 600 KB for Qwen3
+	Batch       int // tokens per forward pass (default 64); each needs a vocabulary of logits, 600 KB for Qwen3, reserved in the model's Resources
 }
 
 // Score returns, for each token of ids after the first, its log-probability given the tokens before it: the model
@@ -41,15 +42,29 @@ func (m *Model) Score(ctx context.Context, ids []int, o ScoreOptions) ([]TokenLo
 	if b <= 0 {
 		b = 64
 	}
-	s := m.newState(len(ids), min(b, len(ids)))
-	s.allLogits = make([]float32, s.maxN*m.hp.vocab)
-	out := make([]TokenLogprob, 0, len(ids)-1)
+	b = min(b, len(ids)-1)
+	s, err := m.getState(len(ids), b)
+	if err != nil {
+		return nil, err
+	}
 	v := m.hp.vocab
-	for pos := 0; pos < len(ids)-1; pos += s.maxN {
+	lb := int64(b) * int64(v) * 4 // the logits of every position in a batch
+	if err := m.res.reserve(lb, fmt.Sprintf("logits for batches of %d tokens", b)); err != nil {
+		m.putState(s)
+		return nil, err
+	}
+	s.allLogits = make([]float32, b*v)
+	defer func() {
+		s.allLogits = nil // the state goes back for generation, which wants the last token's logits only
+		m.putState(s)
+		m.res.release(lb)
+	}()
+	out := make([]TokenLogprob, 0, len(ids)-1)
+	for pos := 0; pos < len(ids)-1; pos += b {
 		if err := ctx.Err(); err != nil {
 			return out, err
 		}
-		end := min(pos+s.maxN, len(ids)-1) // the last token is only a target
+		end := min(pos+b, len(ids)-1) // the last token is only a target
 		m.forward(s, ids[pos:end], pos)
 		for t := 0; t < end-pos; t++ {
 			out = append(out, logprobOf(s.allLogits[t*v:(t+1)*v], ids[pos+t+1], o.TopLogprobs))
