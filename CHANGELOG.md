@@ -34,6 +34,7 @@ becomes `## vX.Y.Z` and its lines are the release notes (`release.sh` reads them
 - `NOLLAMA_KEEP_ALIVE` sets the server's keep-alive, in the same formats as Ollama's `OLLAMA_KEEP_ALIVE` (`300`, `5m`, `-1`).
 - A request with `keep_alive: 0` that finishes while other answers are still being written now unloads the model once they finish, instead of being ignored.
 - `/api/ps` always reports `expires_at` as a time (far in the future for a model kept loaded forever), never `""`, which Ollama's own client can't parse.
+- README: "Loading and keep_alive" (what unloading saves and what it costs: the prompt cache), and the M1 Max next to the cloud servers, cold and warm first token and peak RAM.
 
 ## v0.0.1-alpha.1
 

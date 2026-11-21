@@ -568,6 +568,61 @@ left out when its file doesn't fit in the server's memory.
 Run them yourself with `go run ./engine/cmd/bench vps -models qwen3-0.6b:Q4_K_M=/path/to/model.gguf -ollama` (as root,
 for the cold starts), or on a fresh Vultr server with `scripts/vultr-bench/vultr.sh`.
 
+### For comparison: an Apple M1 Max
+
+The same measurements on a laptop, so you can see how far a small server is from one. These rows don't tell you what
+a VPS will do: use the table above for that.
+
+Measured on 2026-11-21 on an Apple M1 Max (10 cores, 64 GB), macOS, nollama at 19fb099 on the CPU only, 128 tokens
+written per run, medians of 3 runs, 4096-token context and 256 MB prompt cache. Each run started with the machine's
+load average under 4. `qwen3-0.6b` and `qwen3-1.7b` are Qwen's Q8_0 files, `qwen3-4b` is Q4_K_M (what `nollama pull`
+downloads); the short prompt is 31 tokens here (no chat template), the long one 586.
+
+- **Cold first token**: a new process reading a copy of the model file that isn't in the page cache. macOS can't drop
+  the page cache without `sudo purge`, so each cold run used a fresh APFS clone of the file (`cp -c`), which starts with
+  nothing cached (checked with `mincore`) and is read from the laptop's SSD. A cloud server's disk is slower.
+- **2 threads** stands in for a small server's 2 vCPUs, but it is not a VPS measurement: at 2 threads the M1 Max reads and
+  writes 3 to 8 times faster than the 2-vCPU Cascade Lake server above, on the same files.
+- **Peak RAM** is the process's highest resident memory, including the memory-mapped model file.
+
+| Machine | Model | Quant | Cold first token | Warm first token | First token, loaded (short / long) | Reading tok/s (short / long) | Writing tok/s | Peak RAM |
+|---|---|---|---|---|---|---|---|---|
+| Apple M1 Max, 4 threads | 0.6b | Q8_0 | 549 ms | 213 ms | 164 ms / 1.5 s | 419 / 407 | 106 | 1.8 GB |
+| Apple M1 Max, 4 threads | 1.7b | Q8_0 | 1.3 s | 419 ms | 312 ms / 3.6 s | 156 / 165 | 47 | 3.1 GB |
+| Apple M1 Max, 4 threads | 4b | Q4_K_M | 1.9 s | 770 ms | 703 ms / 10 s | 59 / 59 | 28 | 4.2 GB |
+| Apple M1 Max, 2 threads (stand-in, not a VPS) | 0.6b | Q8_0 | 658 ms | 236 ms | 189 ms / 2.9 s | 221 / 206 | 65 | 1.8 GB |
+| Apple M1 Max, 2 threads (stand-in, not a VPS) | 1.7b | Q8_0 | 1.7 s | 545 ms | 476 ms / 7.1 s | 80 / 84 | 29 | 3.1 GB |
+| Apple M1 Max, 2 threads (stand-in, not a VPS) | 4b | Q4_K_M | 2.7 s | 1.2 s | 1.2 s / 20 s | 30 / 30 | 15 | 4.2 GB |
+
+Cold and warm first token are for the short prompt. Writing tok/s is after the short prompt; after the long one it is
+70 to 90% of that.
+
+## Loading and keep_alive
+
+nollama memory-maps the model file, so loading takes 15 to 40 ms; there is nothing to copy. An idle model is unloaded
+after 5 minutes (`nollama serve --keep-alive`, `NOLLAMA_KEEP_ALIVE`, or `keep_alive` on a request, in Ollama's formats:
+`300` or `"5m"`, a negative value for forever, `0` to unload as soon as the answer is done).
+
+Since reloading is that cheap, you might want a short keep-alive. Before you set one, know what unloading throws away: the
+prompt cache. A model that stays loaded reads a shared start (a system prompt, a growing chat) once; after a reload it
+reads the whole prompt again. Measured on the M1 Max above (4 threads, a 614-token prompt that starts with a fixed
+system prompt):
+
+| Model | Load (file in page cache) | Whole prompt, nothing cached (as after a reload) | The same prompt again | Same system prompt, new question | Memory freed by unloading |
+|---|---|---|---|---|---|
+| 0.6b, Q8_0 | 16 ms | 1.5 s | 22 ms | 85 ms | 373 MB |
+| 1.7b, Q8_0 | 16 ms | 3.8 s | 30 ms | 168 ms | 404 MB |
+| 4b, Q4_K_M | 17 ms | 10.4 s | 51 ms | 416 ms | 533 MB |
+
+- **Unloading frees less than you'd think.** It frees the answer state and the prompt cache (the last column). The
+  weights are page cache the OS keeps until it needs the memory, and gives back on its own when it does, whether or not
+  the model is loaded.
+- **A reload is only fast while the file is still in the page cache.** Once the OS has dropped it, the next request pays
+  the cold first token from the tables above.
+- **So keep the default** if requests share a system prompt or continue chats, or if memory isn't tight. Use
+  `keep_alive: 0` (or `--keep-alive 0`) on a small server where answers are rare, prompts share nothing, and the few
+  hundred MB matter more than a few seconds on the next answer.
+
 ## Draft models (experimental, not faster yet)
 
 A small model can guess the next few tokens and let the larger one check them all in one pass (speculative decoding).
