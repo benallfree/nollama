@@ -13,6 +13,7 @@
 #   destroy RUN                       delete the instance and check it is gone
 #   list                              every instance labelled nollama-bench-* (anything left running)
 #   all PLAN [REGION] [--ollama]      every step above, destroying the instance on exit, success or not
+#   watch RUN                         take over a running benchmark: poll until done, fetch, destroy
 #   resume RUN                        rerun on a box that's already set up (fresh binary), fetch, destroy
 #
 # The API key comes from VULTR_API_KEY (or the macOS Keychain item vultr-api-key) and reaches curl on stdin, never
@@ -178,6 +179,13 @@ watch_and_fetch() {
 	cat "$run/results.md" 2>/dev/null || true
 }
 
+# take over a running benchmark: poll, fetch, destroy
+cmd_watch() {
+	run=$1
+	trap 'cmd_destroy "$run"' EXIT INT TERM HUP
+	watch_and_fetch "$run"
+}
+
 # rerun on a box that's already set up (new binary), then fetch and destroy
 cmd_resume() {
 	run=$1
@@ -204,6 +212,6 @@ c=${1:-}
 [ -n "$c" ] || { sed -n 2,22p "$0"; exit 2; }
 shift
 case "$c" in
-create | wait | push | start | status | fetch | destroy | list | all | resume) "cmd_$c" "$@" ;;
+create | wait | push | start | status | fetch | destroy | list | all | resume | watch) "cmd_$c" "$@" ;;
 *) die "unknown step $c" ;;
 esac
