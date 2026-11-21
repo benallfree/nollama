@@ -116,7 +116,7 @@ func TestBundleResolve(t *testing.T) {
 	write(t, filepath.Join(models, "qwen3-1.7b.gguf"), []byte("another"))
 
 	src, err := Resolve("qwen3:0.6b", models)
-	if err != nil || !src.Inside || src.Path != out || src.Offset == 0 || src.Size != int64(len(m)) || src.SHA256 != sum(m) || !src.Present() {
+	if err != nil || !src.Inside || src.Path != "bundled:qwen3-0.6b" || src.File != out || src.Offset == 0 || src.Size != int64(len(m)) || src.SHA256 != sum(m) || !src.Present() {
 		t.Fatalf("bundled: %+v %v", src, err)
 	}
 	if err := Fetch(src, nil, nil); err != nil {
@@ -125,11 +125,19 @@ func TestBundleResolve(t *testing.T) {
 	if err := Verify(src); err != nil {
 		t.Errorf("Verify: %v", err)
 	}
-	mine, _ := Resolve("mine", models)
-	if mine.Key() == src.Key() {
-		t.Errorf("two bundled models share a key: %s", src.Key())
+	if mine, _ := Resolve("mine", models); mine.Path == src.Path {
+		t.Errorf("two bundled models share a path: %s", src.Path)
 	}
-	if dl, _ := Resolve("qwen3-1.7b", models); dl.Inside || dl.Key() != filepath.Join(models, "qwen3-1.7b.gguf") {
+	if again, ok := Builtin(src.Path); !ok || again.File != src.File || again.Offset != src.Offset {
+		t.Errorf("Builtin(%s): %+v %v", src.Path, again, ok)
+	}
+	if again, err := Resolve(src.Path, models); err != nil || again.Offset != src.Offset {
+		t.Errorf("Resolve(%s): %+v %v", src.Path, again, err)
+	}
+	if _, ok := Builtin("bundled:nope"); ok {
+		t.Error("bundled:nope: found")
+	}
+	if dl, _ := Resolve("qwen3-1.7b", models); dl.Inside || dl.Path != filepath.Join(models, "qwen3-1.7b.gguf") {
 		t.Errorf("download: %+v", dl)
 	}
 
@@ -171,7 +179,7 @@ func TestEmbed(t *testing.T) {
 		inside.mu.Unlock()
 	})
 	src, err := Resolve("qwen3-4b", t.TempDir())
-	if err != nil || !src.Inside || !bytes.Equal(src.Data, data) || src.SHA256 == "" || !src.Present() {
+	if err != nil || !src.Inside || src.Path != "embedded:qwen3-4b" || !bytes.Equal(src.Data, data) || src.SHA256 == "" || !src.Present() {
 		t.Fatalf("embedded: %+v %v", src, err)
 	}
 	if Verify(src) == nil {

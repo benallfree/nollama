@@ -130,7 +130,7 @@ import (
 
 src, _ := models.Resolve("qwen3-1.7b", models.DefaultDir())
 _ = models.Fetch(src, nil, nil) // downloads once, checks the SHA-256
-m, _ := engine.LoadSource(src, engine.LoadOptions{}) // a file, or a model built into the binary
+m, _ := engine.Load(src.Path, engine.LoadOptions{}) // a downloaded file, or a model built into the binary
 defer m.Close()
 
 label, _ := schema.Compile([]byte(`{"type":"object","properties":{"label":{"enum":["bug","billing","question"]}},"required":["label"]}`))
@@ -258,11 +258,14 @@ var qwen []byte
 func init() { models.Embed("qwen3-0.6b", qwen) }
 
 src, _ := models.Resolve("qwen3-0.6b", models.DefaultDir()) // the embedded one, no download
-m, _ := engine.LoadSource(src, engine.LoadOptions{})
+m, _ := engine.Load(src.Path, engine.LoadOptions{})          // src.Path is "embedded:qwen3-0.6b"
 ```
 
 The operating system pages embedded data in from the executable as it's read, so there's no copy and no startup cost.
-`engine.LoadBytes` takes any GGUF already in memory, and `engine.LoadRange` one at an offset inside any file.
+Either way, a model inside the program resolves like any other: `models.Resolve` returns it with a path of
+`bundled:<name>` or `embedded:<name>`, and `engine.Load(src.Path, …)` opens it, so code written for downloaded models
+needs no change, and models not built in still download as usual. `engine.LoadBytes` takes any GGUF already in
+memory, and `engine.LoadRange` one at an offset inside any file.
 
 ## Models
 

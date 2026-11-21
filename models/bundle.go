@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -215,12 +216,16 @@ func openSource(src Source) (io.Reader, int64, func(), error) {
 	if src.Data != nil {
 		return bytes.NewReader(src.Data), int64(len(src.Data)), func() {}, nil
 	}
-	f, err := os.Open(src.Path)
+	file := src.File
+	if file == "" {
+		file = src.Path
+	}
+	f, err := os.Open(file)
 	if err != nil {
 		return nil, 0, nil, err
 	}
 	size := src.Size
-	if src.Offset == 0 {
+	if src.File == "" && src.Offset == 0 {
 		st, err := f.Stat()
 		if err != nil {
 			f.Close()
@@ -322,7 +327,7 @@ func BundleError() error {
 //
 //	models.Embed("qwen3-0.6b", qwen)
 //
-// Resolve then finds it before any download, and engine.LoadSource reads it in place. A catalog name gets the
+// Resolve then finds it before any download, and engine.Load(src.Path) reads it in place. A catalog name gets the
 // catalog's SHA-256 (models.Verify checks it). data must not change afterward.
 func Embed(name string, data []byte) {
 	name = Normalize(name)
@@ -343,21 +348,52 @@ func Embed(name string, data []byte) {
 	inside.embedded[name] = e
 }
 
-// findInside returns the model named that's inside the program: embedded first, then bundled.
-func findInside(name string) (Source, bool) {
+// The Path of a model inside the program: engine.Load opens these like files.
+const (
+	BundledPrefix  = "bundled:"
+	EmbeddedPrefix = "embedded:"
+)
+
+// Builtin returns the model inside the program that path names: "bundled:<name>" for one bundled at the end of the
+// executable, "embedded:<name>" for one registered with Embed. These are the Path of such a model's Source, so code
+// that loads by path (engine.Load(src.Path)) works for every model.
+func Builtin(path string) (Source, bool) {
+	if name, ok := strings.CutPrefix(path, EmbeddedPrefix); ok {
+		return findEmbedded(name)
+	}
+	if name, ok := strings.CutPrefix(path, BundledPrefix); ok {
+		return findBundled(name)
+	}
+	return Source{}, false
+}
+
+func findEmbedded(name string) (Source, bool) {
 	inside.mu.Lock()
 	e, ok := inside.embedded[name]
 	inside.mu.Unlock()
-	if ok {
-		return Source{Name: name, Path: "embedded:" + name, Data: e.data, Size: int64(len(e.data)), SHA256: e.sha256, Inside: true}, true
+	if !ok {
+		return Source{}, false
 	}
-	path, list, _ := bundle()
+	return Source{Name: name, Path: EmbeddedPrefix + name, Data: e.data, Size: int64(len(e.data)), SHA256: e.sha256, Inside: true}, true
+}
+
+func findBundled(name string) (Source, bool) {
+	file, list, _ := bundle()
 	for _, b := range list {
 		if b.Name == name {
-			return Source{Name: name, Path: path, Offset: b.Offset, Size: b.Size, SHA256: b.SHA256, Inside: true}, true
+			return Source{Name: name, Path: BundledPrefix + name, File: file, Offset: b.Offset, Size: b.Size,
+				SHA256: b.SHA256, Inside: true}, true
 		}
 	}
 	return Source{}, false
+}
+
+// findInside returns the model named that's inside the program: embedded first, then bundled.
+func findInside(name string) (Source, bool) {
+	if src, ok := findEmbedded(name); ok {
+		return src, true
+	}
+	return findBundled(name)
 }
 
 // listInside returns the models inside the program, embedded and bundled.
@@ -367,16 +403,16 @@ func listInside() []Local {
 	inside.mu.Lock()
 	for name, e := range inside.embedded {
 		seen[name] = true
-		out = append(out, Local{Name: name, Path: "embedded:" + name, Size: int64(len(e.data)), ModTime: e.modTime,
+		out = append(out, Local{Name: name, Path: EmbeddedPrefix + name, Size: int64(len(e.data)), ModTime: e.modTime,
 			SHA256: e.sha256, Inside: true})
 	}
 	inside.mu.Unlock()
-	path, list, mod := bundle()
+	_, list, mod := bundle()
 	for _, b := range list {
 		if seen[b.Name] {
 			continue
 		}
-		out = append(out, Local{Name: b.Name, Path: path, Size: b.Size, ModTime: mod, SHA256: b.SHA256, Inside: true})
+		out = append(out, Local{Name: b.Name, Path: BundledPrefix + b.Name, Size: b.Size, ModTime: mod, SHA256: b.SHA256, Inside: true})
 	}
 	return out
 }

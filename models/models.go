@@ -73,25 +73,15 @@ func DefaultDir() string {
 // program itself (a model bundled at the end of its executable, or one registered with Embed).
 type Source struct {
 	Name   string // the name asked for (an Ollama-style "qwen3:0.6b" comes back as "qwen3-0.6b")
-	Path   string // the local file (for a bundled model, the executable; for an embedded one, "embedded:<name>")
+	Path   string // the local file; for a model inside the program, "bundled:<name>" or "embedded:<name>" (see Builtin)
 	URL    string // "" for a local file
 	SHA256 string // "" when unverified (an hf: model)
 	Size   int64  // the download's size; for a model inside the program, the model's size
 
-	Inside bool   // inside the program: bundled in the executable (Path, Offset, Size) or embedded (Data)
-	Offset int64  // where a bundled model starts in Path
+	Inside bool   // inside the program: bundled in the executable (File, Offset, Size) or embedded (Data)
+	File   string // the file a bundled model is in (the executable); "" for anything else
+	Offset int64  // where a bundled model starts in File
 	Data   []byte // an embedded model's bytes
-}
-
-// Key tells sources apart: two sources with the same key are the same model bytes.
-func (s Source) Key() string {
-	switch {
-	case s.Data != nil:
-		return "embedded:" + s.Name
-	case s.Offset > 0:
-		return fmt.Sprintf("%s@%d", s.Path, s.Offset)
-	}
-	return s.Path
 }
 
 // Normalize turns an Ollama-style name into nollama's: "qwen3:0.6b" is "qwen3-0.6b", and ":latest" is dropped.
@@ -109,6 +99,9 @@ func Normalize(spec string) string {
 // catalog name (or its Ollama spelling, "qwen3:0.6b"), "hf:<org>/<repo>/<file>.gguf", or a path to a .gguf file.
 // Downloads go under dir.
 func Resolve(spec, dir string) (Source, error) {
+	if src, ok := Builtin(strings.TrimSpace(spec)); ok {
+		return src, nil
+	}
 	spec = Normalize(spec)
 	if src, ok := findInside(spec); ok {
 		return src, nil

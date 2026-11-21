@@ -288,7 +288,7 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	m, err := engine.LoadSource(src, engine.LoadOptions{Threads: *threads, PromptCache: 256 << 20})
+	m, err := engine.Load(src.Path, engine.LoadOptions{Threads: *threads, PromptCache: 256 << 20})
 	if err != nil {
 		return err
 	}
@@ -417,7 +417,7 @@ func checkBundle(path string) error {
 	}
 	bad := 0
 	for _, b := range list {
-		err := models.Verify(models.Source{Name: b.Name, Path: path, Offset: b.Offset, Size: b.Size, SHA256: b.SHA256})
+		err := models.Verify(models.Source{Name: b.Name, Path: models.BundledPrefix + b.Name, File: path, Offset: b.Offset, Size: b.Size, SHA256: b.SHA256})
 		status := "sha256 ok"
 		if err != nil {
 			status, bad = err.Error(), bad+1

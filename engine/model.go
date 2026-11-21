@@ -129,8 +129,15 @@ var fileTypeNames = map[int]string{
 	17: "Q5_K_M", 18: "Q6_K", 32: "BF16",
 }
 
-// Load opens a GGUF model file.
+// Load opens a GGUF model file, or a model inside the program by the Path models.Resolve gave it
+// ("bundled:<name>" for one bundled at the end of the executable, "embedded:<name>" for one registered with
+// models.Embed). So engine.Load(src.Path) opens any model models.Resolve finds.
 func Load(path string, opts LoadOptions) (*Model, error) {
+	if src, ok := models.Builtin(path); ok {
+		return loadBuiltin(src, opts)
+	} else if strings.HasPrefix(path, models.BundledPrefix) || strings.HasPrefix(path, models.EmbeddedPrefix) {
+		return nil, fmt.Errorf("no model %s inside this program", path)
+	}
 	g, err := openGGUF(path)
 	if err != nil {
 		return nil, err
@@ -170,20 +177,16 @@ func LoadBytes(data []byte, opts LoadOptions) (*Model, error) {
 	return load(g, opts)
 }
 
-// LoadSource opens the model a models.Source points at: a file, a model bundled in the executable, or one
-// registered with models.Embed.
-func LoadSource(src models.Source, opts LoadOptions) (*Model, error) {
-	if opts.ID == "" && (src.Data != nil || src.Offset > 0) {
+// loadBuiltin opens a model inside the program: bundled (a range of the executable) or embedded (bytes).
+func loadBuiltin(src models.Source, opts LoadOptions) (*Model, error) {
+	if opts.ID == "" {
 		// the same name a downloaded copy has, so a conversation saved with one reads back with the other
 		opts.ID = fmt.Sprintf("%s.gguf:%d", src.Name, src.Size)
 	}
-	switch {
-	case src.Data != nil:
+	if src.Data != nil {
 		return LoadBytes(src.Data, opts)
-	case src.Offset > 0:
-		return LoadRange(src.Path, src.Offset, src.Size, opts)
 	}
-	return Load(src.Path, opts)
+	return LoadRange(src.File, src.Offset, src.Size, opts)
 }
 
 func load(g *ggufFile, opts LoadOptions) (*Model, error) {

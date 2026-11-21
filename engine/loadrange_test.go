@@ -109,13 +109,36 @@ func TestLoadBundled(t *testing.T) {
 		return res.Tokens
 	}
 	want := answer(Load(p, LoadOptions{Threads: 4}))
-	if got := answer(LoadSource(src, LoadOptions{Threads: 4})); !slices.Equal(got, want) {
+	// by path, the way code written for downloaded files loads
+	if got := answer(Load(src.Path, LoadOptions{Threads: 4})); !slices.Equal(got, want) {
 		t.Errorf("bundled: %v, want %v", got, want)
+	}
+	// a bundled copy has the file's fingerprint, so a saved conversation loads into either
+	fm, err := Load(p, LoadOptions{Threads: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bm, err := Load(src.Path, LoadOptions{Threads: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fm.Fingerprint() != bm.Fingerprint() {
+		t.Errorf("fingerprints differ: file %s, bundled %s", fm.Fingerprint(), bm.Fingerprint())
+	}
+	fm.Close()
+	bm.Close()
+	if _, err := Load("bundled:nope", LoadOptions{}); err == nil {
+		t.Error("bundled:nope: want an error")
 	}
 	// from memory, deliberately misaligned, as go:embed data can be
 	odd := make([]byte, len(data)+1)
 	copy(odd[1:], data)
-	if got := answer(LoadBytes(odd[1:], LoadOptions{Threads: 4})); !slices.Equal(got, want) {
-		t.Errorf("bytes: %v, want %v", got, want)
+	models.Embed("odd", odd[1:])
+	emb, err := models.Resolve("odd", dir)
+	if err != nil || emb.Path != "embedded:odd" {
+		t.Fatalf("%+v %v", emb, err)
+	}
+	if got := answer(Load(emb.Path, LoadOptions{Threads: 4})); !slices.Equal(got, want) {
+		t.Errorf("embedded: %v, want %v", got, want)
 	}
 }

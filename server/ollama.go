@@ -290,7 +290,7 @@ func (s *Server) loadOnly(w http.ResponseWriter, name string, ka *time.Duration,
 	if unloading {
 		s.mu.Lock()
 		if s.cur != nil {
-			if src, err := s.resolve(name); err == nil && src.Key() == s.cur.src.Key() {
+			if src, err := s.resolve(name); err == nil && src.Path == s.cur.src.Path {
 				if s.cur.active > 0 {
 					s.cur.drop = true // after the answers it is writing
 				} else {
@@ -508,7 +508,7 @@ func (s *Server) deleteModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	if s.cur != nil && s.cur.src.Key() == src.Key() {
+	if s.cur != nil && s.cur.src.Path == src.Path {
 		old := s.cur
 		s.cur = nil
 		s.retire(old)
