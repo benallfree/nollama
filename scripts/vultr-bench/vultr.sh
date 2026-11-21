@@ -49,7 +49,8 @@ ids_by_label() { # LABEL -> instance ids with that label, one per line
 }
 json() { python3 -I -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
 
-SSHOPTS="-o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+# IdentitiesOnly: offer only the run key (agent keys first add up to "too many authentication failures")
+SSHOPTS="-o IdentitiesOnly=yes -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 rssh() { # RUN cmd...
 	r=$1; shift
 	timeout 60 ssh $SSHOPTS -i "$r/key" "root@$(cat "$r/ip")" "$@"
