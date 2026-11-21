@@ -239,7 +239,7 @@ func ollamaUnloadAll(models []string) {
 	time.Sleep(time.Second)
 }
 
-// runnerRSS returns the summed RSS (bytes) of `ollama runner` processes.
+// runnerRSS returns the summed RSS (bytes) of the processes Ollama runs models in.
 func runnerRSS() int64 {
 	args := []string{"-axo", "rss=,command="} // BSD/macOS
 	if runtime.GOOS == "linux" {
@@ -252,7 +252,8 @@ func runnerRSS() int64 {
 	var total int64
 	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(line)
-		if !strings.Contains(line, "ollama") || !strings.Contains(line, "runner") {
+		// the process holding the model: `ollama runner` (older Ollama) or its bundled llama-server (0.40 and later)
+		if !strings.Contains(line, "ollama") || !(strings.Contains(line, "runner") || strings.Contains(line, "llama-server")) {
 			continue
 		}
 		f := strings.Fields(line)

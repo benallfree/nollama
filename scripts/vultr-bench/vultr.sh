@@ -13,6 +13,7 @@
 #   destroy RUN                       delete the instance and check it is gone
 #   list                              every instance labelled nollama-bench-* (anything left running)
 #   all PLAN [REGION] [--ollama]      every step above, destroying the instance on exit, success or not
+#   resume RUN                        rerun on a box that's already set up (fresh binary), fetch, destroy
 #
 # The API key comes from VULTR_API_KEY (or the macOS Keychain item vultr-api-key) and reaches curl on stdin, never
 # on a command line or in a file.
@@ -124,7 +125,8 @@ cmd_start() {
 
 cmd_status() {
 	run=$1
-	rssh "$run" 'cd /root/bench; tail -3 bench.log; if pgrep -f "bench vps" >/dev/null; then echo RUNNING; elif [ -s results.md ]; then echo DONE; else echo STOPPED; fi'
+	# pidof matches the process name only (pgrep -f would match this very shell, whose command line names it)
+	rssh "$run" 'cd /root/bench; tail -3 bench.log; if pidof bench >/dev/null; then echo RUNNING; elif [ -s results.md ]; then echo DONE; else echo STOPPED; fi'
 }
 
 cmd_fetch() {
@@ -161,16 +163,9 @@ cmd_list() {
 	api GET '/instances?per_page=500' | json '"\n".join(i["id"]+" "+i["label"]+" "+i["plan"]+" "+i["status"]+" since "+i["date_created"] for i in d["instances"] if i["label"].startswith("nollama-bench-")) or "no nollama-bench instances"'
 }
 
-cmd_all() {
-	run="$BASE/$(date +%Y%m%d-%H%M%S)-$1"
-	mkdir -p "$run"
-	echo "$1" >"$run/plan"
-	trap 'cmd_destroy "$run"' EXIT INT TERM HUP
-	RUN=$run cmd_create "$@"
-	cmd_wait "$run"
-	cmd_push "$run"
-	cmd_start "$run"
-	t0=$(date +%s)
+# poll until the benchmark ends, then fetch
+watch_and_fetch() {
+	run=$1 t0=$(date +%s)
 	while :; do
 		sleep 30
 		s=$(cmd_status "$run" 2>&1 || echo "status failed")
@@ -182,10 +177,32 @@ cmd_all() {
 	cat "$run/results.md" 2>/dev/null || true
 }
 
+# rerun on a box that's already set up (new binary), then fetch and destroy
+cmd_resume() {
+	run=$1
+	trap 'cmd_destroy "$run"' EXIT INT TERM HUP
+	rssh "$run" 'pkill -x bench; cd /root/bench && rm -f results.md results.json bench.log; echo cleared'
+	cmd_push "$run"
+	cmd_start "$run"
+	watch_and_fetch "$run"
+}
+
+cmd_all() {
+	run="$BASE/$(date +%Y%m%d-%H%M%S)-$1"
+	mkdir -p "$run"
+	echo "$1" >"$run/plan"
+	trap 'cmd_destroy "$run"' EXIT INT TERM HUP
+	RUN=$run cmd_create "$@"
+	cmd_wait "$run"
+	cmd_push "$run"
+	cmd_start "$run"
+	watch_and_fetch "$run"
+}
+
 c=${1:-}
 [ -n "$c" ] || { sed -n 2,22p "$0"; exit 2; }
 shift
 case "$c" in
-create | wait | push | start | status | fetch | destroy | list | all) "cmd_$c" "$@" ;;
+create | wait | push | start | status | fetch | destroy | list | all | resume) "cmd_$c" "$@" ;;
 *) die "unknown step $c" ;;
 esac
