@@ -11,7 +11,7 @@ import (
 func gemmQ4K2x4Asm(w0, w1, s0, s1, y unsafe.Pointer, nb int, out *float32)
 
 //go:noescape
-func gemmF16x2x4Asm(w0, w1, y unsafe.Pointer, stride, n int, out *float32)
+func gemmF16x2x2Asm(w0, w1, y unsafe.Pointer, stride, n int, out *float32)
 
 //go:noescape
 func gemmQ6K1x4Asm(w, y unsafe.Pointer, nb int, out *float32)
@@ -39,7 +39,11 @@ func archFloatAsm() {
 			return
 		}
 		_, _ = w1[2*n-1], y[3*stride+n-1]
-		gemmF16x2x4Asm(bptr(w0), bptr(w1), fptr(y), stride*4, n, &out[0])
+		// two columns at a time: 16 lanes per (row, column) fill the registers
+		var lo, hi [4]float32
+		gemmF16x2x2Asm(bptr(w0), bptr(w1), fptr(y), stride*4, n, &lo[0])
+		gemmF16x2x2Asm(bptr(w0), bptr(w1), fptr(y[2*stride:]), stride*4, n, &hi[0])
+		*out = [8]float32{lo[0], lo[1], hi[0], hi[1], lo[2], lo[3], hi[2], hi[3]}
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -29,7 +30,7 @@ func TestGemmQ4K2x4(t *testing.T) {
 		t.Skip("no 2x4 Q4_K kernel on this CPU")
 	}
 	r := rand.New(rand.NewPCG(3, 4))
-	for _, nb := range []int{1, 2, 3, 8, 24} {
+	for _, nb := range []int{1, 2, 3, 5, 8, 11, 24, 40} {
 		w := randBlocks(r, 2*nb, q4kBytes, []int{0, 2})
 		w0, w1 := w[:nb*q4kBytes], w[nb*q4kBytes:]
 		plain, grp := makeQ8K4(r, nb)
@@ -41,7 +42,7 @@ func TestGemmQ4K2x4(t *testing.T) {
 		for c := 0; c < 4; c++ {
 			for ri, wr := range [][]byte{w0, w1} {
 				want := dotQ4KQ8KGo(wr, plain[c], nb)
-				if math.Abs(float64(o[ri*4+c]-want)) > 1e-4*(1+math.Abs(float64(want))) {
+				if math.Float32bits(o[ri*4+c]) != math.Float32bits(want) { // the reference order, bit for bit
 					t.Errorf("nb=%d row %d col %d: %v, want %v", nb, ri, c, o[ri*4+c], want)
 				}
 			}
@@ -50,12 +51,9 @@ func TestGemmQ4K2x4(t *testing.T) {
 }
 
 // GGUF=<file> go test -run TestPrefillMatchesReference -v
-// Reads prompts with the prompt (GEMM) kernels on and off and compares the
-// last position's logits and the first greedy token, against the spread the
-// old path shows between batched and token-by-token reading (the 4-row and
-// 1-row kernels round differently, which a few layers amplify to about a
-// logit). Later greedy tokens are logged, not checked: they follow the noise. NLAYERS=k
-// truncates the model.
+// Reads prompts with the prompt kernels, with the 4-column kernels, and token
+// by token, and checks that the last position's logits and the greedy
+// continuation are identical. NLAYERS=k truncates the model.
 func TestPrefillMatchesReference(t *testing.T) {
 	p := os.Getenv("GGUF")
 	if p == "" {
@@ -95,28 +93,24 @@ func TestPrefillMatchesReference(t *testing.T) {
 		fast, fgen := run(ids, prefillBatch)
 		restore := promptKernelsOff()
 		ref, rgen := run(ids, prefillBatch)
-		one, _ := run(ids, 1) // token by token: the old engine's own spread
 		restore()
-		diff := func(a, b []float32) (d float64) {
+		one, ogen := run(ids, 1) // token by token
+		same := func(a, b []float32) bool {
 			for i := range a {
-				d = max(d, math.Abs(float64(a[i]-b[i])))
+				if math.Float32bits(a[i]) != math.Float32bits(b[i]) {
+					return false
+				}
 			}
-			return d
+			return true
 		}
-		dFast, dOne := diff(fast, ref), diff(one, ref)
-		t.Logf("n=%d: max |logit diff| new vs old %.3f, old token-by-token vs old batched %.3f; greedy new %v old %v", n, dFast, dOne, fgen, rgen)
-		// Float rounding in a different order moves the logits by about as
-		// much as reading the prompt token by token does; more is a bug.
-		if dFast > 2*dOne+0.05 {
-			t.Errorf("n=%d: new path moved logits by %.3f, the old engine's own spread is %.3f", n, dFast, dOne)
+		t.Logf("n=%d: greedy new %v old %v", n, fgen, rgen)
+		// every kernel follows one reference order, so the prompt kernels,
+		// the 4-column ones and token-by-token reading agree bit for bit
+		if !same(fast, ref) || !slices.Equal(fgen, rgen) {
+			t.Errorf("n=%d: prompt kernels change the logits", n)
 		}
-		// The first token may flip only where the old path itself is unsure:
-		// its top two logits closer than its own batched/serial spread.
-		if fgen[0] != rgen[0] {
-			gap := float64(ref[rgen[0]] - ref[fgen[0]])
-			if gap > dOne {
-				t.Errorf("n=%d: first token %d vs %d, old path's margin %.3f exceeds its spread %.3f", n, fgen[0], rgen[0], gap, dOne)
-			}
+		if !same(one, ref) || !slices.Equal(ogen, rgen) {
+			t.Errorf("n=%d: token-by-token reading changes the logits", n)
 		}
 	}
 }
@@ -142,7 +136,7 @@ func TestGemmF16x2x4(t *testing.T) {
 		gemmF16x2x4(w0, w1, y, stride, &o)
 		for ri, wr := range [][]byte{w0, w1} {
 			for c := 0; c < 4; c++ {
-				if want := dotF16F32Go(wr, y[c*stride:c*stride+n]); !close32(o[ri*4+c], want) {
+				if want := dotF16F32Go(wr, y[c*stride:c*stride+n]); math.Float32bits(o[ri*4+c]) != math.Float32bits(want) {
 					t.Errorf("n=%d row %d col %d: %v, want %v", n, ri, c, o[ri*4+c], want)
 				}
 			}
@@ -155,7 +149,7 @@ func TestGemmQ6K1x4(t *testing.T) {
 		t.Skip("no Q6_K prompt kernel on this CPU")
 	}
 	r := rand.New(rand.NewPCG(9, 10))
-	for _, nb := range []int{1, 2, 3, 8, 24} {
+	for _, nb := range []int{1, 2, 3, 5, 8, 11, 24, 40} {
 		w := randBlocks(r, nb, q6kBytes, []int{208})
 		grp := make([]byte, nb*q8k6Bytes)
 		var plain [4][]byte
@@ -172,7 +166,7 @@ func TestGemmQ6K1x4(t *testing.T) {
 		gemmQ6K1x4(w, grp, nb, &o)
 		for c := 0; c < 4; c++ {
 			want := dotQ6KQ8KGo(w, plain[c], nb)
-			if math.Abs(float64(o[c]-want)) > 1e-4*(1+math.Abs(float64(want))) {
+			if math.Float32bits(o[c]) != math.Float32bits(want) { // the reference order, bit for bit
 				t.Errorf("nb=%d col %d: %v, want %v", nb, c, o[c], want)
 			}
 		}

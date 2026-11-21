@@ -225,13 +225,17 @@ g4loop:
 	ADD  $8, R13
 	FCVTL4H(10, 10)
 	VLD1 (R2), [V11.S4]
-	FMULS(10, 0, 8, 8)
-	FMLSS(10, 1, 3, 8)
-	FMULS(10, 2, 12, 12)
-	FMLSS(10, 3, 9, 12)
-	VFMLA V11.S4, V8.S4, V30.S4
+	// the reference order (dotQ4KQ8KGo): per column, sum = fma(d*yd, sumi, sum),
+	// then sum = fma(-dmin*yd, mins, sum)
+	FMULS(10, 0, 11, 14)
+	FMULS(10, 1, 11, 15)
+	VFMLA V14.S4, V8.S4, V30.S4
+	VFMLS V15.S4, V3.S4, V30.S4
+	FMULS(10, 2, 11, 14)
+	FMULS(10, 3, 11, 15)
 	VLD1 (R9), [V13.S4]
-	VFMLA V11.S4, V12.S4, V13.S4
+	VFMLA V14.S4, V12.S4, V13.S4
+	VFMLS V15.S4, V9.S4, V13.S4
 	VST1 [V13.S4], (R9)
 
 	ADD  $144, R0
@@ -247,25 +251,32 @@ g4done:
 #define FCVTL2_8H(n, d) WORD $(0x4E217800 | ((n)<<5) | (d))                     // Vd.4S = float32(Vn.8H[4:] f16)
 #define FADDP4S(m, n, d) WORD $(0x6E20D400 | ((m)<<16) | ((n)<<5) | (d))
 
-// F16C(A0, A1, B0, B1): one activation column's next 16 floats (at R10,
-// then R10 += stride) against both rows' converted weights (row 0: V0-V3,
-// row 1: V4-V7); A are row 0's two accumulators, B row 1's.
-#define F16C(A0, A1, B0, B1) \
+// F16C(A, B): one activation column's next 16 floats (at R10, then R10 +=
+// stride) against both rows' converted weights (row 0: V0-V3, row 1: V4-V7).
+// A and B are the column's 4 accumulators for rows 0 and 1 (lanes 0-15).
+#define F16C(A0, A1, A2, A3, B0, B1, B2, B3) \
 	VLD1 (R10), [V24.S4, V25.S4, V26.S4, V27.S4] \
 	ADD  R5, R10 \
 	VFMLA V0.S4, V24.S4, A0.S4 \
 	VFMLA V1.S4, V25.S4, A1.S4 \
-	VFMLA V2.S4, V26.S4, A0.S4 \
-	VFMLA V3.S4, V27.S4, A1.S4 \
+	VFMLA V2.S4, V26.S4, A2.S4 \
+	VFMLA V3.S4, V27.S4, A3.S4 \
 	VFMLA V4.S4, V24.S4, B0.S4 \
 	VFMLA V5.S4, V25.S4, B1.S4 \
-	VFMLA V6.S4, V26.S4, B0.S4 \
-	VFMLA V7.S4, V27.S4, B1.S4
+	VFMLA V6.S4, V26.S4, B2.S4 \
+	VFMLA V7.S4, V27.S4, B3.S4
 
-// func gemmF16x2x4Asm(w0, w1, y unsafe.Pointer, stride, n int, out *float32)
-// out[r*4+c] = sum_i f16(w_r[i]) * y[c*stride bytes + 4i] for r < 2, c < 4;
-// n is a multiple of 16.
-TEXT ·gemmF16x2x4Asm(SB), NOSPLIT, $0-48
+// F16W(A0, A1, A2, A3): w_k = (a_k + a_k+8) + (a_k+4 + a_k+12) into A0 (sum16).
+#define F16W(A0, A1, A2, A3) \
+	VFADD A2.S4, A0.S4, A0.S4 \
+	VFADD A3.S4, A1.S4, A1.S4 \
+	VFADD A1.S4, A0.S4, A0.S4
+
+// func gemmF16x2x2Asm(w0, w1, y unsafe.Pointer, stride, n int, out *float32)
+// out = [r0.c0, r0.c1, r1.c0, r1.c1], r.c = sum_i f16(w_r[i]) * y[c*stride
+// bytes + 4i]; n is a multiple of 16. The reference order (dotF16F32Go):
+// element i goes to lane i%16 with a fused multiply-add, then the fixed tree.
+TEXT ·gemmF16x2x2Asm(SB), NOSPLIT, $0-48
 	MOVD w0+0(FP), R0
 	MOVD w1+8(FP), R1
 	MOVD y+16(FP), R2
@@ -302,31 +313,21 @@ f2loop:
 	FCVTL4H(31, 6)
 	FCVTL2_8H(31, 7)
 	MOVD R2, R10
-	F16C(V8, V9, V16, V17)
-	F16C(V10, V11, V18, V19)
-	F16C(V12, V13, V20, V21)
-	F16C(V14, V15, V22, V23)
+	F16C(V8, V9, V10, V11, V16, V17, V18, V19)
+	F16C(V12, V13, V14, V15, V20, V21, V22, V23)
 	ADD  $64, R2
 	SUBS $1, R3
 	BNE  f2loop
 f2done:
-	VFADD V9.S4, V8.S4, V8.S4
-	VFADD V11.S4, V10.S4, V10.S4
-	VFADD V13.S4, V12.S4, V12.S4
-	VFADD V15.S4, V14.S4, V14.S4
-	VFADD V17.S4, V16.S4, V16.S4
-	VFADD V19.S4, V18.S4, V18.S4
-	VFADD V21.S4, V20.S4, V20.S4
-	VFADD V23.S4, V22.S4, V22.S4
-	FADDP4S(10, 8, 8)
-	FADDP4S(14, 12, 12)
+	F16W(V8, V9, V10, V11)
+	F16W(V12, V13, V14, V15)
+	F16W(V16, V17, V18, V19)
+	F16W(V20, V21, V22, V23)
+	// (w0 + w1) + (w2 + w3) for each, lane order r0c0, r0c1, r1c0, r1c1
 	FADDP4S(12, 8, 8)
-	FADDP4S(18, 16, 16)
-	FADDP4S(22, 20, 20)
 	FADDP4S(20, 16, 16)
+	FADDP4S(16, 8, 8)
 	VST1 [V8.S4], (R4)
-	ADD  $16, R4
-	VST1 [V16.S4], (R4)
 	RET
 
 #define ZIP1D(m, n, d) WORD $(0x4EC03800 | ((m)<<16) | ((n)<<5) | (d))          // Vd.2D = [n0 m0]
