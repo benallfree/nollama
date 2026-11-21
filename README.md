@@ -17,7 +17,7 @@ macOS or Linux, with Homebrew:
 
 ```bash
 brew tap benallfree/nollama https://github.com/benallfree/nollama
-brew install nollama
+brew install benallfree/nollama/nollama
 ```
 
 Windows, with [Scoop](https://scoop.sh):
