@@ -89,8 +89,8 @@ func dequantRow(t uint32, row []byte, out []float32) {
 				d2, mm2 := d*float32(s2), dmin*float32(m2)
 				for l := 0; l < 32; l++ {
 					q := qs[32*j+l]
-					y[64*j+l] = d1*float32(q&0xF) - mm1
-					y[64*j+32+l] = d2*float32(q>>4) - mm2
+					y[64*j+l] = float32(d1*float32(q&0xF)) - mm1
+					y[64*j+32+l] = float32(d2*float32(q>>4)) - mm2
 				}
 			}
 		}
@@ -186,7 +186,7 @@ func dotQ4KQ8KGo(x, y []byte, nb int) float32 {
 			bs := func(k int) int32 { return int32(int16(binary.LittleEndian.Uint16(yb[q8kBsumOff+2*k:]))) }
 			sumMins += int32(m1)*(bs(4*j)+bs(4*j+1)) + int32(m2)*(bs(4*j+2)+bs(4*j+3))
 		}
-		sum += d*float32(sumi) - dmin*float32(sumMins)
+		sum += float32(d*float32(sumi)) - float32(dmin*float32(sumMins))
 	}
 	return sum
 }
@@ -220,7 +220,7 @@ func dotQ6KQ8KGo(x, y []byte, nb int) float32 {
 				sumi += s[k] * int32(int8(sc[k]))
 			}
 		}
-		sum += d * float32(sumi)
+		sum += float32(d * float32(sumi))
 	}
 	return sum
 }
@@ -230,13 +230,13 @@ func dotF16F32Go(x []byte, y []float32) float32 {
 	n := len(y)
 	i := 0
 	for ; i+4 <= n; i += 4 {
-		s0 += f16(x[2*i:]) * y[i]
-		s1 += f16(x[2*i+2:]) * y[i+1]
-		s2 += f16(x[2*i+4:]) * y[i+2]
-		s3 += f16(x[2*i+6:]) * y[i+3]
+		s0 += float32(f16(x[2*i:]) * y[i])
+		s1 += float32(f16(x[2*i+2:]) * y[i+1])
+		s2 += float32(f16(x[2*i+4:]) * y[i+2])
+		s3 += float32(f16(x[2*i+6:]) * y[i+3])
 	}
 	for ; i < n; i++ {
-		s0 += f16(x[2*i:]) * y[i]
+		s0 += float32(f16(x[2*i:]) * y[i])
 	}
 	return s0 + s1 + s2 + s3
 }
@@ -247,13 +247,13 @@ func dotF32Go(x, y []float32) float32 {
 	y = y[:n]
 	i := 0
 	for ; i+4 <= n; i += 4 {
-		s0 += x[i] * y[i]
-		s1 += x[i+1] * y[i+1]
-		s2 += x[i+2] * y[i+2]
-		s3 += x[i+3] * y[i+3]
+		s0 += float32(x[i] * y[i])
+		s1 += float32(x[i+1] * y[i+1])
+		s2 += float32(x[i+2] * y[i+2])
+		s3 += float32(x[i+3] * y[i+3])
 	}
 	for ; i < n; i++ {
-		s0 += x[i] * y[i]
+		s0 += float32(x[i] * y[i])
 	}
 	return s0 + s1 + s2 + s3
 }
@@ -261,7 +261,7 @@ func dotF32Go(x, y []float32) float32 {
 func axpyGo(a float32, x, y []float32) {
 	y = y[:len(x)]
 	for i, v := range x {
-		y[i] += a * v
+		y[i] += float32(a * v)
 	}
 }
 

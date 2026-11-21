@@ -413,7 +413,8 @@ func newModel(g *ggufFile, opts LoadOptions) (*Model, error) {
 	}
 	m.invFrq = make([]float64, hp.headDim/2)
 	for i := range m.invFrq {
-		m.invFrq[i] = math.Pow(hp.ropeBase, -2*float64(i)/float64(hp.headDim))
+		// rounded to float32: math.Pow differs in the last float64 bit between arm64 and amd64
+		m.invFrq[i] = float64(float32(math.Pow(hp.ropeBase, -2*float64(i)/float64(hp.headDim))))
 	}
 
 	threads := m.pool.n

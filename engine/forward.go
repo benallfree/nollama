@@ -74,7 +74,7 @@ func rowDot(w *weight, a *acts) func(row []byte, t int) float32 {
 			dequantRow(w.typ, row, tmp)
 			var s float64
 			for i := range tmp {
-				s += float64(tmp[i]) * float64(a.f[t*k+i])
+				s += float64(float64(tmp[i]) * float64(a.f[t*k+i]))
 			}
 			return float32(s)
 		}
@@ -95,7 +95,7 @@ func rowDot(w *weight, a *acts) func(row []byte, t int) float32 {
 		return func(row []byte, t int) float32 {
 			var s float32
 			for i := 0; i < k; i++ {
-				s += math.Float32frombits(uint32(row[4*i])|uint32(row[4*i+1])<<8|uint32(row[4*i+2])<<16|uint32(row[4*i+3])<<24) * a.f[t*k+i]
+				s += float32(math.Float32frombits(uint32(row[4*i])|uint32(row[4*i+1])<<8|uint32(row[4*i+2])<<16|uint32(row[4*i+3])<<24) * a.f[t*k+i])
 			}
 			return s
 		}
@@ -195,7 +195,7 @@ func (m *Model) matmul(p *pool, a *acts, t0 int, segs ...mmSeg) {
 func rmsnorm(out, x, w []float32, eps float64) {
 	var ss float64
 	for _, v := range x {
-		ss += float64(v) * float64(v)
+		ss += float64(float64(v) * float64(v))
 	}
 	scale := float32(1 / math.Sqrt(ss/float64(len(x))+eps))
 	for i, v := range x {
@@ -325,8 +325,9 @@ func (m *Model) forward(s *state, tokens []int, pos int) {
 				pp = s.ropePos[t]
 			}
 			th := float64(pp) * m.invFrq[i]
-			s.cos[t*half+i] = float32(math.Cos(th))
-			s.sin[t*half+i] = float32(math.Sin(th))
+			sn, cs := sincos(th)
+			s.cos[t*half+i] = float32(cs)
+			s.sin[t*half+i] = float32(sn)
 		}
 	}
 	s.an.n, s.aa.n, s.af.n = n, n, n
@@ -523,7 +524,7 @@ func rope(v, cs, sn []float32) {
 	half := len(cs)
 	for i := 0; i < half; i++ {
 		x0, x1 := v[i], v[i+half]
-		v[i] = x0*cs[i] - x1*sn[i]
-		v[i+half] = x0*sn[i] + x1*cs[i]
+		v[i] = float32(x0*cs[i]) - float32(x1*sn[i])
+		v[i+half] = float32(x0*sn[i]) + float32(x1*cs[i])
 	}
 }

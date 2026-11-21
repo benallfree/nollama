@@ -72,7 +72,7 @@ func dotQ8_0Go(x, y []byte, nb int) float32 {
 		for j := 0; j < 32; j++ {
 			s += int32(int8(xb[2+j])) * int32(int8(yb[4+j]))
 		}
-		sum += f16(xb) * math.Float32frombits(binary.LittleEndian.Uint32(yb)) * float32(s)
+		sum += float32(f16(xb) * math.Float32frombits(binary.LittleEndian.Uint32(yb)) * float32(s))
 	}
 	return sum
 }
@@ -86,16 +86,16 @@ func expf(x float32) float32 {
 		x = 88
 	}
 	const log2e = 1.44269504088896341
-	n := float32(math.Floor(float64(x*log2e + 0.5)))
-	r := x - n*0.693359375 - n*-2.12194440e-4
+	n := float32(math.Floor(float64(float32(x*log2e) + 0.5)))
+	r := x - float32(n*0.693359375) - float32(n*-2.12194440e-4)
 	// exp(r) on [-ln2/2, ln2/2]
 	p := float32(1.9875691500e-4)
-	p = p*r + 1.3981999507e-3
-	p = p*r + 8.3334519073e-3
-	p = p*r + 4.1665795894e-2
-	p = p*r + 1.6666665459e-1
-	p = p*r + 5.0000001201e-1
-	p = p*r*r + r + 1
+	p = float32(p*r) + 1.3981999507e-3
+	p = float32(p*r) + 8.3334519073e-3
+	p = float32(p*r) + 4.1665795894e-2
+	p = float32(p*r) + 1.6666665459e-1
+	p = float32(p*r) + 5.0000001201e-1
+	p = float32(p*r*r) + r + 1
 	return p * math.Float32frombits(uint32(int32(n)+127)<<23)
 }
 
