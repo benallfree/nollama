@@ -219,6 +219,41 @@ Apple M1 Max, 4 threads, other jobs running, so the reading time is on the slow 
 (`GenerateOptions.ThreadDir` already keeps threads on disk in a folder the engine manages; snapshots are for when your
 app wants to hold the state itself.)
 
+### Keep it from starving your app
+
+Give nollama a budget so it shares the machine with the program it lives in:
+
+```go
+res := engine.NewResources(engine.ResourceOptions{
+	Threads:     4,       // CPU threads, shared by every model and every answer
+	Memory:      3 << 30, // bytes for weights, answers in progress and caches
+	LowPriority: true,    // your app's threads win the CPU when it's busy
+})
+defer res.Close()
+
+srv := server.New(server.Config{ModelsDir: "./models", Resources: res})
+m, _ := engine.Load(src.Path, engine.LoadOptions{Resources: res}) // same budget
+```
+
+- **Threads.** Every model and every answer shares the same worker threads, taking turns, instead of each model
+  starting its own. Each call also works on its caller's goroutine, so cap concurrent calls (the server's `Parallel`)
+  to cap the total.
+- **Memory.** The budget counts the model files (they're mapped into memory and read in full for every token), each
+  answer's keys and values, and the prompt cache and conversation threads kept in memory. When something doesn't fit,
+  nollama first drops what it can rebuild (idle buffers, then the least recently used cache entries, across all models
+  on the budget). A load or an answer that still doesn't fit fails with an error matching `engine.ErrMemoryLimit`
+  (the server answers 503) instead of meeting the OOM killer. Go's own heap overhead isn't counted, so leave some
+  headroom, or also set `GOMEMLIMIT`.
+- **Low priority.** The OS runs nollama's threads below your app's: nice 10 on Linux (on desktops with autogroup
+  scheduling, that's below the rest of your process rather than other programs), the utility QoS class on macOS, and
+  `THREAD_PRIORITY_LOWEST` on Windows. Other systems run at normal priority (`engine.LowPrioritySupported`). It's done
+  without cgo: the threads doing the work are dedicated to it and end when it does, so a lowered thread never runs
+  the rest of your app.
+
+For one model, `LoadOptions` takes `Threads`, `MaxMemory` and `LowPriority` directly. `nollama serve` takes
+`--threads`, `--max-memory 3GB` and `--low-priority` (or `NOLLAMA_THREADS`, `NOLLAMA_MAX_MEMORY`,
+`NOLLAMA_LOW_PRIORITY`).
+
 ## Test without a model
 
 The `nollamatest` package lets your tests run in CI with no download. A scripted model answers with a function you

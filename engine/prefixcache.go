@@ -2,6 +2,7 @@ package engine
 
 import (
 	"sync"
+	"time"
 )
 
 // The prompt cache keeps the attention keys and values the model computed for the start of recent prompts, so a prompt
@@ -21,6 +22,7 @@ type prefixEntry struct {
 	tokens []int
 	k, v   [][]float32     // per layer: k [kvd][n] (each channel's positions in a row), v [n*kvd]
 	seq    uint64          // last use, for eviction
+	used   time.Time       // last use, for evicting across models when a shared memory budget is short
 	pins   map[string]bool // Warm's pins: a pinned entry is never evicted
 }
 
@@ -62,7 +64,7 @@ func (m *Model) lookupPrefix(scope string, ids []int) (e *prefixEntry, n int) {
 		return nil, 0
 	}
 	c.seq++
-	e.seq = c.seq
+	e.seq, e.used = c.seq, time.Now()
 	c.hits++
 	return e, n
 }
@@ -100,7 +102,7 @@ func (m *Model) storePrefix(scope string, s *state, ids []int, pin string) int {
 	for _, cand := range c.entries { // already cached (as far as an entry would keep)?
 		if cand.scope == scope && len(cand.tokens) >= n && equalInts(cand.tokens[:n], ids[:n]) {
 			c.seq++
-			cand.seq = c.seq
+			cand.seq, cand.used = c.seq, time.Now()
 			if pin != "" {
 				if cand.pins == nil {
 					cand.pins = map[string]bool{}
@@ -129,7 +131,12 @@ func (m *Model) storePrefix(scope string, s *state, ids []int, pin string) int {
 	if pin != "" {
 		e.pins = map[string]bool{pin: true}
 	}
+	if !m.res.reserveCache(size) { // a cache: when the memory budget is short, don't keep it
+		return 0
+	}
 
+	var freed int64 // evicted here, released to the budget once the lock is let go
+	defer func() { m.res.release(freed) }()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for c.used+size > c.budget { // evict the least recently used entry that isn't pinned
@@ -140,16 +147,36 @@ func (m *Model) storePrefix(scope string, s *state, ids []int, pin string) int {
 			}
 		}
 		if old < 0 {
+			freed += size
 			return 0 // everything left is pinned: no room
 		}
-		c.used -= int64(len(c.entries[old].tokens)) * per
+		b := int64(len(c.entries[old].tokens)) * per
+		c.used -= b
+		freed += b
 		c.entries = append(c.entries[:old], c.entries[old+1:]...)
 	}
 	c.seq++
-	e.seq = c.seq
+	e.seq, e.used = c.seq, time.Now()
 	c.entries = append(c.entries, e)
 	c.used += size
 	return n
+}
+
+// evictPrefix drops e from the prompt cache (unless it's gone or pinned by now) and returns the bytes it held, for
+// the caller to release.
+func (m *Model) evictPrefix(e *prefixEntry) int64 {
+	c := &m.prefix
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, cand := range c.entries {
+		if cand == e && len(e.pins) == 0 {
+			b := int64(len(e.tokens)) * m.tokenBytes()
+			c.used -= b
+			c.entries = append(c.entries[:i], c.entries[i+1:]...)
+			return b
+		}
+	}
+	return 0
 }
 
 // Unpin releases pin (Warm's) from every entry; unpinned entries are evicted like the rest.

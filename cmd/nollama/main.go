@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -51,6 +52,9 @@ Environment:
   NOLLAMA_API_KEY          key serve requires (Authorization: Bearer <key>)
   NOLLAMA_ORIGINS          browser origins serve allows, comma-separated
   NOLLAMA_ALLOWED_HOSTS    host names serve answers to, comma-separated
+  NOLLAMA_THREADS          serve's --threads
+  NOLLAMA_MAX_MEMORY       serve's --max-memory (such as 3GB)
+  NOLLAMA_LOW_PRIORITY     serve's --low-priority (1 or true)
 `
 
 var version = "dev"
@@ -101,7 +105,9 @@ func cmdServe(args []string) error {
 		addr = "127.0.0.1:11434"
 	}
 	fs.StringVar(&addr, "addr", addr, "address to listen on")
-	threads := fs.Int("threads", 0, "CPU threads for the model (0: the engine's default)")
+	threads := fs.Int("threads", envInt("NOLLAMA_THREADS"), "CPU threads, shared by every answer and model (0: the CPUs Go uses, up to 8)")
+	maxMem := fs.String("max-memory", os.Getenv("NOLLAMA_MAX_MEMORY"), "memory budget for the model, answers and caches, such as 3GB or 800MB (empty or 0: no limit)")
+	lowPrio := fs.Bool("low-priority", envBool("NOLLAMA_LOW_PRIORITY"), "run the engine's threads at a lower OS priority, so other programs win the CPU")
 	parallel := fs.Int("parallel", 1, "answers written at once; the rest wait their turn")
 	keepAlive := fs.Duration("keep-alive", 5*time.Minute, "how long an idle model stays loaded (negative: forever)")
 	numCtx := fs.Int("num-ctx", 4096, "context window when a request doesn't set num_ctx")
@@ -125,11 +131,16 @@ func cmdServe(args []string) error {
 	if !strings.Contains(addr, ":") {
 		addr += ":11434"
 	}
+	memLimit, err := parseSize(*maxMem)
+	if err != nil {
+		return fmt.Errorf("--max-memory: %w", err)
+	}
 	cfg := server.Config{ModelsDir: modelsDir(), Threads: *threads, Parallel: *parallel, KeepAlive: *keepAlive,
 		NumCtx: *numCtx, Truncate: *truncate, PromptCache: int64(*cacheMB) << 20,
 		APIKey: strings.TrimSpace(*apiKey), ReadOnly: *readOnly, NoPull: *noPull, NoDelete: *noDelete,
 		Models: list(*allow), AllowPaths: *allowPaths, AllowedOrigins: list(*origins), AllowedHosts: list(*hosts),
-		MaxBodyBytes: int64(*maxBodyMB) << 20, MaxTokens: *maxTokens, MaxNumCtx: *maxNumCtx, PerClient: *perClient}
+		MaxBodyBytes: int64(*maxBodyMB) << 20, MaxTokens: *maxTokens, MaxNumCtx: *maxNumCtx, PerClient: *perClient,
+		MaxMemory: memLimit, LowPriority: *lowPrio}
 	if !*quiet {
 		cfg.Logf = log.Printf
 	}
@@ -148,6 +159,9 @@ func cmdServe(args []string) error {
 	hs := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: time.Minute,
 		IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 64 << 10}
 	log.Printf("nollama %s listening on http://%s (models in %s)", version, ln.Addr(), cfg.ModelsDir)
+	if u := srv.Resources().Usage(); u.MemoryLimit > 0 || *lowPrio {
+		log.Printf("%d threads, memory budget %s, low priority %v", u.Threads, sizeString(u.MemoryLimit), u.LowPriority)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	errc := make(chan error, 1)
@@ -186,6 +200,47 @@ func list(s string) []string {
 		}
 	}
 	return out
+}
+
+func envInt(name string) int {
+	n, _ := strconv.Atoi(os.Getenv(name))
+	return n
+}
+
+func envBool(name string) bool {
+	b, _ := strconv.ParseBool(os.Getenv(name))
+	return b
+}
+
+// parseSize reads a byte size: a number with an optional unit (B, KB, MB, GB, TB, binary multiples: 1GB is 1024 MB).
+// A bare number is megabytes. "" and "0" are 0.
+func parseSize(s string) (int64, error) {
+	s = strings.ToUpper(strings.TrimSpace(s))
+	if s == "" {
+		return 0, nil
+	}
+	mult := float64(1 << 20)
+	for _, u := range []struct {
+		suffix string
+		mult   float64
+	}{{"TB", 1 << 40}, {"GB", 1 << 30}, {"MB", 1 << 20}, {"KB", 1 << 10}, {"T", 1 << 40}, {"G", 1 << 30}, {"M", 1 << 20}, {"K", 1 << 10}, {"B", 1}} {
+		if rest, ok := strings.CutSuffix(s, u.suffix); ok {
+			s, mult = strings.TrimSpace(rest), u.mult
+			break
+		}
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil || f < 0 {
+		return 0, fmt.Errorf("%q isn't a size (try 3GB or 800MB)", s)
+	}
+	return int64(f * mult), nil
+}
+
+func sizeString(n int64) string {
+	if n <= 0 {
+		return "none"
+	}
+	return fmt.Sprintf("%.1f GB", float64(n)/(1<<30))
 }
 
 func pull(spec string) (models.Source, error) {

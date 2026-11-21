@@ -227,6 +227,11 @@ func (m *Model) Generate(ctx context.Context, prompt string, o GenerateOptions, 
 
 // GenerateTokens is Generate on pre-tokenized input.
 func (m *Model) GenerateTokens(ctx context.Context, ids []int, o GenerateOptions, onToken func(piece string) bool) (res Result, err error) {
+	m.res.call(func() { res, err = m.generateTokens(ctx, ids, o, onToken) })
+	return res, err
+}
+
+func (m *Model) generateTokens(ctx context.Context, ids []int, o GenerateOptions, onToken func(piece string) bool) (res Result, err error) {
 	res = Result{PromptTokens: len(ids)}
 	if len(ids) == 0 {
 		return res, errors.New("engine: empty prompt")
@@ -241,7 +246,10 @@ func (m *Model) GenerateTokens(ctx context.Context, ids []int, o GenerateOptions
 	if m.respond != nil {
 		return m.generateScripted(ctx, ids, o, onToken)
 	}
-	s := m.getState(maxCtx, min(len(ids), prefillBatch))
+	s, err := m.getState(maxCtx, min(len(ids), prefillBatch))
+	if err != nil {
+		return res, err
+	}
 	defer m.putState(s)
 	rng := rand.New(rand.NewPCG(o.Seed, o.Seed^0x9e3779b97f4a7c15))
 
@@ -549,7 +557,12 @@ type WarmResult struct {
 // Warm reads prompt (raw text, like Generate's) into the prompt cache ahead of the calls that start with it, and pins
 // the entry under pin so it isn't evicted until Unpin(pin). Calls with the same scope whose prompts start the same way
 // then skip reading that part.
-func (m *Model) Warm(ctx context.Context, prompt, scope, pin string) (WarmResult, error) {
+func (m *Model) Warm(ctx context.Context, prompt, scope, pin string) (res WarmResult, err error) {
+	m.res.call(func() { res, err = m.warm(ctx, prompt, scope, pin) })
+	return res, err
+}
+
+func (m *Model) warm(ctx context.Context, prompt, scope, pin string) (WarmResult, error) {
 	ids := m.Tokenize(prompt)
 	res := WarmResult{Tokens: len(ids)}
 	if m.prefix.budget <= 0 || len(ids) < prefixMin {
@@ -558,7 +571,10 @@ func (m *Model) Warm(ctx context.Context, prompt, scope, pin string) (WarmResult
 	if err := checkContext(len(ids), 1, m.hp.ctx); err != nil {
 		return res, err
 	}
-	s := m.getState(len(ids)+1, min(len(ids), prefillBatch))
+	s, err := m.getState(len(ids)+1, min(len(ids), prefillBatch))
+	if err != nil {
+		return res, err
+	}
 	defer m.putState(s)
 	from := 0
 	if e, n := m.lookupPrefix(scope, append(ids, 0)); e != nil { // all of ids may come from the cache

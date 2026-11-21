@@ -25,8 +25,13 @@ const OllamaVersion = "0.12.0"
 
 // Config sets up a Server.
 type Config struct {
-	ModelsDir   string        // where models are downloaded and listed (default models.DefaultDir())
-	Threads     int           // engine threads (0: the engine's default)
+	ModelsDir   string // where models are downloaded and listed (default models.DefaultDir())
+	Threads     int    // CPU threads shared by every model and answer (0: the engine's default)
+	MaxMemory   int64  // memory budget in bytes for weights, answers' state and caches (0: no limit; see engine.Resources)
+	LowPriority bool   // run the engine's threads at a lower OS priority (see engine.LowPrioritySupported)
+	// Resources, when set, is a thread and memory budget the server shares with models the app loads itself; Threads,
+	// MaxMemory and LowPriority are then ignored, and Close leaves it open.
+	Resources   *engine.Resources
 	PromptCache int64         // bytes for the engine's prompt cache (0: off)
 	Parallel    int           // answers written at once (default 1); the rest wait their turn
 	KeepAlive   time.Duration // how long an idle model stays loaded (default 5m; negative: forever)
@@ -59,11 +64,14 @@ type Config struct {
 // Server holds at most one loaded model and answers both APIs with it, loading the model a request names (and
 // unloading the one before) as needed.
 type Server struct {
-	cfg  Config
-	sem  chan struct{}
-	mu   sync.Mutex
-	cur  *loaded
-	pull sync.Mutex // one download at a time
+	cfg      Config
+	res      *engine.Resources
+	ownRes   bool
+	retiring sync.WaitGroup // models unloading once their answers finish
+	sem      chan struct{}
+	mu       sync.Mutex
+	cur      *loaded
+	pull     sync.Mutex // one download at a time
 
 	clients clientCounts
 }
@@ -108,8 +116,19 @@ func New(cfg Config) *Server {
 	if cfg.Load == nil {
 		cfg.Load = engine.Load
 	}
-	return &Server{cfg: cfg, sem: make(chan struct{}, cfg.Parallel)}
+	s := &Server{cfg: cfg, sem: make(chan struct{}, cfg.Parallel), res: cfg.Resources}
+	if s.res == nil {
+		s.res = engine.NewResources(engine.ResourceOptions{Threads: cfg.Threads, Memory: cfg.MaxMemory, LowPriority: cfg.LowPriority})
+		s.ownRes = true
+		if cfg.LowPriority && !engine.LowPrioritySupported() {
+			cfg.Logf("low priority isn't supported on this OS; the engine runs at normal priority")
+		}
+	}
+	return s
 }
+
+// Resources is the thread and memory budget the server's models use.
+func (s *Server) Resources() *engine.Resources { return s.res }
 
 // Handler serves Ollama's API under /api/, OpenAI's under /v1/, and "nollama is running" at /.
 func (s *Server) Handler() http.Handler {
@@ -164,14 +183,19 @@ func (s *Server) Close() error {
 	cur := s.cur
 	s.cur = nil
 	s.mu.Unlock()
+	var err error
 	if cur != nil {
 		if cur.timer != nil {
 			cur.timer.Stop()
 		}
 		cur.refs.Wait()
-		return cur.m.Close()
+		err = cur.m.Close()
 	}
-	return nil
+	s.retiring.Wait()
+	if s.ownRes {
+		s.res.Close()
+	}
+	return err
 }
 
 func (s *Server) root(w http.ResponseWriter, r *http.Request) {
@@ -211,7 +235,7 @@ func (s *Server) acquire(name string) (*loaded, time.Duration, error) {
 		s.cur = nil
 		s.retire(old)
 	}
-	m, err := s.cfg.Load(src.Path, engine.LoadOptions{Threads: s.cfg.Threads, PromptCache: s.cfg.PromptCache})
+	m, err := s.cfg.Load(src.Path, engine.LoadOptions{Resources: s.res, PromptCache: s.cfg.PromptCache})
 	if err != nil {
 		return nil, 0, fmt.Errorf("loading %s: %w", src.Name, err)
 	}
@@ -268,12 +292,20 @@ func (s *Server) release(l *loaded, keepAlive *time.Duration) {
 	}
 }
 
-// retire closes l once its answers finish. Called with s.mu held, after l stopped being s.cur.
+// retire closes l once its answers finish: right away when it's idle, so its memory is free for the next model.
+// Called with s.mu held, after l stopped being s.cur.
 func (s *Server) retire(l *loaded) {
 	if l.timer != nil {
 		l.timer.Stop()
 	}
+	if l.active == 0 {
+		_ = l.m.Close()
+		s.cfg.Logf("unloaded %s", l.name)
+		return
+	}
+	s.retiring.Add(1)
 	go func() {
+		defer s.retiring.Done()
 		l.refs.Wait()
 		_ = l.m.Close()
 		s.cfg.Logf("unloaded %s", l.name)
@@ -435,6 +467,8 @@ func statusOf(err error) int {
 		return http.StatusBadRequest
 	case errors.Is(err, context.Canceled):
 		return 499
+	case errors.Is(err, engine.ErrMemoryLimit):
+		return http.StatusServiceUnavailable
 	}
 	return http.StatusInternalServerError
 }

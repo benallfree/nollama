@@ -22,17 +22,18 @@ type pool struct {
 	asleep  int
 	closed  atomic.Bool
 	cursors []cursor
+	start   func() // run first by each worker goroutine (nil: nothing)
 }
 
 const spinFor = 300 * time.Microsecond
 
-func newPool(n int) *pool {
+func newPool(n int, start func()) *pool {
 	if n < 1 {
 		n = 1
 	}
 	// Spinning workers need their own Ps.
 	n = min(n, runtime.GOMAXPROCS(0))
-	p := &pool{n: n, cursors: make([]cursor, n)}
+	p := &pool{n: n, cursors: make([]cursor, n), start: start}
 	p.cond = sync.NewCond(&p.sleepMu)
 	for w := 1; w < n; w++ {
 		go p.worker(w)
@@ -41,6 +42,9 @@ func newPool(n int) *pool {
 }
 
 func (p *pool) worker(w int) {
+	if p.start != nil {
+		p.start()
+	}
 	// Generation 0 is "no dispatch yet". Reading gen here instead would race
 	// with a dispatch issued before this goroutine first ran, and hang it.
 	seen := uint64(0)

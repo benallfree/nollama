@@ -102,6 +102,9 @@ func (m *Model) lookupThread(scope, id, dir string, ids []int) (*prefixEntry, in
 func (m *Model) keepThread(scope, id string, e *prefixEntry) *threadEntry {
 	t := &m.threads
 	size := int64(len(e.tokens)) * m.tokenBytes()
+	kept := size <= t.budget && m.res.reserveCache(size) // else disk only (or not kept, when the call names no folder)
+	var freed int64                                      // released to the budget once the lock is let go
+	defer func() { m.res.release(freed) }()
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.seq++
@@ -109,10 +112,11 @@ func (m *Model) keepThread(scope, id string, e *prefixEntry) *threadEntry {
 	key := threadKey(scope, id)
 	if old := t.mem[key]; old != nil {
 		t.used -= old.bytes
+		freed += old.bytes
 		delete(t.mem, key)
 	}
-	if size > t.budget {
-		return te // too big for memory: disk only
+	if !kept {
+		return te
 	}
 	for t.used+size > t.budget {
 		var oldKey string
@@ -123,6 +127,7 @@ func (m *Model) keepThread(scope, id string, e *prefixEntry) *threadEntry {
 			}
 		}
 		t.used -= oldest.bytes
+		freed += oldest.bytes
 		delete(t.mem, oldKey)
 	}
 	if t.mem == nil {
@@ -131,6 +136,20 @@ func (m *Model) keepThread(scope, id string, e *prefixEntry) *threadEntry {
 	t.mem[key] = te
 	t.used += size
 	return te
+}
+
+// evictThread drops te from memory (unless it was replaced or dropped by now) and returns the bytes it held, for the
+// caller to release.
+func (m *Model) evictThread(key string, te *threadEntry) int64 {
+	t := &m.threads
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.mem[key] != te {
+		return 0
+	}
+	delete(t.mem, key)
+	t.used -= te.bytes
+	return te.bytes
 }
 
 // storeThread keeps the state of tokens (all computed in s) as the thread's, in memory and, with a folder, on disk.
@@ -360,12 +379,15 @@ func (m *Model) Threads(scope, dir string) []ThreadInfo {
 // ForgetThread drops a thread's state from memory and, when dir is given, from disk.
 func (m *Model) ForgetThread(scope, id, dir string) {
 	t := &m.threads
+	var freed int64
 	t.mu.Lock()
 	if te := t.mem[threadKey(scope, id)]; te != nil {
 		t.used -= te.bytes
+		freed = te.bytes
 		delete(t.mem, threadKey(scope, id))
 	}
 	t.mu.Unlock()
+	m.res.release(freed)
 	if dir != "" {
 		t.diskMu.Lock()
 		_ = os.Remove(m.threadFile(dir, scope, id))

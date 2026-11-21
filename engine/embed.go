@@ -47,7 +47,12 @@ func (m *Model) Embed(ctx context.Context, texts []string, o EmbedOptions) ([]Em
 }
 
 // EmbedTokens is Embed on pre-tokenized texts (without the appended end-of-text token, which it adds).
-func (m *Model) EmbedTokens(ctx context.Context, texts [][]int, o EmbedOptions) ([]Embedding, error) {
+func (m *Model) EmbedTokens(ctx context.Context, texts [][]int, o EmbedOptions) (out []Embedding, err error) {
+	m.res.call(func() { out, err = m.embedTokens(ctx, texts, o) })
+	return out, err
+}
+
+func (m *Model) embedTokens(ctx context.Context, texts [][]int, o EmbedOptions) ([]Embedding, error) {
 	if o.Dimensions < 0 || o.Dimensions > m.hp.dim {
 		return nil, fmt.Errorf("engine: dimensions %d out of range (1 to %d)", o.Dimensions, m.hp.dim)
 	}
@@ -64,7 +69,10 @@ func (m *Model) EmbedTokens(ctx context.Context, texts [][]int, o EmbedOptions) 
 	if len(seqs) == 0 {
 		return out, nil
 	}
-	s := m.getState(longest, min(longest, prefillBatch))
+	s, err := m.getState(longest, min(longest, prefillBatch))
+	if err != nil {
+		return nil, err
+	}
 	defer func() {
 		s.hidden = nil
 		m.putState(s)

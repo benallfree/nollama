@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/benallfree/nollama/engine"
 	"github.com/benallfree/nollama/internal/tinymodel"
 )
 
@@ -313,5 +315,43 @@ func TestToolStream(t *testing.T) {
 	got2, _ := plain.feed("<b> ")
 	if got+got2+plain.rest() != "1 < 2 and <b> " {
 		t.Errorf("plain text: %q %q", got, got2)
+	}
+}
+
+// A model that doesn't fit the memory budget answers 503 with the reason, in both APIs; a shared budget is left open
+// by Close. GGUF=/path/to/qwen3-0.6b.gguf go test ./server
+func TestMemoryBudget(t *testing.T) {
+	p := os.Getenv("GGUF")
+	if p == "" {
+		t.Skip("GGUF not set")
+	}
+	dir := t.TempDir()
+	if err := os.Symlink(p, filepath.Join(dir, "test.gguf")); err != nil {
+		t.Fatal(err)
+	}
+	model := filepath.Join(dir, "test.gguf")
+	shared := engine.NewResources(engine.ResourceOptions{Threads: 2, Memory: 1 << 20})
+	defer shared.Close()
+	s := New(Config{ModelsDir: dir, Resources: shared})
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	code, out := call(t, ts, "POST", "/api/chat", `{"model":"`+model+`","stream":false,"messages":[{"role":"user","content":"Hi"}]}`)
+	if code != http.StatusServiceUnavailable || !strings.Contains(fmt.Sprint(out["error"]), "memory limit") {
+		t.Errorf("ollama: %d %v", code, out)
+	}
+	code, out = call(t, ts, "POST", "/v1/chat/completions", `{"model":"`+model+`","messages":[{"role":"user","content":"Hi"}]}`)
+	if code != http.StatusServiceUnavailable || !strings.Contains(fmt.Sprint(out["error"]), "memory limit") {
+		t.Errorf("openai: %d %v", code, out)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if s.Resources() != shared || shared.Usage().MemoryUsed != 0 {
+		t.Errorf("shared resources: %+v", shared.Usage())
+	}
+	// still open: a model loads with it
+	if _, err := engine.Load(model, engine.LoadOptions{Resources: shared}); !errors.Is(err, engine.ErrMemoryLimit) {
+		t.Errorf("after Close: want the budget still in force, got %v", err)
 	}
 }

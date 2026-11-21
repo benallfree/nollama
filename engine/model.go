@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 
@@ -17,6 +16,14 @@ import (
 // LoadOptions configures Load.
 type LoadOptions struct {
 	Threads int // worker threads for matmuls; 0 = number of performance cores (GOMAXPROCS, capped at 8)
+	// MaxMemory is the memory budget in bytes for this model's weights, generation states and caches (see
+	// Resources); 0: no limit.
+	MaxMemory int64
+	// LowPriority lowers the OS scheduling priority of the threads doing the work (see LowPrioritySupported).
+	LowPriority bool
+	// Resources, when set, is a thread and memory budget this model shares with others (see Resources); Threads,
+	// MaxMemory and LowPriority must then be left zero. Without it, the model gets its own, closed with the model.
+	Resources *Resources
 	// PromptCache is the memory, in bytes, for keeping the start of recent prompts so a prompt that begins the same
 	// way skips reading that part again (see prefixcache.go); 0 turns it off.
 	PromptCache int64
@@ -74,16 +81,19 @@ type hparams struct {
 // Model is a loaded GGUF model. Weights are mmapped and shared read-only, so
 // several Generate calls may run concurrently on one Model.
 type Model struct {
-	g      *ggufFile
-	hp     hparams
-	embd   *weight
-	out    *weight
-	norm   []float32
-	layers []layer
-	tok    *tokenizer
-	pool   *pool
-	info   Info
-	invFrq []float64
+	g           *ggufFile
+	hp          hparams
+	embd        *weight
+	out         *weight
+	norm        []float32
+	layers      []layer
+	tok         *tokenizer
+	pool        *pool
+	res         *Resources
+	ownRes      bool  // res was made for this model, and closes with it
+	weightBytes int64 // reserved in res for the weights
+	info        Info
+	invFrq      []float64
 
 	stateMu sync.Mutex
 	states  []*state // idle generation states (KV caches), reused to avoid GC churn
@@ -98,29 +108,49 @@ type Model struct {
 	eosID  int  // tokenizer.ggml.eos_token_id, or -1
 }
 
-// getState returns an idle state with room for maxCtx positions and batches of maxN.
-func (m *Model) getState(maxCtx, maxN int) *state {
+// getState returns an idle state with room for maxCtx positions and batches of maxN, reserving a new one's memory in
+// the budget.
+func (m *Model) getState(maxCtx, maxN int) (*state, error) {
 	m.stateMu.Lock()
 	for i, s := range m.states {
 		if s.maxCtx >= maxCtx && s.maxN >= maxN {
 			m.states = append(m.states[:i], m.states[i+1:]...)
 			m.stateMu.Unlock()
-			return s
+			return s, nil
 		}
 	}
 	m.stateMu.Unlock()
 	// round up so similar requests can share states
 	maxCtx = (maxCtx + 255) &^ 255
 	maxCtx = min(maxCtx, m.hp.ctx)
-	return m.newState(maxCtx, maxN)
+	if err := m.res.reserve(m.stateBytes(maxCtx, maxN), fmt.Sprintf("a generation's state (%d tokens of context)", maxCtx)); err != nil {
+		return nil, err
+	}
+	return m.newState(maxCtx, maxN), nil
 }
 
+// putState keeps s for reuse, or drops it (and its memory reservation) when enough are kept.
 func (m *Model) putState(s *state) {
 	m.stateMu.Lock()
-	defer m.stateMu.Unlock()
 	if len(m.states) < 4 {
 		m.states = append(m.states, s)
+		m.stateMu.Unlock()
+		return
 	}
+	m.stateMu.Unlock()
+	m.res.release(s.bytes)
+}
+
+// dropIdleStates forgets the states kept for reuse and returns the bytes they held (for the caller to release).
+func (m *Model) dropIdleStates() int64 {
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+	var n int64
+	for _, s := range m.states {
+		n += s.bytes
+	}
+	m.states = nil
+	return n
 }
 
 var fileTypeNames = map[int]string{
@@ -204,6 +234,30 @@ func newModel(g *ggufFile, opts LoadOptions) (*Model, error) {
 		return nil, fmt.Errorf("engine: unsupported architecture %q (want qwen3)", arch)
 	}
 	m := &Model{g: g}
+	if opts.Resources != nil {
+		if opts.Threads != 0 || opts.MaxMemory != 0 || opts.LowPriority {
+			return nil, errors.New("engine: LoadOptions.Resources is set: leave Threads, MaxMemory and LowPriority zero")
+		}
+		m.res = opts.Resources
+	} else {
+		m.res = NewResources(ResourceOptions{Threads: opts.Threads, Memory: opts.MaxMemory, LowPriority: opts.LowPriority})
+		m.ownRes = true
+	}
+	if err := m.res.attach(m); err != nil {
+		return nil, err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			m.detachResources()
+		}
+	}()
+	m.weightBytes = g.size
+	if err := m.res.reserve(m.weightBytes, "loading the model"); err != nil {
+		m.weightBytes = 0
+		return nil, err
+	}
+	m.pool = m.res.pool
 	m.prefix.budget = opts.PromptCache
 	m.threads.budget = opts.ThreadMemory
 	m.id = opts.ID
@@ -351,11 +405,7 @@ func newModel(g *ggufFile, opts LoadOptions) (*Model, error) {
 		m.invFrq[i] = math.Pow(hp.ropeBase, -2*float64(i)/float64(hp.headDim))
 	}
 
-	threads := opts.Threads
-	if threads <= 0 {
-		threads = min(runtime.GOMAXPROCS(0), 8)
-	}
-	m.pool = newPool(threads)
+	threads := m.pool.n
 
 	var params int64
 	types := map[string]int{}
@@ -394,17 +444,37 @@ func newModel(g *ggufFile, opts LoadOptions) (*Model, error) {
 		Quant: q, TensorTypes: types, FileSize: g.size, Layers: hp.layers, Embedding: hp.dim,
 		Threads: threads, Kernels: kernelName, Pooling: pooling,
 	}
+	ok = true
 	return m, nil
 }
 
 // Close releases the worker pool and unmaps the file. No Generate call may be running.
 func (m *Model) Close() error {
 	m.FlushThreads() // a thread file being written reads the state it copied, not the model, but finish it
-	if m.pool != nil {
-		m.pool.close()
-		m.pool = nil
+	if m.res != nil {
+		m.detachResources()
 	}
 	return m.g.close()
+}
+
+// detachResources gives back everything the model holds in its budget and stops using it.
+func (m *Model) detachResources() {
+	held := m.weightBytes + m.dropIdleStates()
+	m.weightBytes = 0
+	m.prefix.mu.Lock()
+	held += m.prefix.used
+	m.prefix.used, m.prefix.entries = 0, nil
+	m.prefix.mu.Unlock()
+	m.threads.mu.Lock()
+	held += m.threads.used
+	m.threads.used, m.threads.mem = 0, nil
+	m.threads.mu.Unlock()
+	m.res.release(held)
+	m.res.detach(m)
+	if m.ownRes {
+		m.res.Close()
+	}
+	m.res, m.pool = nil, nil
 }
 
 // Info returns model metadata.

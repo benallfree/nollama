@@ -220,6 +220,37 @@ type state struct {
 	cos, sin     []float32   // maxN * headDim/2
 	lastAct      *acts
 	hidden       []float32 // when set (Embed), forward stores the last token's normed hidden state here and skips the LM head
+	bytes        int64     // what it takes in memory (stateBytes), reserved in the model's Resources
+}
+
+// actsBytes is what newActs(maxN, k) allocates.
+func actsBytes(maxN, k int) int64 {
+	n := int64(maxN*k) * 4
+	if k%qk == 0 {
+		n += int64(maxN * k / qk * q8kBytes)
+	}
+	if k%32 == 0 {
+		n += int64(maxN * k / 32 * q80aBytes)
+		if maxN >= 4 {
+			n += int64(maxN / 4 * k / 32 * q80x4Bytes)
+		}
+	}
+	return n
+}
+
+// stateBytes is what newState(maxCtx, maxN) allocates: keys and values for maxCtx positions, and scratch buffers for
+// batches of maxN tokens.
+func (m *Model) stateBytes(maxCtx, maxN int) int64 {
+	hp := m.hp
+	qd, kvd := hp.heads*hp.headDim, hp.kvHeads*hp.headDim
+	ctxP := (maxCtx + 15) &^ 15
+	f := int64(hp.layers) * 2 * int64(ctxP*kvd)               // kc, vc
+	f += int64(maxN) * int64(hp.dim+qd+2*kvd+2*hp.ffn+hp.dim) // x, q, k, v, gate, up, tmp
+	f += int64(hp.vocab)                                      // logits
+	f += int64(m.pool.n) * int64(4*ctxP+8*hp.headDim)         // per worker: scores, qbuf, obuf
+	f += int64(maxN * hp.headDim)                             // cos, sin
+	b := f*4 + actsBytes(maxN, hp.dim) + actsBytes(maxN, qd) + actsBytes(maxN, hp.ffn) + actsBytes(1, hp.dim)
+	return b
 }
 
 func (m *Model) newState(maxCtx, maxN int) *state {
@@ -254,6 +285,7 @@ func (m *Model) newState(maxCtx, maxN int) *state {
 	s.cos = make([]float32, maxN*hp.headDim/2)
 	s.sin = make([]float32, maxN*hp.headDim/2)
 	s.lastAct = newActs(1, hp.dim)
+	s.bytes = m.stateBytes(maxCtx, maxN)
 	return s
 }
 

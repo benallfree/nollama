@@ -209,12 +209,18 @@ func (m *Model) findThread(scope, id, dir string) *prefixEntry {
 func (m *Model) insertPrefix(e *prefixEntry, pin string) int {
 	c := &m.prefix
 	per := m.tokenBytes()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	n := min(len(e.tokens), int(c.budget/per))
+	n := min(len(e.tokens), int(c.budget/per)) // the budget is set at load and never changes
 	if n < prefixMin {
 		return 0
 	}
+	size := int64(n) * per
+	if !m.res.reserveCache(size) { // the shared memory budget is short: don't keep it
+		return 0
+	}
+	var freed int64 // replaced or evicted here, released to the budget once the lock is let go
+	defer func() { m.res.release(freed) }()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if n < len(e.tokens) { // keep the start: that's where prompts repeat
 		kvd := m.hp.kvHeads * m.hp.headDim
 		en := len(e.tokens)
@@ -240,11 +246,11 @@ func (m *Model) insertPrefix(e *prefixEntry, pin string) int {
 				e.pins[p] = true
 			}
 			c.used -= int64(len(cand.tokens)) * per
+			freed += int64(len(cand.tokens)) * per
 			c.entries = append(c.entries[:i], c.entries[i+1:]...)
 			break
 		}
 	}
-	size := int64(n) * per
 	for c.used+size > c.budget {
 		old := -1
 		for i, cand := range c.entries {
@@ -253,13 +259,15 @@ func (m *Model) insertPrefix(e *prefixEntry, pin string) int {
 			}
 		}
 		if old < 0 {
+			freed += size
 			return 0
 		}
 		c.used -= int64(len(c.entries[old].tokens)) * per
+		freed += int64(len(c.entries[old].tokens)) * per
 		c.entries = append(c.entries[:old], c.entries[old+1:]...)
 	}
 	c.seq++
-	e.seq = c.seq
+	e.seq, e.used = c.seq, time.Now()
 	c.entries = append(c.entries, e)
 	c.used += size
 	return n
