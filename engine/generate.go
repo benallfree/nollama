@@ -45,6 +45,20 @@ type GenerateOptions struct {
 	Logprobs    bool
 	TopLogprobs int
 	OnLogprob   func(TokenLogprob)
+	// Draft, when set, is a smaller model with the same tokenizer (CheckDraft) that guesses DraftTokens tokens at a
+	// time for this model to check in one pass (speculative.go). The output follows this model's distribution either
+	// way. Experimental: it only pays off when checking a short batch costs about as much as writing one token, which
+	// on the CPU engine today it doesn't, so it makes answers slower.
+	Draft       *Model
+	DraftTokens int // tokens guessed at a time (0: DefaultDraftTokens)
+	// DraftFast, with temperature 0, checks guesses with the batch kernels, which round a little differently from the
+	// one-token ones: faster, but the answer may then part from the plain one at a near tie. Off, a greedy answer is bit
+	// for bit the plain one. With sampling the check always uses the batch kernels.
+	DraftFast bool
+	// DraftMinP stops the draft's guessing after a token it gives less than this probability (its own softmax), so it
+	// guesses long runs where the text is predictable (code, JSON) and short ones where it isn't. 0: DefaultDraftMinP;
+	// negative: always guess DraftTokens.
+	DraftMinP float64
 }
 
 // Fit is how a Constraint judges the output so far.
@@ -71,6 +85,9 @@ type Result struct {
 	Decode       time.Duration  // remaining tokens
 	StopReason   string         // "eos", "stop", "length" (MaxTokens reached), "callback", "canceled"
 	Logprobs     []TokenLogprob // one per token of Text, when GenerateOptions.Logprobs
+	Drafted      int            // with a draft model: tokens it guessed
+	Accepted     int            // of Drafted, how many this model kept
+	Checks       int            // with a draft model: passes this model made to check guesses
 }
 
 // Message is one chat turn.
@@ -240,6 +257,9 @@ func (m *Model) GenerateTokens(ctx context.Context, ids []int, o GenerateOptions
 }
 
 func (m *Model) generateTokens(ctx context.Context, ids []int, o GenerateOptions, onToken func(piece string) bool) (res Result, err error) {
+	if o.Draft != nil {
+		return m.generateSpeculative(ctx, ids, o, onToken)
+	}
 	res = Result{PromptTokens: len(ids)}
 	if len(ids) == 0 {
 		return res, errors.New("engine: empty prompt")

@@ -77,14 +77,16 @@ type openaiCommon struct {
 			Schema json.RawMessage `json:"schema"`
 		} `json:"json_schema"`
 	} `json:"response_format"`
-	N          int               `json:"n"`
-	Tools      []json.RawMessage `json:"tools"`
-	ToolChoice json.RawMessage   `json:"tool_choice"`
-	Truncate   *bool             `json:"truncate"` // nollama's: drop the oldest messages if the chat doesn't fit
+	N           int               `json:"n"`
+	Tools       []json.RawMessage `json:"tools"`
+	ToolChoice  json.RawMessage   `json:"tool_choice"`
+	Truncate    *bool             `json:"truncate"`     // nollama's: drop the oldest messages if the chat doesn't fit
+	DraftTokens *int              `json:"draft_tokens"` // nollama's: tokens the draft model guesses at a time (0: off)
 }
 
 func (c openaiCommon) sampling() (sampling, error) {
-	sp := sampling{Temperature: c.Temperature, TopP: c.TopP, Seed: c.Seed, Stop: c.Stop, MaxTokens: c.MaxTokens, Truncate: c.Truncate}
+	sp := sampling{Temperature: c.Temperature, TopP: c.TopP, Seed: c.Seed, Stop: c.Stop, MaxTokens: c.MaxTokens, Truncate: c.Truncate,
+		DraftTokens: c.DraftTokens}
 	if c.MaxCompletionTokens > 0 {
 		sp.MaxTokens = c.MaxCompletionTokens
 	}

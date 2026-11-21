@@ -472,12 +472,38 @@ Today, if your users have a GPU and are happy to install Ollama, Ollama is faste
 
 Run them yourself with `go run ./engine/cmd/bench bench` (it needs Ollama running, for the comparison).
 
+## Draft models (experimental, not faster yet)
+
+A small model can guess the next few tokens and let the larger one check them all in one pass (speculative decoding).
+On a GPU that check costs about as much as writing one token, so every guess the larger model agrees with is a token for
+free. The answer doesn't change: with temperature 0 it is exactly the larger model's own answer, and with sampling it
+follows the same distribution.
+
+```bash
+nollama serve --draft qwen3-0.6b
+nollama run --draft qwen3-0.6b qwen3-4b "Write a Go function that reverses a string."
+```
+
+**On nollama's CPU engine today it makes answers slower, so leave it off.** Checking a batch of five tokens costs the
+1.7B model three to five times as much as writing one, so even when the larger model keeps most guesses it comes out
+behind: 0.2 to 0.9 times the speed without a draft in our runs. It is here, correct and tested, so it speeds answers up
+as soon as nollama reads short batches faster.
+
+The guesses themselves are good. With `qwen3-0.6b` guessing up to 4 tokens for `qwen3-1.7b` (it stops early after a
+token it isn't sure of), each check yields, at temperature 0: about 4 tokens for code, 2.7 to 2.8 for JSON or a list,
+and 1.8 for free-form prose.
+
+The draft must share the larger model's tokenizer (all the Qwen3 sizes do), and is skipped for the draft model itself.
+A request can set `draft_tokens` in Ollama's `options` (or at the top level of an OpenAI request): how many tokens the
+draft guesses at a time, `0` to turn it off. In Go, load both models and pass `engine.GenerateOptions{Draft: draft}`;
+`engine.CheckDraft` says whether a pair fits.
+
 ## What's supported
 
 Ollama's API: `/api/chat`, `/api/generate` (with `raw`, `system`, `context`), `/api/tags`, `/api/ps`, `/api/show`,
 `/api/pull`, `/api/delete`, `/api/version`, `/api/embed` (`input`, `truncate`, `dimensions`) and the older
 `/api/embeddings`, streaming and not, `format` (`"json"` or a JSON schema), `options`
-(`temperature`, `top_p`, `top_k`, `num_predict`, `num_ctx`, `seed`, `stop`), `keep_alive`.
+(`temperature`, `top_p`, `top_k`, `num_predict`, `num_ctx`, `seed`, `stop`, and nollama's `draft_tokens`), `keep_alive`.
 
 OpenAI's API: `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/embeddings` (text or token ids,
 `dimensions`, `encoding_format` `float` or `base64`), streaming (with `stream_options.include_usage`)

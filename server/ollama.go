@@ -23,10 +23,11 @@ type ollamaOptions struct {
 	NumCtx      int      `json:"num_ctx"`
 	Seed        *int64   `json:"seed"`
 	Stop        []string `json:"stop"`
+	DraftTokens *int     `json:"draft_tokens"` // nollama: tokens the draft model guesses at a time (0: off)
 }
 
 func (o ollamaOptions) sampling(format json.RawMessage) (sampling, error) {
-	sp := sampling{Temperature: o.Temperature, TopP: o.TopP, TopK: o.TopK, Seed: o.Seed, NumCtx: o.NumCtx, Stop: o.Stop}
+	sp := sampling{Temperature: o.Temperature, TopP: o.TopP, TopK: o.TopK, Seed: o.Seed, NumCtx: o.NumCtx, Stop: o.Stop, DraftTokens: o.DraftTokens}
 	if o.NumPredict != nil && *o.NumPredict > 0 {
 		sp.MaxTokens = *o.NumPredict
 	}

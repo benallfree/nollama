@@ -56,6 +56,7 @@ Environment:
   NOLLAMA_MAX_MEMORY       serve's --max-memory (such as 3GB)
   NOLLAMA_LOW_PRIORITY     serve's --low-priority (1 or true)
   NOLLAMA_DETERMINISTIC    serve's --deterministic (1 or true)
+  NOLLAMA_DRAFT            serve's --draft: a model that guesses tokens (experimental, slower on the CPU today)
 `
 
 var version = "dev"
@@ -130,6 +131,8 @@ func cmdServe(args []string) error {
 	maxNumCtx := fs.Int("max-num-ctx", 32768, "largest context window a request may ask for")
 	perClient := fs.Int("per-client", 8, "requests one client IP may have open at once (negative: no limit)")
 	public := fs.Bool("insecure-public", false, "listen on a non-loopback address without an API key (anyone who can reach it can use it)")
+	draft := fs.String("draft", os.Getenv("NOLLAMA_DRAFT"), "a small model with the same tokenizer that guesses tokens for the larger one to check, e.g. qwen3-0.6b (speculative decoding, experimental: slower on the CPU today; \"\": off)")
+	draftTokens := fs.Int("draft-tokens", 0, "tokens the draft guesses at a time (0: the engine's default)")
 	fs.Parse(args)
 	if !strings.Contains(addr, ":") {
 		addr += ":11434"
@@ -143,9 +146,15 @@ func cmdServe(args []string) error {
 		APIKey: strings.TrimSpace(*apiKey), ReadOnly: *readOnly, NoPull: *noPull, NoDelete: *noDelete,
 		Models: list(*allow), AllowPaths: *allowPaths, AllowedOrigins: list(*origins), AllowedHosts: list(*hosts),
 		MaxBodyBytes: int64(*maxBodyMB) << 20, MaxTokens: *maxTokens, MaxNumCtx: *maxNumCtx, PerClient: *perClient,
-		MaxMemory: memLimit, LowPriority: *lowPrio, KVCacheType: *kvType, Deterministic: *det}
+		MaxMemory: memLimit, LowPriority: *lowPrio, KVCacheType: *kvType, Deterministic: *det,
+		Draft: *draft, DraftTokens: *draftTokens}
 	if err := checkKVCacheType(*kvType); err != nil {
 		return err
+	}
+	if *draft != "" {
+		if _, err := pull(*draft); err != nil {
+			return fmt.Errorf("draft model: %w", err)
+		}
 	}
 	if !*quiet {
 		cfg.Logf = log.Printf
@@ -343,6 +352,8 @@ func cmdRun(args []string) error {
 	verbose := fs.Bool("verbose", false, "print token counts and speed after each answer")
 	kvType := kvCacheFlag(fs)
 	det := fs.Bool("deterministic", false, "the same logits, bit for bit, on any CPU (portable kernels, slower)")
+	draftName := fs.String("draft", "", "a small model with the same tokenizer that guesses tokens to check, e.g. qwen3-0.6b")
+	draftTokens := fs.Int("draft-tokens", 0, "tokens the draft guesses at a time (0: the engine's default)")
 	fs.Parse(args)
 	if fs.NArg() < 1 {
 		return errors.New("usage: nollama run [flags] <model> [prompt]")
@@ -356,6 +367,20 @@ func cmdRun(args []string) error {
 		return err
 	}
 	defer m.Close()
+	var draft *engine.Model
+	if *draftName != "" {
+		dsrc, err := pull(*draftName)
+		if err != nil {
+			return err
+		}
+		if draft, err = engine.Load(dsrc.Path, engine.LoadOptions{Threads: *threads, PromptCache: 64 << 20, Deterministic: *det}); err != nil {
+			return err
+		}
+		defer draft.Close()
+		if err := engine.CheckDraft(m, draft); err != nil {
+			return err
+		}
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	var history []engine.Message
@@ -365,7 +390,7 @@ func cmdRun(args []string) error {
 	answer := func(prompt string) error {
 		history = append(history, engine.Message{Role: "user", Content: prompt})
 		res, err := m.Generate(ctx, m.ChatPrompt(history), engine.GenerateOptions{MaxTokens: *maxTokens,
-			Temperature: *temp, TopP: 0.9, TopK: 40, Seed: uint64(time.Now().UnixNano())},
+			Temperature: *temp, TopP: 0.9, TopK: 40, Seed: uint64(time.Now().UnixNano()), Draft: draft, DraftTokens: *draftTokens},
 			func(piece string) bool { fmt.Print(piece); return true })
 		fmt.Println()
 		if err != nil {
@@ -376,6 +401,9 @@ func cmdRun(args []string) error {
 			fmt.Fprintf(os.Stderr, "[prompt %d tokens (%d cached) in %s, answer %d tokens at %.1f tokens/s]\n",
 				res.PromptTokens, res.CachedTokens, res.Prefill.Round(time.Millisecond), res.OutputTokens,
 				float64(res.OutputTokens)/max(res.Decode.Seconds(), 1e-9))
+			if res.Drafted > 0 {
+				fmt.Fprintf(os.Stderr, "[draft: %d of %d guessed tokens kept]\n", res.Accepted, res.Drafted)
+			}
 		}
 		return nil
 	}

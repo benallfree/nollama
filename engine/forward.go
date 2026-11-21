@@ -11,6 +11,9 @@ type acts struct {
 	q8k, q80       []byte
 	q80x4          []byte // groups of 4 rows interleaved, for the 4-column Q8_0 kernel
 	need8k, need80 bool
+	// rowByRow skips the 4-row kernels, which round differently from the 1-row ones: a batch then gives each token
+	// exactly the logits a one-token forward would (speculative decoding's check, speculative.go).
+	rowByRow bool
 }
 
 func newActs(maxN, k int) *acts {
@@ -123,7 +126,7 @@ var floatRef = false
 
 // rowDot4 returns a function computing 4 dots (activation rows t..t+3), or nil.
 func rowDot4(w *weight, a *acts, det bool) func(row []byte, t int, out *[4]float32) {
-	if floatRef || det { // deterministic: each row exactly as the 1-row kernel computes it
+	if floatRef || det || a.rowByRow { // deterministic, or a draft's check: each row exactly as the 1-row kernel computes it
 		return nil
 	}
 	k := a.k

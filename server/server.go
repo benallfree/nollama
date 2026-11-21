@@ -41,7 +41,13 @@ type Config struct {
 	KeepAlive   time.Duration // how long an idle model stays loaded (default 5m; negative: forever)
 	NumCtx      int           // context window when a request doesn't set num_ctx (default 4096, capped at the model's)
 	Truncate    bool          // chats that don't fit drop their oldest messages unless the request sends "truncate": false (default: a 400)
-	Client      *http.Client  // for pulls (default http.DefaultClient)
+	// Draft names a small model with the same tokenizer (qwen3-0.6b for the larger Qwen3s) loaded beside each model to
+	// guess tokens for it to check (speculative decoding), with the same distribution. Experimental: slower on the CPU
+	// engine today. "": off. It is skipped for the draft model itself, when it isn't downloaded, or when its tokenizer
+	// doesn't match.
+	Draft       string
+	DraftTokens int          // tokens the draft guesses at a time (0: the engine's default); a request's draft_tokens overrides
+	Client      *http.Client // for pulls (default http.DefaultClient)
 	Logf        func(format string, args ...any)
 
 	// Who may call the server and what they may do. See the README's Security section.
@@ -84,6 +90,7 @@ type loaded struct {
 	name    string
 	src     models.Source
 	m       *engine.Model
+	draft   *engine.Model  // nil: no draft for this model
 	active  int            // requests using it (guarded by Server.mu)
 	refs    sync.WaitGroup // the same, for closing once they finish
 	timer   *time.Timer
@@ -194,6 +201,7 @@ func (s *Server) Close() error {
 			cur.timer.Stop()
 		}
 		cur.refs.Wait()
+		closeDraft(cur)
 		err = cur.m.Close()
 	}
 	s.retiring.Wait()
@@ -245,11 +253,50 @@ func (s *Server) acquire(name string) (*loaded, time.Duration, error) {
 	if err != nil {
 		return nil, 0, fmt.Errorf("loading %s: %w", src.Name, err)
 	}
-	s.cur = &loaded{name: src.Name, src: src, m: m}
+	s.cur = &loaded{name: src.Name, src: src, m: m, draft: s.loadDraft(src, m)}
 	s.hold(s.cur)
 	load := time.Since(start)
 	s.cfg.Logf("loaded %s in %s (%s, KV cache %s)", src.Name, load.Round(time.Millisecond), m.Info().Kernels, m.Info().KVCacheType)
 	return s.cur, load, nil
+}
+
+// loadDraft loads the configured draft model for target, or returns nil (and logs why) when there is none to use.
+func (s *Server) loadDraft(target models.Source, m *engine.Model) *engine.Model {
+	if s.cfg.Draft == "" {
+		return nil
+	}
+	src, err := models.Resolve(s.cfg.Draft, s.cfg.ModelsDir)
+	if err != nil {
+		s.cfg.Logf("draft %s: %v", s.cfg.Draft, err)
+		return nil
+	}
+	if src.Path == target.Path {
+		return nil // the draft model itself needs no draft
+	}
+	if !src.Present() {
+		s.cfg.Logf("draft %s isn't downloaded (nollama pull %s); answering without it", src.Name, src.Name)
+		return nil
+	}
+	d, err := s.cfg.Load(src.Path, engine.LoadOptions{Resources: s.res, PromptCache: s.cfg.PromptCache / 4,
+		KVCacheType: s.cfg.KVCacheType, Deterministic: s.cfg.Deterministic})
+	if err != nil {
+		s.cfg.Logf("draft %s: %v", src.Name, err)
+		return nil
+	}
+	if err := engine.CheckDraft(m, d); err != nil {
+		s.cfg.Logf("draft %s can't guess for %s: %v", src.Name, target.Name, err)
+		_ = d.Close()
+		return nil
+	}
+	s.cfg.Logf("draft %s guesses for %s", src.Name, target.Name)
+	return d
+}
+
+func closeDraft(l *loaded) {
+	if l.draft != nil {
+		_ = l.draft.Close()
+		l.draft = nil
+	}
 }
 
 // hold marks l in use. Called with s.mu held.
@@ -305,6 +352,7 @@ func (s *Server) retire(l *loaded) {
 		l.timer.Stop()
 	}
 	if l.active == 0 {
+		closeDraft(l)
 		_ = l.m.Close()
 		s.cfg.Logf("unloaded %s", l.name)
 		return
@@ -313,6 +361,7 @@ func (s *Server) retire(l *loaded) {
 	go func() {
 		defer s.retiring.Done()
 		l.refs.Wait()
+		closeDraft(l)
 		_ = l.m.Close()
 		s.cfg.Logf("unloaded %s", l.name)
 	}()
@@ -332,6 +381,7 @@ type sampling struct {
 	Tools       *toolSet        // tools the model may call (nil: none)
 	Logprobs    bool            // report each output token's log-probability
 	TopLogprobs int             // and this many most likely tokens at each step
+	DraftTokens *int            // tokens the draft model guesses at a time; 0 turns it off for this request
 }
 
 // genRequest is one generation: the model, its prompt as tokens (built once the model is loaded) and the sampling.
@@ -444,11 +494,25 @@ func (s *Server) generate(ctx context.Context, g genRequest) (genOutput, error) 
 			o.OnLogprob = g.lp.add
 		}
 	}
+	if l.draft != nil {
+		o.Draft, o.DraftTokens = l.draft, s.cfg.DraftTokens
+		if dt := g.sampling.DraftTokens; dt != nil {
+			if *dt <= 0 {
+				o.Draft = nil
+			} else {
+				o.DraftTokens = *dt
+			}
+		}
+	}
 	on := g.onText
 	if on == nil {
 		on = func(string) bool { return true }
 	}
 	res, err := l.m.GenerateTokens(ctx, ids, o, on)
+	if res.Drafted > 0 {
+		s.cfg.Logf("draft: %d of %d guessed tokens kept (%.0f%%), %d tokens in %s", res.Accepted, res.Drafted,
+			100*float64(res.Accepted)/float64(res.Drafted), res.OutputTokens, res.Decode.Round(time.Millisecond))
+	}
 	out.res = res
 	if g.sampling.Logprobs {
 		out.lps = lpTokens(l.m, res.Logprobs) // while the model is held

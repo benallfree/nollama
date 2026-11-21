@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -400,5 +401,47 @@ func TestClassify(t *testing.T) {
 		"labels":["bug","feature request","billing question"]}`)
 	if sum, _ := labels(out); code != 200 || out["label"] != "bug" || sum < 0.999 || sum > 1.001 {
 		t.Errorf("classify: %d %v", code, out)
+	}
+}
+
+// TestDraft serves a model with a draft beside it: GGUF=<qwen3-1.7b.gguf> DRAFT_GGUF=<qwen3-0.6b.gguf> go test ./server
+func TestDraft(t *testing.T) {
+	p, dp := os.Getenv("GGUF"), os.Getenv("DRAFT_GGUF")
+	if p == "" || dp == "" {
+		t.Skip("GGUF and DRAFT_GGUF not set")
+	}
+	var mu sync.Mutex
+	var logs []string
+	s := New(Config{ModelsDir: t.TempDir(), AllowPaths: true, Draft: dp, Logf: func(f string, a ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		logs = append(logs, fmt.Sprintf(f, a...))
+	}})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(func() { ts.Close(); _ = s.Close() })
+	ask := func(draftTokens string) string {
+		body := `{"model":"` + p + `","stream":false,"options":{"temperature":0,"num_predict":40` + draftTokens + `},
+			"format":{"type":"object","properties":{"colors":{"type":"array","items":{"type":"string"}}},"required":["colors"]},
+			"messages":[{"role":"user","content":"Name the three primary colors as JSON."}]}`
+		code, out := call(t, ts, "POST", "/api/chat", body)
+		if code != 200 {
+			t.Fatalf("chat: %d %v", code, out)
+		}
+		return out["message"].(map[string]any)["content"].(string)
+	}
+	with := ask("")
+	without := ask(`,"draft_tokens":0`)
+	if with != without {
+		t.Errorf("with the draft %q, without %q", with, without)
+	}
+	var v struct{ Colors []string }
+	if err := json.Unmarshal([]byte(with), &v); err != nil || len(v.Colors) == 0 {
+		t.Errorf("structured answer %q: %v", with, err)
+	}
+	mu.Lock()
+	all := strings.Join(logs, "\n")
+	mu.Unlock()
+	if !strings.Contains(all, "guesses for") || strings.Count(all, "guessed tokens kept") != 1 {
+		t.Errorf("logs:\n%s", all)
 	}
 }
