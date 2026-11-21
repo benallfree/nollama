@@ -14,7 +14,7 @@ import (
 var gpuSource string
 
 // gpuKernels are the kernels gpuSource defines.
-var gpuKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32"}
+var gpuKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32"}
 
 // gpu is a model's GPU state: the device, compiled kernels and the mmapped file wrapped as one buffer.
 // Experimental: nothing in forward uses it yet.
@@ -127,5 +127,19 @@ func (u *gpu) elementwise(kernel string, n int, args ...metal.Arg) metal.Dispatc
 		Args:    args,
 		Groups:  metal.Size{W: uint((n + 255) / 256), H: 1, D: 1},
 		Threads: metal.Size{W: 256, H: 1, D: 1},
+	}
+}
+
+// matmulDispatch is matvecDispatch for a batch of tokens with the tiled kernel (Q8_0 only so far).
+func (u *gpu) matmulDispatch(w *weight, x, out *metal.Buffer, n int) metal.Dispatch {
+	if w.typ != typeQ8_0 {
+		return u.matvecDispatch(w, x, out, n)
+	}
+	return metal.Dispatch{
+		P:       u.ps["matmul_q8_0_f32"],
+		Args:    []metal.Arg{u.weightArg(w), {Buf: x}, {Buf: out}, {Bytes: u32(uint32(w.rows), uint32(w.cols/32), uint32(w.rowBytes), uint32(w.cols), uint32(n))}},
+		Groups:  metal.Size{W: uint((w.rows + 31) / 32), H: uint((n + 31) / 32), D: 1},
+		Threads: metal.Size{W: 128, H: 1, D: 1},
+		Shared:  2 * 1024 * 4,
 	}
 }

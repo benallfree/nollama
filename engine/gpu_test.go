@@ -285,3 +285,75 @@ func TestGPUElementwise(t *testing.T) {
 	maxRelDiff(t, "swiglu", floatsOf(ob.Bytes(), n), sw, 1e-5)
 	maxRelDiff(t, "add", floatsOf(gb.Bytes(), n), ad, 0)
 }
+
+// TestGPUMatmul checks the tiled batch kernel against matvec on real Q8_0 weights (including a token
+// count that isn't a multiple of 32) and times a 512-token prompt's matrix work with both.
+func TestGPUMatmul(t *testing.T) {
+	m, err := Load(testGGUF(t), LoadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	u, err := openGPU(m.g)
+	if err != nil {
+		t.Skip(err)
+	}
+	defer u.close()
+	l := m.layers[0]
+	if l.wq.typ != typeQ8_0 {
+		t.Skip("model isn't Q8_0")
+	}
+	r := rand.New(rand.NewPCG(9, 10))
+	for _, w := range []*weight{l.wk, l.wdown} {
+		const n = 45
+		xb, _ := u.dev.NewBuffer(4 * n * w.cols)
+		putFloats(xb.Bytes(), randFloats(r, n*w.cols))
+		vb, _ := u.dev.NewBuffer(4 * n * w.rows)
+		mb, _ := u.dev.NewBuffer(4 * n * w.rows)
+		if err := u.dev.Run(u.matvecDispatch(w, xb, vb, n), u.matmulDispatch(w, xb, mb, n)); err != nil {
+			t.Fatal(err)
+		}
+		maxRelDiff(t, fmt.Sprintf("matmul vs matvec %dx%d, %d tokens", w.rows, w.cols, n),
+			floatsOf(mb.Bytes(), n*w.rows), floatsOf(vb.Bytes(), n*w.rows), 1e-4)
+		xb.Release()
+		vb.Release()
+		mb.Release()
+	}
+
+	// Speed: the layer matrices (not the output projection) for a 512-token prompt.
+	const n = 512
+	var ws []*weight
+	maxRows, maxCols, flops := 0, 0, 0.0
+	for _, l := range m.layers {
+		for _, w := range []*weight{l.wq, l.wk, l.wv, l.wo, l.wgate, l.wup, l.wdown} {
+			ws = append(ws, w)
+			maxRows, maxCols = max(maxRows, w.rows), max(maxCols, w.cols)
+			flops += 2 * float64(w.rows) * float64(w.cols) * n
+		}
+	}
+	xb, _ := u.dev.NewBuffer(4 * n * maxCols)
+	ob, _ := u.dev.NewBuffer(4 * n * maxRows)
+	defer xb.Release()
+	defer ob.Release()
+	putFloats(xb.Bytes(), randFloats(r, n*maxCols))
+	for _, c := range []struct {
+		name string
+		f    func(*weight, *metal.Buffer, *metal.Buffer, int) metal.Dispatch
+	}{{"matvec", u.matvecDispatch}, {"matmul", u.matmulDispatch}} {
+		ds := make([]metal.Dispatch, len(ws))
+		for i, w := range ws {
+			ds[i] = c.f(w, xb, ob, n)
+		}
+		_ = u.dev.Run(ds...)
+		t0 := time.Now()
+		const iters = 3
+		for i := 0; i < iters; i++ {
+			if err := u.dev.Run(ds...); err != nil {
+				t.Fatal(err)
+			}
+		}
+		d := time.Since(t0) / iters
+		t.Logf("%d-token prompt, layer matrices, %s: %v (%.1f TFLOPS, %.0f tokens/s for this part)",
+			n, c.name, d.Round(time.Millisecond), flops/d.Seconds()/1e12, n/d.Seconds())
+	}
+}

@@ -178,3 +178,99 @@ kernel void add_f32(device float *x [[buffer(0)]],
 		x[i] += y[i];
 	}
 }
+
+#include <metal_simdgroup_matrix>
+
+// matmul_q8_0_f32: y[t*rows + r] = dot(W row r, x[t]) for a batch of tokens (prompt reading).
+// Each threadgroup computes a 32-row x 32-token tile with 4 simdgroups (16x16 each, as 2x2 8x8
+// simdgroup matrices). The K loop steps one Q8_0 block (32) at a time: weights are dequantized and
+// activations copied into threadgroup memory, then multiplied with simdgroup_multiply_accumulate.
+// Grid: (rows/32, ceil(tokens/32)). a.nb counts 32-element blocks; a.rows here is also the y stride.
+struct MatmulArgs {
+	uint rows;
+	uint nb;
+	uint rowBytes;
+	uint cols;
+	uint tokens;
+};
+
+kernel void matmul_q8_0_f32(device const uchar *w [[buffer(0)]],
+                            device const float *x [[buffer(1)]],
+                            device float *y [[buffer(2)]],
+                            constant MatmulArgs &a [[buffer(3)]],
+                            threadgroup float *shm [[threadgroup(0)]],
+                            uint2 tg [[threadgroup_position_in_grid]],
+                            uint tid [[thread_index_in_threadgroup]],
+                            uint sg [[simdgroup_index_in_threadgroup]]) {
+	threadgroup float *sw = shm;        // [32 rows][32 k]
+	threadgroup float *sx = shm + 1024; // [32 tokens][32 k]
+	uint r0 = tg.x * 32, t0 = tg.y * 32;
+	uint sr = (sg / 2) * 16, st = (sg % 2) * 16; // this simdgroup's sub-tile
+
+	simdgroup_float8x8 c[2][2];
+	for (int i = 0; i < 2; i++) {
+		for (int j = 0; j < 2; j++) {
+			c[i][j] = simdgroup_float8x8(0);
+		}
+	}
+	// 128 threads: thread tid loads 8 consecutive k of row/token tid/4.
+	uint lr = tid / 4, lk = (tid % 4) * 8;
+	for (uint b = 0; b < a.nb; b++) {
+		{
+			uint r = r0 + lr;
+			threadgroup float *dst = sw + lr * 32 + lk;
+			if (r < a.rows) {
+				device const uchar *blk = w + (ulong)r * a.rowBytes + b * 34;
+				float d = float(*(device const half *)blk);
+				device const char *qs = (device const char *)(blk + 2 + lk);
+				for (int i = 0; i < 8; i++) {
+					dst[i] = d * float(qs[i]);
+				}
+			} else {
+				for (int i = 0; i < 8; i++) {
+					dst[i] = 0;
+				}
+			}
+			uint t = t0 + lr;
+			threadgroup float *dx = sx + lr * 32 + lk;
+			if (t < a.tokens) {
+				device const float *src = x + (ulong)t * a.cols + b * 32 + lk;
+				for (int i = 0; i < 8; i++) {
+					dx[i] = src[i];
+				}
+			} else {
+				for (int i = 0; i < 8; i++) {
+					dx[i] = 0;
+				}
+			}
+		}
+		threadgroup_barrier(mem_flags::mem_threadgroup);
+		for (uint kk = 0; kk < 32; kk += 8) {
+			simdgroup_float8x8 ma[2], mb[2];
+			for (int i = 0; i < 2; i++) {
+				simdgroup_load(ma[i], sw + (sr + 8 * i) * 32 + kk, 32);
+				simdgroup_load(mb[i], sx + (st + 8 * i) * 32 + kk, 32, ulong2(0, 0), true); // X^T: [k][token]
+			}
+			for (int i = 0; i < 2; i++) {
+				for (int j = 0; j < 2; j++) {
+					simdgroup_multiply_accumulate(c[i][j], ma[i], mb[j], c[i][j]);
+				}
+			}
+		}
+		threadgroup_barrier(mem_flags::mem_threadgroup);
+	}
+	// c[i][j] is [rows][tokens]; stage the 32x32 tile transposed ([token][row]) and write in bounds.
+	threadgroup float *out = shm; // reuse: [32 tokens][32 rows]
+	for (int i = 0; i < 2; i++) {
+		for (int j = 0; j < 2; j++) {
+			simdgroup_store(c[i][j], out + (st + 8 * j) * 32 + sr + 8 * i, 32, ulong2(0, 0), true);
+		}
+	}
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+	for (uint i = tid; i < 1024; i += 128) {
+		uint t = t0 + i / 32, r = r0 + i % 32;
+		if (t < a.tokens && r < a.rows) {
+			y[(ulong)t * a.rows + r] = out[i];
+		}
+	}
+}
