@@ -17,7 +17,7 @@ var metalSource string
 var metalDetSource string
 
 // metalDetKernels are the kernels metalDetSource adds for deterministic mode.
-var metalDetKernels = []string{"rmsnorm_det", "swiglu_det", "quant_q8_0_det", "quant_q8_k_det", "matvec_q8_0_det", "matvec_q4k_det", "attention_det"}
+var metalDetKernels = []string{"rmsnorm_det", "swiglu_det", "quant_q8_0_det", "quant_q8_k_det", "matvec_q8_0_det", "matvec_q4k_det", "matmul_q8_0_det", "matvec1_q8_0_det", "attention_det"}
 
 // metalKernels are the kernels metalSource defines.
 var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "attention_f32", "attention_split_f32", "attention_combine_f32", "kv_store_f32", "copy_f32"}
@@ -108,11 +108,22 @@ func (m *metalBackend) batch() gpuBatch { return &metalBatch{m: m} }
 type metalBatch struct {
 	m  *metalBackend
 	ds []metal.Dispatch
+	// quantized: what act holds (deterministic mode), so matmuls sharing an input (q/k/v, gate/up) quantize it once.
+	// Every other operation clears it: it may write that input.
+	quantized struct {
+		x, act gpuRef
+		n      int
+		kernel string
+	}
 }
+
+// wrote forgets the quantized activations: the operation being recorded may change their source.
+func (b *metalBatch) wrote() { b.quantized.kernel = "" }
 
 func marg(r gpuRef) metal.Arg { return metal.Arg{Buf: r.buf.(metalBuf).b, Offset: r.off} }
 
 func (b *metalBatch) submit() error {
+	b.wrote()
 	err := b.m.dev.Run(b.ds...)
 	b.ds = b.ds[:0]
 	return err
@@ -171,6 +182,9 @@ func (b *metalBatch) matmulTiled(w *weight, x, out gpuRef, n int) {
 	})
 }
 
+// detT is DET_T in gpu_det.metal: tokens per simdgroup in the deterministic matvecs.
+const detT = 8
+
 // matmulDet quantizes x into act as the CPU does (Q8_0 or Q8_K blocks, by weight type), then runs the integer
 // matvec that follows the CPU's dot product order, for each token.
 func (b *metalBatch) matmulDet(w *weight, x, out gpuRef, n int, act gpuRef) {
@@ -186,20 +200,51 @@ func (b *metalBatch) matmulDet(w *weight, x, out gpuRef, n int, act gpuRef) {
 	}
 	nb := w.cols / bs
 	const nsg = 4 // blocks or rows (simdgroups) per threadgroup
+	q := &b.quantized
+	if q.kernel != quant || q.x != x || q.act != act || q.n != n {
+		b.ds = append(b.ds, metal.Dispatch{
+			P:       b.m.ps[quant],
+			Args:    []metal.Arg{marg(x), marg(act), {Bytes: u32(uint32(n * nb))}},
+			Groups:  metal.Size{W: uint((n*nb + nsg - 1) / nsg), H: 1, D: 1},
+			Threads: metal.Size{W: 32 * nsg, H: 1, D: 1},
+		})
+		q.x, q.act, q.n, q.kernel = x, act, n, quant
+	}
+	if out.buf == x.buf || out.buf == act.buf {
+		b.wrote()
+	}
+	args := metal.Arg{Bytes: u32(uint32(w.rows), uint32(nb), uint32(w.rowBytes), uint32(nb*abytes), uint32(n))}
+	if n >= matmulTiledMin && w.typ == typeQ8_0 { // prompts: the matrix units (exact integer totals per block)
+		b.ds = append(b.ds, metal.Dispatch{
+			P:       b.m.ps["matmul_q8_0_det"],
+			Args:    []metal.Arg{b.weightArg(w), marg(act), marg(out), args},
+			Groups:  metal.Size{W: uint((w.rows + 31) / 32), H: uint((n + 31) / 32), D: 1},
+			Threads: metal.Size{W: 128, H: 1, D: 1},
+			Shared:  4 * (3072 + 64),
+		})
+		return
+	}
+	if n == 1 && w.typ == typeQ8_0 && nb <= 1024 { // decode: coalesced loads
+		b.ds = append(b.ds, metal.Dispatch{
+			P:       b.m.ps["matvec1_q8_0_det"],
+			Args:    []metal.Arg{b.weightArg(w), marg(act), marg(out), args},
+			Groups:  metal.Size{W: uint((w.rows + nsg - 1) / nsg), H: 1, D: 1},
+			Threads: metal.Size{W: 32 * nsg, H: 1, D: 1},
+			Shared:  nsg * 2 * nb * 4,
+		})
+		return
+	}
 	b.ds = append(b.ds, metal.Dispatch{
-		P:       b.m.ps[quant],
-		Args:    []metal.Arg{marg(x), marg(act), {Bytes: u32(uint32(n * nb))}},
-		Groups:  metal.Size{W: uint((n*nb + nsg - 1) / nsg), H: 1, D: 1},
-		Threads: metal.Size{W: 32 * nsg, H: 1, D: 1},
-	}, metal.Dispatch{
 		P:       b.m.ps[kernel],
-		Args:    []metal.Arg{b.weightArg(w), marg(act), marg(out), {Bytes: u32(uint32(w.rows), uint32(nb), uint32(w.rowBytes), uint32(nb*abytes))}},
-		Groups:  metal.Size{W: uint((w.rows + nsg - 1) / nsg), H: uint(n), D: 1},
+		Args:    []metal.Arg{b.weightArg(w), marg(act), marg(out), args},
+		Groups:  metal.Size{W: uint((w.rows + nsg - 1) / nsg), H: uint((n + detT - 1) / detT), D: 1},
 		Threads: metal.Size{W: 32 * nsg, H: 1, D: 1},
+		Shared:  nsg * 64 * min(detT, n) * 4,
 	})
 }
 
 func (b *metalBatch) rmsnorm(x, w, out gpuRef, rows, n int, eps float64) {
+	b.wrote()
 	if b.m.det {
 		b.ds = append(b.ds, metal.Dispatch{
 			P:       b.m.ps["rmsnorm_det"],
@@ -221,6 +266,7 @@ func (b *metalBatch) rmsnorm(x, w, out gpuRef, rows, n int, eps float64) {
 }
 
 func (b *metalBatch) rope(x, cs, sn gpuRef, tokens, heads, headDim int) {
+	b.wrote()
 	half := headDim / 2
 	tw := min(half, 64)
 	b.ds = append(b.ds, metal.Dispatch{
@@ -233,6 +279,7 @@ func (b *metalBatch) rope(x, cs, sn gpuRef, tokens, heads, headDim int) {
 
 // elementwise is a 1-D dispatch over n elements.
 func (b *metalBatch) elementwise(kernel string, n int, args ...metal.Arg) {
+	b.wrote()
 	b.ds = append(b.ds, metal.Dispatch{
 		P:       b.m.ps[kernel],
 		Args:    append(args, metal.Arg{Bytes: u32(uint32(n))}),
@@ -254,6 +301,7 @@ func (b *metalBatch) add(x, y gpuRef, n int) { b.elementwise("add_f32", n, marg(
 func (b *metalBatch) copy(dst, src gpuRef, n int) { b.elementwise("copy_f32", n, marg(dst), marg(src)) }
 
 func (b *metalBatch) attention(a gpuAttention) {
+	b.wrote()
 	if a.kvType != typeF32 {
 		panic(fmt.Sprintf("metal: attention over a %s cache isn't supported", kvTypeName(a.kvType)))
 	}
@@ -297,6 +345,7 @@ func (b *metalBatch) attention(a gpuAttention) {
 }
 
 func (b *metalBatch) storeKV(k, v, kc, vc gpuRef, n, pos, kvd, ctxP int) {
+	b.wrote()
 	b.ds = append(b.ds, metal.Dispatch{
 		P:       b.m.ps["kv_store_f32"],
 		Args:    []metal.Arg{marg(k), marg(v), marg(kc), marg(vc), {Bytes: u32(uint32(kvd), uint32(ctxP), uint32(pos))}},

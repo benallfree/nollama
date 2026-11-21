@@ -29,8 +29,8 @@ type Config struct {
 	Threads     int    // CPU threads shared by every model and answer (0: the engine's default)
 	MaxMemory   int64  // memory budget in bytes for weights, answers' state and caches (0: no limit; see engine.Resources)
 	LowPriority bool   // run the engine's threads at a lower OS priority (see engine.LowPrioritySupported)
-	// Deterministic loads models with engine.LoadOptions.Deterministic: the same logits, bit for bit, on any CPU,
-	// thread count and batch size, with the portable (slower) kernels.
+	// Deterministic loads models with engine.LoadOptions.Deterministic: the same logits, bit for bit, on any CPU or
+	// Mac GPU, at any thread count and batch size.
 	Deterministic bool
 	// Resources, when set, is a thread and memory budget the server shares with models the app loads itself; Threads,
 	// MaxMemory and LowPriority are then ignored, and Close leaves it open.

@@ -304,7 +304,7 @@ one reference order with single-rounding multiply-adds, and the Go code never le
 which fuses `x*y+z` on arm64 but not on amd64. So greedy output and seeded sampling match across machines, and `Score`
 gives the same logprobs whatever its `Batch`. `TestKernelsReferenceOrder` and `TestDeterministic` (golden hashes) check
 this on each CI architecture. It holds for the default `f32` KV cache; the compact caches (`--kv-cache-type`) round
-differently per CPU.
+differently per CPU. The GPU's default kernels sum in their own order, so their logits differ from the CPU's.
 
 `LoadOptions.Deterministic` (or `nollama serve --deterministic`, `NOLLAMA_DETERMINISTIC=1`, `nollama run
 --deterministic`) also makes logprobs (`Score`, `Classify`, generate's logprobs) the same bits, by computing their
@@ -313,6 +313,12 @@ refuses what would break exactness: a compact KV cache, and continuing from half
 `ThreadDir` are ignored; `LoadThread` / `LoadPromptCache` need a snapshot saved with `Full`). Use it when two machines
 must agree exactly, for example a compressor driven by the model's probabilities. It costs little: the log-softmax over
 the vocabulary is about 1.5x slower, the rest runs the same kernels.
+
+On a Mac, deterministic mode runs on the GPU with kernels that compute exactly what the CPU computes, bit for bit
+(Q8_0 and Q4_K weights; `TestDeterministic` compares them). They follow the same reference order, are compiled with
+fast math off, and the reference flushes subnormals in rmsnorm, SwiGLU and the softmax as GPUs do. On an M1 Max with
+Qwen3-1.7B they write about 40 to 50 tokens/s and read prompts at about 860 tokens/s: roughly half the speed of the
+default GPU kernels, and twice to four times the CPU's. Elsewhere (NVIDIA included) deterministic mode uses the CPU.
 
 ## Test without a model
 

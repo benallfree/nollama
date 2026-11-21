@@ -219,3 +219,52 @@ func TestGPUDetAttention(t *testing.T) {
 		sameBits(t, fmt.Sprintf("attention, masked=%v", masked), got, want)
 	}
 }
+
+// BenchmarkGPUMatmulQ8_0 times one 6144x2048 Q8_0 matmul (an FFN gate's shape) for 1 and 64 tokens, fast and
+// deterministic: go test -run XXX -bench GPUMatmulQ8_0
+func BenchmarkGPUMatmulQ8_0(b *testing.B) {
+	for _, det := range []bool{false, true} {
+		var be gpuBackend
+		for _, open := range gpuOpeners {
+			if x, err := open(det); err == nil {
+				be = x
+				break
+			}
+		}
+		if be == nil {
+			b.Skip("no GPU")
+		}
+		r := rand.New(rand.NewPCG(1, 2))
+		const rows, nb = 6144, 64
+		file := alignedBytes(rows * nb * q80Bytes)
+		copy(file, randBlocks(r, rows*nb, q80Bytes, []int{0}))
+		if err := be.loadWeights(file); err != nil {
+			b.Fatal(err)
+		}
+		w := &weight{typ: typeQ8_0, cols: nb * 32, rows: rows, rowBytes: nb * q80Bytes, data: file}
+		for _, n := range []int{1, 64} {
+			alloc := func(bytes int) gpuRef {
+				buf, err := be.alloc(bytes)
+				if err != nil {
+					b.Fatal(err)
+				}
+				return gpuRef{buf: buf}
+			}
+			x, out, act := alloc(4*n*w.cols), alloc(4*n*rows), alloc(gpuActBytes(n, w.cols))
+			b.Run(fmt.Sprintf("det=%v/n=%d", det, n), func(b *testing.B) {
+				const reps = 20 // per batch, so dispatch and submit overhead don't dominate
+				for i := 0; i < b.N; i++ {
+					bt := be.batch()
+					for k := 0; k < reps; k++ {
+						bt.matmul(w, x, out, n, act)
+					}
+					if err := bt.submit(); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.ReportMetric(float64(b.Elapsed().Microseconds())/float64(b.N*reps), "µs/matmul")
+			})
+		}
+		be.close()
+	}
+}
