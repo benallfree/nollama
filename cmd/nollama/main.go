@@ -98,6 +98,7 @@ func cmdServe(args []string) error {
 	parallel := fs.Int("parallel", 1, "answers written at once; the rest wait their turn")
 	keepAlive := fs.Duration("keep-alive", 5*time.Minute, "how long an idle model stays loaded (negative: forever)")
 	numCtx := fs.Int("num-ctx", 4096, "context window when a request doesn't set num_ctx")
+	truncate := fs.Bool("truncate", false, "drop a chat's oldest messages when it doesn't fit the context window, instead of answering 400 (requests can still send \"truncate\": false)")
 	cacheMB := fs.Int("prompt-cache-mb", 256, "memory for reusing the start of recent prompts (0: off)")
 	quiet := fs.Bool("quiet", false, "don't log requests")
 	apiKey := fs.String("api-key", os.Getenv("NOLLAMA_API_KEY"), "require this key (Authorization: Bearer <key>); prefer NOLLAMA_API_KEY, which other users can't see in ps")
@@ -118,7 +119,7 @@ func cmdServe(args []string) error {
 		addr += ":11434"
 	}
 	cfg := server.Config{ModelsDir: modelsDir(), Threads: *threads, Parallel: *parallel, KeepAlive: *keepAlive,
-		NumCtx: *numCtx, PromptCache: int64(*cacheMB) << 20,
+		NumCtx: *numCtx, Truncate: *truncate, PromptCache: int64(*cacheMB) << 20,
 		APIKey: strings.TrimSpace(*apiKey), ReadOnly: *readOnly, NoPull: *noPull, NoDelete: *noDelete,
 		Models: list(*allow), AllowPaths: *allowPaths, AllowedOrigins: list(*origins), AllowedHosts: list(*hosts),
 		MaxBodyBytes: int64(*maxBodyMB) << 20, MaxTokens: *maxTokens, MaxNumCtx: *maxNumCtx, PerClient: *perClient}

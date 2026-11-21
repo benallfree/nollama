@@ -31,6 +31,7 @@ type Config struct {
 	Parallel    int           // answers written at once (default 1); the rest wait their turn
 	KeepAlive   time.Duration // how long an idle model stays loaded (default 5m; negative: forever)
 	NumCtx      int           // context window when a request doesn't set num_ctx (default 4096, capped at the model's)
+	Truncate    bool          // chats that don't fit drop their oldest messages unless the request sends "truncate": false (default: a 400)
 	Client      *http.Client  // for pulls (default http.DefaultClient)
 	Logf        func(format string, args ...any)
 
@@ -288,6 +289,7 @@ type sampling struct {
 	NumCtx      int // 0: the server's default
 	Stop        []string
 	Schema      json.RawMessage // constrain the output to this JSON schema
+	Truncate    *bool           // a chat that doesn't fit drops its oldest messages (nil: the server's default)
 }
 
 // genRequest is one generation: the model, its prompt as tokens (built once the model is loaded) and the sampling.
@@ -297,15 +299,18 @@ type genRequest struct {
 	sampling  sampling
 	keepAlive *time.Duration
 	onText    func(piece string) bool // nil: no streaming
+	// trim, for a chat, rebuilds the prompt within budget tokens by dropping old messages (fitContext); nil: can't
+	trim func(m *engine.Model, budget int) ([]int, engine.Trimmed, error)
 }
 
 type genOutput struct {
-	model  string
-	ids    []int // the prompt's tokens
-	res    engine.Result
-	load   time.Duration
-	total  time.Duration
-	reason string // "stop" or "length"
+	model   string
+	ids     []int // the prompt's tokens
+	res     engine.Result
+	load    time.Duration
+	total   time.Duration
+	reason  string         // "stop" or "length"
+	trimmed engine.Trimmed // what fitContext dropped (Messages 0: nothing)
 }
 
 func (s *Server) generate(ctx context.Context, g genRequest) (genOutput, error) {
@@ -350,14 +355,13 @@ func (s *Server) generate(ctx context.Context, g genRequest) (genOutput, error) 
 	if modelCtx > 0 && numCtx > modelCtx {
 		numCtx = modelCtx
 	}
+	ids, out.trimmed, err = s.fitContext(l.m, g, ids, numCtx, modelCtx)
+	if err != nil {
+		return out, err
+	}
+	out.ids = ids
 	room := numCtx - len(ids)
-	if room <= 0 {
-		return out, badRequest{fmt.Errorf("the prompt is %d tokens, more than the context window (%d); set a larger num_ctx", len(ids), numCtx)}
-	}
-	maxTokens := g.sampling.MaxTokens
-	if s.cfg.MaxTokens > 0 && (maxTokens <= 0 || maxTokens > s.cfg.MaxTokens) {
-		maxTokens = s.cfg.MaxTokens
-	}
+	maxTokens := s.maxTokens(g) // more than fits ends at the window's end, with reason "length"
 	if maxTokens <= 0 || maxTokens > room {
 		maxTokens = room
 	}
@@ -392,6 +396,8 @@ func (s *Server) generate(ctx context.Context, g genRequest) (genOutput, error) 
 
 // badRequest is an error in what the client sent.
 type badRequest struct{ error }
+
+func (b badRequest) Unwrap() error { return b.error }
 
 func statusOf(err error) int {
 	var nf errNotFound

@@ -78,23 +78,25 @@ type ollamaChatRequest struct {
 	Stream    *bool             `json:"stream"`
 	Tools     []json.RawMessage `json:"tools"`
 	KeepAlive json.RawMessage   `json:"keep_alive"`
+	Truncate  *bool             `json:"truncate"` // drop the oldest messages if the chat doesn't fit (nollama's; nil: the server's default)
 }
 
 // ollamaDone is the closing fields of a generate or chat answer.
 type ollamaDone struct {
-	DoneReason         string `json:"done_reason,omitempty"`
-	TotalDuration      int64  `json:"total_duration,omitempty"`
-	LoadDuration       int64  `json:"load_duration,omitempty"`
-	PromptEvalCount    int    `json:"prompt_eval_count,omitempty"`
-	PromptEvalDuration int64  `json:"prompt_eval_duration,omitempty"`
-	EvalCount          int    `json:"eval_count,omitempty"`
-	EvalDuration       int64  `json:"eval_duration,omitempty"`
+	DoneReason         string     `json:"done_reason,omitempty"`
+	TotalDuration      int64      `json:"total_duration,omitempty"`
+	LoadDuration       int64      `json:"load_duration,omitempty"`
+	PromptEvalCount    int        `json:"prompt_eval_count"`
+	PromptEvalDuration int64      `json:"prompt_eval_duration,omitempty"`
+	EvalCount          int        `json:"eval_count"`
+	EvalDuration       int64      `json:"eval_duration,omitempty"`
+	Truncated          *truncated `json:"truncated,omitempty"`
 }
 
 func doneOf(out genOutput) ollamaDone {
 	return ollamaDone{DoneReason: out.reason, TotalDuration: int64(out.total), LoadDuration: int64(out.load),
 		PromptEvalCount: out.res.PromptTokens, PromptEvalDuration: int64(out.res.Prefill),
-		EvalCount: out.res.OutputTokens, EvalDuration: int64(out.res.Decode)}
+		EvalCount: out.res.OutputTokens, EvalDuration: int64(out.res.Decode), Truncated: truncatedOf(out)}
 }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
@@ -246,7 +248,8 @@ func (s *Server) ollamaChat(w http.ResponseWriter, r *http.Request) {
 		ollamaError(w, err)
 		return
 	}
-	g := genRequest{model: req.Model, sampling: sp, keepAlive: ka,
+	sp.Truncate = req.Truncate
+	g := genRequest{model: req.Model, sampling: sp, keepAlive: ka, trim: chatTrim(msgs),
 		tokens: func(m *engine.Model) ([]int, error) { return m.Tokenize(m.ChatPrompt(msgs)), nil }}
 	stream := req.Stream == nil || *req.Stream
 	nd := &ndjson{w: w}

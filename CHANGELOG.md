@@ -15,6 +15,10 @@ becomes `## vX.Y.Z` and its lines are the release notes (`release.sh` reads them
 - `engine.LoadOptions.Respond` makes a model answer from a script instead of its weights, and `server.Config.Load` lets a test choose how model files are opened.
 - Save and load a conversation's state, and the prompt cache's, through any `io.Writer`/`io.Reader` (`Model.SaveThread`, `LoadThread`, `SavePromptCache`, `LoadPromptCache`): a long conversation picks up after a restart without being read again. Snapshots are tied to the model file by a fingerprint, versioned and checksummed, half or full precision, optionally compressed.
 - Embeddings: `/api/embed` (one text or a list, `truncate`, `dimensions`), `/api/embeddings` and `/v1/embeddings` (text or token ids, `dimensions`, `encoding_format` `float` or `base64`) answer with unit-length vectors from Qwen3-Embedding, which `qwen3-embedding-0.6b` (or `qwen3-embedding:0.6b`) downloads. In Go, `Model.Embed` and `engine.EmbedQuery` for the query instruction. `/api/show` reports an embedding model's capability as `embedding`.
+- A prompt that doesn't fit the context window is an HTTP 400 that gives the token counts and the limit, in Ollama's and OpenAI's error shapes; nollama never truncates a prompt silently.
+- Opt-in truncation: `"truncate": true` on `/api/chat` and `/v1/chat/completions`, or `nollama serve --truncate`, keeps the system prompt and the most recent messages, and reports what was dropped in a `truncated` field and the server log.
+- `prompt_eval_count` and `eval_count` are always in Ollama's final answer, even when 0. `/v1/completions` streams `usage` with `stream_options.include_usage`.
+- Engine: context errors are `*engine.ContextError` (matches `engine.ErrContextExceeded`) with the counts; `engine.TrimMessages` trims a conversation to a token budget.
 
 ## v0.0.1-alpha.1
 

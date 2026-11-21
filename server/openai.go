@@ -76,12 +76,13 @@ type openaiCommon struct {
 			Schema json.RawMessage `json:"schema"`
 		} `json:"json_schema"`
 	} `json:"response_format"`
-	N     int               `json:"n"`
-	Tools []json.RawMessage `json:"tools"`
+	N        int               `json:"n"`
+	Tools    []json.RawMessage `json:"tools"`
+	Truncate *bool             `json:"truncate"` // nollama's: drop the oldest messages if the chat doesn't fit
 }
 
 func (c openaiCommon) sampling() (sampling, error) {
-	sp := sampling{Temperature: c.Temperature, TopP: c.TopP, Seed: c.Seed, Stop: c.Stop, MaxTokens: c.MaxTokens}
+	sp := sampling{Temperature: c.Temperature, TopP: c.TopP, Seed: c.Seed, Stop: c.Stop, MaxTokens: c.MaxTokens, Truncate: c.Truncate}
 	if c.MaxCompletionTokens > 0 {
 		sp.MaxTokens = c.MaxCompletionTokens
 	}
@@ -224,7 +225,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		return map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
 			"choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}}}
 	}
-	g := genRequest{model: req.Model, sampling: sp,
+	g := genRequest{model: req.Model, sampling: sp, trim: chatTrim(msgs),
 		tokens: func(m *engine.Model) ([]int, error) { return m.Tokenize(m.ChatPrompt(msgs)), nil }}
 	ev := &sse{w: w}
 	if req.Stream {
@@ -249,13 +250,21 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !req.Stream {
-		writeJSON(w, 200, map[string]any{"id": id, "object": "chat.completion", "created": created, "model": model,
+		res := map[string]any{"id": id, "object": "chat.completion", "created": created, "model": model,
 			"choices": []any{map[string]any{"index": 0, "message": map[string]any{"role": "assistant", "content": out.res.Text},
 				"finish_reason": out.reason}},
-			"usage": usageOf(out)})
+			"usage": usageOf(out)}
+		if t := truncatedOf(out); t != nil {
+			res["truncated"] = t
+		}
+		writeJSON(w, 200, res)
 		return
 	}
-	ev.send(chunk(map[string]any{}, out.reason))
+	last := chunk(map[string]any{}, out.reason)
+	if t := truncatedOf(out); t != nil {
+		last["truncated"] = t
+	}
+	ev.send(last)
 	if req.StreamOptions.IncludeUsage {
 		ev.send(map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
 			"choices": []any{}, "usage": usageOf(out)})
@@ -317,6 +326,10 @@ func (s *Server) openaiCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ev.send(chunk("", out.reason))
+	if req.StreamOptions.IncludeUsage {
+		ev.send(map[string]any{"id": id, "object": "text_completion", "created": created, "model": model,
+			"choices": []any{}, "usage": usageOf(out)})
+	}
 	ev.send("[DONE]")
 }
 

@@ -92,6 +92,20 @@ Other commands: `nollama pull <model>`, `nollama list`, `nollama rm <model>`. `n
 flags (threads, answers at once, how long an idle model stays loaded, context window). `NOLLAMA_HOST` sets the address
 and `NOLLAMA_MODELS` the models folder.
 
+## Context limits
+
+nollama never cuts a prompt to make it fit. Ollama's default context window quietly drops the start of a long prompt,
+and the model then seems to ignore its instructions. Here, a prompt that doesn't fit the context window (`num_ctx`,
+default 4096, `--num-ctx` on the server) is an HTTP 400 that gives the token counts and the limit, in each API's error
+shape. An answer that reaches `num_predict`/`max_tokens` or the end of the window ends with `done_reason: "length"`
+(Ollama) or `finish_reason: "length"` (OpenAI). Token counts are always in the answer: `prompt_eval_count` and
+`eval_count` on Ollama, `usage` on OpenAI (when streaming, with `stream_options.include_usage`).
+
+To drop old turns instead, send `"truncate": true` with a chat (`/api/chat` or `/v1/chat/completions`), or start the
+server with `--truncate` (a request can still send `"truncate": false`). nollama then keeps the system prompt and the
+most recent messages, leaving `max_tokens` (or a quarter of the window, at most 1024) for the answer. It says what it
+dropped in the answer, `"truncated": {"messages": 6, "tokens": 1840, "prompt_tokens": 5012}`, and in the server log.
+
 ## Embed it in a Go program
 
 Mount the server in your own HTTP server:
@@ -134,6 +148,10 @@ fmt.Println(engine.Cosine(es[0].Vector, es[1].Vector)) // about 0.77
 
 The engine also keeps the start of recent prompts (`LoadOptions.PromptCache`), so a long system prompt is read once,
 and can keep a conversation's state between calls (`GenerateOptions.Thread`).
+
+A prompt that doesn't fit is an error you can check: `errors.Is(err, engine.ErrContextExceeded)`, or `errors.As` with
+`*engine.ContextError` for the counts. `engine.TrimMessages` drops a conversation's oldest messages to fit a budget,
+and tells you what it dropped.
 
 ### Save a conversation and pick it up later
 

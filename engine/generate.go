@@ -55,7 +55,7 @@ type Result struct {
 	OutputTokens int
 	Prefill      time.Duration // prompt processing, up to the first sampled token
 	Decode       time.Duration // remaining tokens
-	StopReason   string        // "eos", "stop", "length", "callback", "canceled"
+	StopReason   string        // "eos", "stop", "length" (MaxTokens reached), "callback", "canceled"
 }
 
 // Message is one chat turn.
@@ -106,8 +106,8 @@ func (m *Model) GenerateTokens(ctx context.Context, ids []int, o GenerateOptions
 		o.MaxTokens = 256
 	}
 	maxCtx := len(ids) + o.MaxTokens
-	if maxCtx > m.hp.ctx {
-		return res, errors.New("engine: prompt plus max tokens exceeds the model's context length")
+	if err := checkContext(len(ids), o.MaxTokens, m.hp.ctx); err != nil { // a *ContextError: never cut the prompt
+		return res, err
 	}
 	if m.respond != nil {
 		return m.generateScripted(ctx, ids, o, onToken)
@@ -422,8 +422,8 @@ func (m *Model) Warm(ctx context.Context, prompt, scope, pin string) (WarmResult
 	if m.prefix.budget <= 0 || len(ids) < prefixMin {
 		return res, nil
 	}
-	if len(ids) >= m.hp.ctx {
-		return res, errors.New("engine: the prompt is longer than the model's context")
+	if err := checkContext(len(ids), 1, m.hp.ctx); err != nil {
+		return res, err
 	}
 	s := m.getState(len(ids)+1, min(len(ids), prefillBatch))
 	defer m.putState(s)
