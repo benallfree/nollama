@@ -124,7 +124,7 @@ func (m *Model) embedSeq(ids []int, limit int, truncate bool) ([]int, error) {
 func normalize(v []float32) {
 	var ss float64
 	for _, x := range v {
-		ss += float64(x) * float64(x)
+		ss += float64(float64(x) * float64(x))
 	}
 	if ss == 0 {
 		return
@@ -139,9 +139,9 @@ func normalize(v []float32) {
 func Cosine(a, b []float32) float64 {
 	var dot, na, nb float64
 	for i := range a {
-		dot += float64(a[i]) * float64(b[i])
-		na += float64(a[i]) * float64(a[i])
-		nb += float64(b[i]) * float64(b[i])
+		dot += float64(float64(a[i]) * float64(b[i]))
+		na += float64(float64(a[i]) * float64(a[i]))
+		nb += float64(float64(b[i]) * float64(b[i]))
 	}
 	if na == 0 || nb == 0 {
 		return 0

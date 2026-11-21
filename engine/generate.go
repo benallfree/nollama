@@ -471,7 +471,7 @@ func (m *Model) sample(logits []float32, o GenerateOptions, rng *rand.Rand) int 
 	mx := cs[0].p
 	var sum float64
 	for i := range cs {
-		e := math.Exp(float64(cs[i].p-mx) / o.Temperature)
+		e := exp64(float64(cs[i].p-mx) / o.Temperature)
 		cs[i].p = float32(e)
 		sum += e
 	}
@@ -561,7 +561,7 @@ func (m *Model) sampleConstrained(logits []float32, o GenerateOptions, rng *rand
 		var sum float64
 		ps := make([]float64, len(fits))
 		for i, c := range fits {
-			ps[i] = math.Exp(float64(c.v-fits[0].v) / o.Temperature)
+			ps[i] = exp64(float64(c.v-fits[0].v) / o.Temperature)
 			sum += ps[i]
 		}
 		r := rng.Float64() * sum

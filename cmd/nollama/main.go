@@ -55,6 +55,7 @@ Environment:
   NOLLAMA_THREADS          serve's --threads
   NOLLAMA_MAX_MEMORY       serve's --max-memory (such as 3GB)
   NOLLAMA_LOW_PRIORITY     serve's --low-priority (1 or true)
+  NOLLAMA_DETERMINISTIC    serve's --deterministic (1 or true)
 `
 
 var version = "dev"
@@ -108,6 +109,7 @@ func cmdServe(args []string) error {
 	threads := fs.Int("threads", envInt("NOLLAMA_THREADS"), "CPU threads, shared by every answer and model (0: the CPUs Go uses, up to 8)")
 	maxMem := fs.String("max-memory", os.Getenv("NOLLAMA_MAX_MEMORY"), "memory budget for the model, answers and caches, such as 3GB or 800MB (empty or 0: no limit)")
 	lowPrio := fs.Bool("low-priority", envBool("NOLLAMA_LOW_PRIORITY"), "run the engine's threads at a lower OS priority, so other programs win the CPU")
+	det := fs.Bool("deterministic", envBool("NOLLAMA_DETERMINISTIC"), "the same logits, bit for bit, on any CPU, thread count and batch size (portable kernels, slower)")
 	parallel := fs.Int("parallel", 1, "answers written at once; the rest wait their turn")
 	keepAlive := fs.Duration("keep-alive", 5*time.Minute, "how long an idle model stays loaded (negative: forever)")
 	numCtx := fs.Int("num-ctx", 4096, "context window when a request doesn't set num_ctx")
@@ -141,7 +143,7 @@ func cmdServe(args []string) error {
 		APIKey: strings.TrimSpace(*apiKey), ReadOnly: *readOnly, NoPull: *noPull, NoDelete: *noDelete,
 		Models: list(*allow), AllowPaths: *allowPaths, AllowedOrigins: list(*origins), AllowedHosts: list(*hosts),
 		MaxBodyBytes: int64(*maxBodyMB) << 20, MaxTokens: *maxTokens, MaxNumCtx: *maxNumCtx, PerClient: *perClient,
-		MaxMemory: memLimit, LowPriority: *lowPrio, KVCacheType: *kvType}
+		MaxMemory: memLimit, LowPriority: *lowPrio, KVCacheType: *kvType, Deterministic: *det}
 	if err := checkKVCacheType(*kvType); err != nil {
 		return err
 	}
@@ -340,6 +342,7 @@ func cmdRun(args []string) error {
 	system := fs.String("system", "", "system prompt")
 	verbose := fs.Bool("verbose", false, "print token counts and speed after each answer")
 	kvType := kvCacheFlag(fs)
+	det := fs.Bool("deterministic", false, "the same logits, bit for bit, on any CPU (portable kernels, slower)")
 	fs.Parse(args)
 	if fs.NArg() < 1 {
 		return errors.New("usage: nollama run [flags] <model> [prompt]")
@@ -348,7 +351,7 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	m, err := engine.Load(src.Path, engine.LoadOptions{Threads: *threads, PromptCache: 256 << 20, KVCacheType: *kvType})
+	m, err := engine.Load(src.Path, engine.LoadOptions{Threads: *threads, PromptCache: 256 << 20, KVCacheType: *kvType, Deterministic: *det})
 	if err != nil {
 		return err
 	}

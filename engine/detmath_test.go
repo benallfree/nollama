@@ -2,6 +2,7 @@ package engine
 
 import (
 	"math"
+	"math/rand/v2"
 	"os"
 	"testing"
 )
@@ -36,7 +37,7 @@ func TestSincos(t *testing.T) {
 	var worst float64
 	var c uint64
 	for i := 0; i < 40960*64; i++ {
-		x := float64(i/64) * math.Pow(1000000, -2*float64(i%64)/128)
+		x := float64(i/64) * float64(float32(math.Pow(1000000, -2*float64(i%64)/128)))
 		s, co := sincos(x)
 		ws, wc := math.Sincos(x)
 		worst = math.Max(worst, math.Max(math.Abs(s-ws), math.Abs(co-wc)))
@@ -46,4 +47,81 @@ func TestSincos(t *testing.T) {
 		t.Fatalf("sincos off by %g", worst)
 	}
 	t.Logf("sincos max error vs math.Sincos %.3g, checksum %016x", worst, c)
+}
+
+func TestExpLog64(t *testing.T) {
+	var we, wl float64
+	for i := -800000; i <= 800000; i++ {
+		x := float64(i) * 1e-3
+		if g, w := exp64(x), math.Exp(x); w != 0 && !math.IsInf(w, 0) {
+			we = math.Max(we, math.Abs(g-w)/w)
+		}
+	}
+	for i := 1; i <= 1000000; i++ {
+		x := float64(i) * 0.731
+		g, w := log64(x), math.Log(x)
+		wl = math.Max(wl, math.Abs(g-w)/math.Max(1, math.Abs(w)))
+		x = 1 / x
+		g, w = log64(x), math.Log(x)
+		wl = math.Max(wl, math.Abs(g-w)/math.Max(1, math.Abs(w)))
+	}
+	// math.Exp's amd64 assembly is off by up to ~4e-14 relative; on arm64 (pure Go) exp64 matches it to 2e-16
+	if we > 1e-13 || wl > 4e-16 {
+		t.Fatalf("exp64 rel err %g, log64 err %g", we, wl)
+	}
+	for _, x := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), 0, 1e-300, 710, -746} {
+		ge, we := exp64(x), math.Exp(x)
+		if !(ge == we || (ge != ge && we != we)) {
+			t.Errorf("exp64(%g) = %g, want %g", x, ge, we)
+		}
+	}
+	for _, x := range []float64{math.NaN(), math.Inf(1), 0, -1, 1} { // not subnormals: amd64's math.Log gets them wrong
+		gl, wl := log64(x), math.Log(x)
+		if !(gl == wl || (gl != gl && wl != wl)) {
+			t.Errorf("log64(%g) = %g, want %g", x, gl, wl)
+		}
+	}
+	t.Logf("exp64 max rel err %.3g, log64 max err %.3g", we, wl)
+}
+
+// TestDetMathGolden: the portable functions give the same bits on every architecture. The checksums were computed on
+// arm64 and match amd64 (GOAMD64 v1 and v3).
+func TestDetMathGolden(t *testing.T) {
+	r := rand.New(rand.NewPCG(3, 5)) // integer-only generator: Float64 is exact, the same everywhere
+	sum := func(f func() uint64, n int) uint64 {
+		var c uint64
+		for i := 0; i < n; i++ {
+			c = c*1099511628211 ^ f()
+		}
+		return c
+	}
+	got := map[string]uint64{
+		"sincos": sum(func() uint64 {
+			s, c := sincos(r.Float64() * 41000)
+			return math.Float64bits(s) ^ math.Float64bits(c)<<1
+		}, 200000),
+		"exp64": sum(func() uint64 { return math.Float64bits(exp64(float64(r.Float64()*1400) - 720)) }, 200000),
+		"log64": sum(func() uint64 { return math.Float64bits(log64(math.Ldexp(r.Float64(), r.IntN(200)-100))) }, 200000),
+		"expf":  sum(func() uint64 { return uint64(math.Float32bits(expf(float32(float64(r.Float64()*180) - 90)))) }, 200000),
+		"rope": sum(func() uint64 {
+			v := []float32{float32(r.Float64()), float32(r.Float64())}
+			rope(v, []float32{float32(r.Float64())}, []float32{float32(r.Float64())})
+			return uint64(math.Float32bits(v[0]))<<32 | uint64(math.Float32bits(v[1]))
+		}, 200000),
+	}
+	for _, k := range []string{"sincos", "exp64", "log64", "expf", "rope"} {
+		w, ok := detMathGolden[k]
+		t.Logf("%-6s %016x", k, got[k])
+		if ok && w != got[k] {
+			t.Errorf("%s: checksum %016x, want %016x (not portable on this CPU)", k, got[k], w)
+		}
+	}
+}
+
+var detMathGolden = map[string]uint64{
+	"sincos": 0xce46a4fc25c8bbfb,
+	"exp64":  0xd0656db02952d589,
+	"log64":  0xeaf7e439eda877dc,
+	"expf":   0x7fa6d21f096245bd,
+	"rope":   0xc478218e3d231971,
 }

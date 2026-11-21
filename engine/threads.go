@@ -75,7 +75,7 @@ func (m *Model) lookupThread(scope, id, dir string, ids []int) (*prefixEntry, in
 		te.seq, te.used = t.seq, time.Now()
 	}
 	t.mu.Unlock()
-	if te == nil && dir != "" {
+	if te == nil && dir != "" && !m.det { // thread files are half precision
 		e, err := m.readThread(m.threadFile(dir, scope, id), scope, id)
 		if err != nil {
 			return nil, 0

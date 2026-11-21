@@ -96,7 +96,7 @@ func expf(x float32) float32 {
 	p = float32(p*r) + 1.6666665459e-1
 	p = float32(p*r) + 5.0000001201e-1
 	p = float32(p*r*r) + r + 1
-	return p * math.Float32frombits(uint32(int32(n)+127)<<23)
+	return float32(p * math.Float32frombits(uint32(int32(n)+127)<<23)) // rounded: callers add to it (1+expf, sums)
 }
 
 // Four-query attention kernels (see forward): scores4 computes
@@ -114,7 +114,7 @@ func scores4Go(q, kT []float32, dstride, nblk int, out []float32, ostride int) {
 		o := out[i*ostride : i*ostride+n]
 		clear(o)
 		for d := 0; d < hd; d++ {
-			axpy(q[i*hd+d], kT[d*dstride:d*dstride+n], o)
+			axpyGo(q[i*hd+d], kT[d*dstride:d*dstride+n], o)
 		}
 	}
 }
@@ -124,7 +124,7 @@ func wsum4Go(p []float32, pstride int, v []float32, vstride, n4 int, out []float
 		o := out[i*ostride : i*ostride+hd]
 		clear(o)
 		for j := 0; j < 4*n4; j++ {
-			axpy(p[i*pstride+j], v[j*vstride:j*vstride+hd], o)
+			axpyGo(p[i*pstride+j], v[j*vstride:j*vstride+hd], o)
 		}
 	}
 }

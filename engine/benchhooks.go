@@ -30,10 +30,10 @@ func (m *Model) teacherForce(prompt, cont []int) (argmax []int, logprob []float6
 		}
 		var sum float64
 		for _, v := range s.logits {
-			sum += math.Exp(float64(v - mx))
+			sum += exp64(float64(v - mx))
 		}
 		argmax = append(argmax, best)
-		logprob = append(logprob, float64(s.logits[tok]-mx)-math.Log(sum))
+		logprob = append(logprob, float64(s.logits[tok]-mx)-log64(sum))
 		m.forward(s, []int{tok}, len(prompt)+i)
 	}
 	return argmax, logprob

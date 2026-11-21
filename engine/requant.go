@@ -13,7 +13,10 @@ import (
 // weight converted to Q8_0 (norms stay F32). It exists for testing and
 // benchmarking the Q8_0 path from a model already on disk; converting from a
 // 4-bit file does not recover the original precision.
-func requantizeQ8_0(in, out string) error {
+func requantizeQ8_0(in, out string) error { return requantize(in, out, false) }
+
+// requantize is requantizeQ8_0; withF32 also converts 2-D F32 weights (tests turn the all-F32 tiny model into Q8_0).
+func requantize(in, out string, withF32 bool) error {
 	g, err := openGGUF(in)
 	if err != nil {
 		return err
@@ -46,7 +49,7 @@ func requantizeQ8_0(in, out string) error {
 		for _, d := range ti.Dims {
 			n *= d
 		}
-		if len(ti.Dims) == 2 && ti.Dims[0]%32 == 0 && typ != typeF32 {
+		if len(ti.Dims) == 2 && ti.Dims[0]%32 == 0 && (typ != typeF32 || withF32) {
 			typ = typeQ8_0
 		}
 		be, bb, ok := blockInfo(typ)

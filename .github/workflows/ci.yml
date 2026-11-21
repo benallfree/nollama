@@ -10,7 +10,7 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -19,6 +19,9 @@ jobs:
           go-version-file: go.mod
       - run: go vet ./...
       - run: go test -race ./...
+      # deterministic mode's golden hashes must also hold where Go fuses multiply-adds on amd64
+      - if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: GOAMD64=v3 go test -run 'TestDeterministic|TestDetMathGolden' ./engine
 
   # every release target builds
   cross:

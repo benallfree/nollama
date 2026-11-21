@@ -39,6 +39,12 @@ type LoadOptions struct {
 	// prompt's text to Respond and returns what it says, as tokens (see respond.go). For tests; the nollamatest
 	// package builds on it.
 	Respond func(prompt string) string
+	// Deterministic makes the logits, and so greedy output, logprobs and seeded sampling, the same bits on every CPU
+	// architecture, thread count, prompt batch size and prompt-cache state. It runs the portable Go kernels in one
+	// fixed order instead of the assembly ones (several times slower to read prompts), and won't continue a
+	// conversation from half-precision state (thread files in a ThreadDir, snapshots saved without Full), and needs
+	// the f32 KV cache.
+	Deterministic bool
 }
 
 // Info describes a loaded model.
@@ -98,6 +104,7 @@ type Model struct {
 	weightBytes int64 // reserved in res for the weights
 	info        Info
 	invFrq      []float64
+	det         bool // LoadOptions.Deterministic
 
 	stateMu sync.Mutex
 	states  []*state // idle generation states (KV caches), reused to avoid GC churn
@@ -271,6 +278,9 @@ func newModel(g *ggufFile, opts LoadOptions) (*Model, error) {
 	var err error
 	if m.kvTyp, err = parseKVCacheType(opts.KVCacheType); err != nil {
 		return nil, err
+	}
+	if opts.Deterministic && m.kvTyp != typeF32 { // the compact caches' attention kernels aren't the portable ones
+		return nil, fmt.Errorf("engine: Deterministic needs the f32 KV cache (KVCacheType %q)", opts.KVCacheType)
 	}
 	req := func(k string) (int, error) {
 		v, ok := g.getInt(arch + "." + k)
@@ -456,6 +466,9 @@ func newModel(g *ggufFile, opts LoadOptions) (*Model, error) {
 		Quant: q, TensorTypes: types, FileSize: g.size, Layers: hp.layers, Embedding: hp.dim,
 		Threads: threads, Kernels: kernelName, Pooling: pooling,
 		KVCacheType: kvTypeName(m.kvTyp),
+	}
+	if opts.Deterministic {
+		m.det, m.info.Kernels = true, "go (deterministic)"
 	}
 	ok = true
 	return m, nil

@@ -113,6 +113,9 @@ func (m *Model) SaveThread(w io.Writer, scope, id string, o SnapshotOptions) err
 	return m.writeSnapshot(w, snapshotThread, []snapEntry{{label: id, e: e}}, o)
 }
 
+// errHalfSnapshot: a deterministic model only continues from exact state.
+var errHalfSnapshot = errors.New("engine: a deterministic model needs a snapshot saved with Full (this one is half precision)")
+
 // LoadThread reads a snapshot SaveThread wrote and keeps it as the state of thread id in scope (they needn't be the
 // ones it was saved under), in memory and, with o.ThreadDir, on disk. The next Generate on that thread whose prompt
 // starts with the saved conversation reads only what's new.
@@ -120,6 +123,9 @@ func (m *Model) LoadThread(r io.Reader, scope, id string, o SnapshotOptions) (Sn
 	info, entries, err := m.readSnapshot(r, snapshotThread)
 	if err != nil {
 		return info, err
+	}
+	if m.det && !info.Full {
+		return info, errHalfSnapshot
 	}
 	if len(entries) != 1 {
 		return info, ErrSnapshotCorrupt
@@ -169,6 +175,9 @@ func (m *Model) LoadPromptCache(r io.Reader, scope, pin string) (SnapshotInfo, i
 	info, entries, err := m.readSnapshot(r, snapshotPromptCache)
 	if err != nil {
 		return info, 0, err
+	}
+	if m.det && !info.Full {
+		return info, 0, errHalfSnapshot
 	}
 	kept := 0
 	for _, se := range entries {

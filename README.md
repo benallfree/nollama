@@ -295,6 +295,22 @@ For one model, `LoadOptions` takes `Threads`, `MaxMemory` and `LowPriority` dire
 `--threads`, `--max-memory 3GB` and `--low-priority` (or `NOLLAMA_THREADS`, `NOLLAMA_MAX_MEMORY`,
 `NOLLAMA_LOW_PRIORITY`).
 
+### The same numbers on every machine
+
+By default the logits depend on the CPU: the arm64 and amd64 assembly kernels sum in different orders, Go fuses
+`x*y+z` into one instruction on arm64 but not on amd64, and a prompt read in batches rounds differently from one read a
+token at a time. The differences are in the last bits, but quantizing activations between layers can grow them to
+about a logit, enough to change a sampled token. Thread count doesn't matter.
+
+`LoadOptions.Deterministic` (or `nollama serve --deterministic`, `NOLLAMA_DETERMINISTIC=1`, `nollama run
+--deterministic`) makes the logits the same bits on arm64 and amd64, at any thread count and prompt batch size, with or
+without a prompt-cache hit. Greedy output, logprobs and seeded sampling follow. Use it when two machines must agree
+exactly, for example a compressor driven by the model's probabilities. It runs the portable Go kernels instead of the
+assembly ones (`Info().Kernels` reports `go (deterministic)`), so it's slower, mostly when reading prompts. It won't
+continue a conversation from half-precision state: thread files in a `ThreadDir` are ignored, and `LoadThread` /
+`LoadPromptCache` need a snapshot saved with `Full`. It needs the default `f32` KV cache. `TestDeterministic` checks the logits against golden hashes, so CI
+on each architecture catches a change that breaks this.
+
 ## Test without a model
 
 The `nollamatest` package lets your tests run in CI with no download. A scripted model answers with a function you
