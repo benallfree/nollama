@@ -1,4 +1,7 @@
-#!/usr/bin/env bash
+# Ask for the list, never $version.info: asking for a version before its tag exists makes the proxy (and
+# sum.golang.org) cache "unknown revision" for about 30 minutes after it is published.
+known=$(curl -s -m 10 "https://proxy.golang.org/$module/@v/list" || true)
+! grep -qx "$version" <<<"$known" ||#!/usr/bin/env bash
 # Cuts a nollama release as a draft on GitHub. Run from a clean checkout of main, in sync with origin:
 #
 #   1. In CHANGELOG.md, rename "## Unreleased" to "## vX.Y.Z" (and add a new empty Unreleased above it); commit, push.
@@ -45,8 +48,10 @@ step "checking the version is unused"
 if git rev-parse -q --verify "refs/tags/$version" >/dev/null; then
   [ "$(git rev-parse "$version^{commit}")" = "$sha" ] || die "tag $version already exists on another commit"
 fi
-code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' "https://proxy.golang.org/$module/@v/$version.info" || true)
-[ "$code" != 200 ] || [ "$(git rev-parse -q --verify "refs/tags/$version^{commit}" || true)" = "$sha" ] ||
+# Ask for the list, never $version.info: asking for a version before its tag exists makes the proxy (and
+# sum.golang.org) cache "unknown revision" for about 30 minutes after it's published.
+known=$(curl -s -m 10 "https://proxy.golang.org/$module/@v/list" || true)
+! grep -qxF "$version" <<<"$known" || [ "$(git rev-parse -q --verify "refs/tags/$version^{commit}" || true)" = "$sha" ] ||
   die "the Go proxy already knows $version; pick the next version"
 
 git rev-parse -q --verify "refs/tags/$version" >/dev/null || git tag -a "$version" -m "nollama $version"
