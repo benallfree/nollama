@@ -146,7 +146,7 @@ func (b *cudaBatch) weightArg(w *weight) cuda.Arg {
 
 func (b *cudaBatch) matmul(w *weight, x, out gpuRef, n int, _ gpuRef) {
 	if n >= matmulTiledMin && w.typ == typeQ8_0 {
-		b.launch("matmul_q8_0_f32", [3]uint32{uint32((w.rows + 31) / 32), uint32((n + 31) / 32), 1}, [3]uint32{256, 1, 1}, 0,
+		b.launch("matmul_q8_0_f32", [3]uint32{uint32((w.rows + 63) / 64), uint32((n + 63) / 64), 1}, [3]uint32{256, 1, 1}, 0,
 			b.weightArg(w), carg(x), carg(out), cuda.Arg{Bytes: u32(uint32(w.rows), uint32(w.cols/32), uint32(w.rowBytes), uint32(w.cols), uint32(n))})
 		return
 	}

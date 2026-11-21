@@ -109,37 +109,43 @@ struct MatmulArgs {
 	uint rows, nb, rowBytes, cols, tokens;
 };
 
-// Tiled Q8_0 matmul for prompt batches: a block computes 32 rows x 32 tokens with 256 threads (32x8); thread
-// (tx, ty) owns rows ty, ty+8, ty+16, ty+24 of token tx. Grid (rows/32, tokens/32). Plain f32 FMA, no tensor cores.
+// Tiled Q8_0 matmul for prompt batches: a block computes 64 rows x 64 tokens with 256 threads (16x16); thread
+// (tx, ty) owns rows ty+16i and tokens tx+16j (i, j < 4), 16 outputs from 8 shared-memory reads per step.
+// Grid (rows/64, tokens/64). Plain f32 FMA, no tensor cores.
 extern "C" __global__ void matmul_q8_0_f32(const uchar *w, const float *x, float *y, MatmulArgs a) {
-	__shared__ float sw[32][33], sx[32][33];
-	uint tx = threadIdx.x % 32, ty = threadIdx.x / 32;
-	uint r0 = blockIdx.x * 32, t0 = blockIdx.y * 32;
-	float acc[4] = {0, 0, 0, 0};
+	__shared__ float sw[32][65], sx[32][65]; // [k][row], [k][token]; 65 keeps the transposing stores conflict-free
+	uint tid = threadIdx.x, tx = tid % 16, ty = tid / 16;
+	uint r0 = blockIdx.x * 64, t0 = blockIdx.y * 64;
+	float acc[4][4] = {};
 	for (uint b = 0; b < a.nb; b++) {
-		for (int i = 0; i < 4; i++) { // 256 threads load 32x32 weights and 32x32 activations
-			uint lr = ty + 8 * i;
-			uint r = r0 + lr, t = t0 + lr;
+		for (uint it = tid; it < 64 * 32; it += 256) { // 64 rows (and tokens) x the block's 32 elements
+			uint l = it / 32, e = it % 32;
+			uint r = r0 + l, t = t0 + l;
 			if (r < a.rows) {
 				const uchar *blk = w + (size_t)r * a.rowBytes + b * 34;
-				sw[lr][tx] = f16(blk) * (float)((const signed char *)(blk + 2))[tx];
+				sw[e][l] = f16(blk) * (float)((const signed char *)(blk + 2))[e];
 			} else {
-				sw[lr][tx] = 0;
+				sw[e][l] = 0;
 			}
-			sx[lr][tx] = t < a.tokens ? x[(size_t)t * a.cols + b * 32 + tx] : 0;
+			sx[e][l] = t < a.tokens ? x[(size_t)t * a.cols + b * 32 + e] : 0;
 		}
 		__syncthreads();
+#pragma unroll 8
 		for (int k = 0; k < 32; k++) {
-			float xv = sx[tx][k];
-			for (int i = 0; i < 4; i++) acc[i] += sw[ty + 8 * i][k] * xv;
+			float wv[4], xv[4];
+			for (int i = 0; i < 4; i++) wv[i] = sw[k][ty + 16 * i];
+			for (int j = 0; j < 4; j++) xv[j] = sx[k][tx + 16 * j];
+			for (int i = 0; i < 4; i++)
+				for (int j = 0; j < 4; j++) acc[i][j] += wv[i] * xv[j];
 		}
 		__syncthreads();
 	}
-	uint t = t0 + tx;
-	if (t < a.tokens) {
+	for (int j = 0; j < 4; j++) {
+		uint t = t0 + tx + 16 * j;
+		if (t >= a.tokens) continue;
 		for (int i = 0; i < 4; i++) {
-			uint r = r0 + ty + 8 * i;
-			if (r < a.rows) y[(size_t)t * a.rows + r] = acc[i];
+			uint r = r0 + ty + 16 * i;
+			if (r < a.rows) y[(size_t)t * a.rows + r] = acc[i][j];
 		}
 	}
 }
