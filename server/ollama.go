@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"time"
@@ -487,15 +488,24 @@ func (s *Server) ps(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	if l := s.cur; l != nil {
 		info := l.m.Info()
-		exp := ""
-		if !l.expires.IsZero() {
-			exp = l.expires.UTC().Format(time.RFC3339Nano)
-		}
-		out = append(out, running{Name: l.name, Model: l.name, Size: info.FileSize, Digest: l.src.SHA256, ExpiresAt: exp,
-			Details: detailsOf(l.name, info)})
+		out = append(out, running{Name: l.name, Model: l.name, Size: info.FileSize, Digest: l.src.SHA256,
+			ExpiresAt: s.expiresAt(l).UTC().Format(time.RFC3339Nano),
+			Details:   detailsOf(l.name, info)})
 	}
 	s.mu.Unlock()
 	writeJSON(w, 200, map[string]any{"models": out})
+}
+
+// expiresAt is when l unloads if no request comes: its timer when idle; for a model kept forever (or answering, with a
+// negative default), Ollama's far-future time, since clients parse the field as a time. Called with s.mu held.
+func (s *Server) expiresAt(l *loaded) time.Time {
+	switch {
+	case !l.expires.IsZero():
+		return l.expires
+	case l.active > 0 && s.cfg.KeepAlive >= 0:
+		return time.Now().Add(s.cfg.KeepAlive)
+	}
+	return time.Now().Add(math.MaxInt64)
 }
 
 func detailsOf(name string, info engine.Info) ollamaDetails {

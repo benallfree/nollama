@@ -39,9 +39,12 @@ type Config struct {
 	KVCacheType string        // the KV cache's format: "f32" (default), "f16", "q8_0" or "q4_0" (engine.KVCacheTypes)
 	GPU         string        // engine.LoadOptions.GPU: "" or "auto" uses a GPU when one works, "off" the CPU only
 	Parallel    int           // answers written at once (default 1); the rest wait their turn
-	KeepAlive   time.Duration // how long an idle model stays loaded (default 5m; negative: forever)
-	NumCtx      int           // context window when a request doesn't set num_ctx (default 4096, capped at the model's)
-	Truncate    bool          // chats that don't fit drop their oldest messages unless the request sends "truncate": false (default: a 400)
+	KeepAlive   time.Duration // how long an idle model stays loaded (0: 5m; negative: forever)
+	// UnloadWhenIdle unloads the model as soon as its last answer finishes, like Ollama's keep_alive 0 (a zero
+	// KeepAlive means the default instead). Reloading costs tens of milliseconds, but the prompt cache goes with it.
+	UnloadWhenIdle bool
+	NumCtx         int  // context window when a request doesn't set num_ctx (default 4096, capped at the model's)
+	Truncate       bool // chats that don't fit drop their oldest messages unless the request sends "truncate": false (default: a 400)
 	// Draft names a small model with the same tokenizer (qwen3-0.6b for the larger Qwen3s) loaded beside each model to
 	// guess tokens for it to check (speculative decoding), with the same distribution. Experimental: slower on the CPU
 	// engine today. "": off. It is skipped for the draft model itself, when it isn't downloaded, or when its tokenizer
@@ -107,7 +110,10 @@ func New(cfg Config) *Server {
 	if cfg.Parallel <= 0 {
 		cfg.Parallel = 1
 	}
-	if cfg.KeepAlive == 0 {
+	switch {
+	case cfg.UnloadWhenIdle:
+		cfg.KeepAlive = 0
+	case cfg.KeepAlive == 0:
 		cfg.KeepAlive = 5 * time.Minute
 	}
 	if cfg.NumCtx <= 0 {
@@ -316,6 +322,7 @@ func (s *Server) hold(l *loaded) {
 		l.timer = nil
 	}
 	l.expires = time.Time{}
+	l.drop = false // the newest request's keep_alive wins
 }
 
 // release ends a use of l; once nothing uses it, it stays loaded for keepAlive (nil: the server's default).
@@ -328,7 +335,13 @@ func (s *Server) release(l *loaded, keepAlive *time.Duration) {
 	defer s.mu.Unlock()
 	l.active--
 	l.refs.Done()
-	if l.active > 0 || s.cur != l {
+	if s.cur != l {
+		return
+	}
+	if l.active > 0 {
+		if ka == 0 {
+			l.drop = true // keep_alive 0 while other answers run: unload once they finish
+		}
 		return
 	}
 	if l.drop {

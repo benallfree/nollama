@@ -100,6 +100,14 @@ func modelsDir() string {
 	return models.DefaultDir()
 }
 
+// parseKeepAlive reads a keep-alive the way Ollama's OLLAMA_KEEP_ALIVE does: seconds ("300", "-1") or a duration ("5m").
+func parseKeepAlive(v string) (time.Duration, error) {
+	if f, err := strconv.ParseFloat(v, 64); err == nil {
+		return time.Duration(f * float64(time.Second)), nil
+	}
+	return time.ParseDuration(v)
+}
+
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := os.Getenv("NOLLAMA_HOST")
@@ -112,7 +120,15 @@ func cmdServe(args []string) error {
 	lowPrio := fs.Bool("low-priority", envBool("NOLLAMA_LOW_PRIORITY"), "run the engine's threads at a lower OS priority, so other programs win the CPU")
 	det := fs.Bool("deterministic", envBool("NOLLAMA_DETERMINISTIC"), "the same logits, bit for bit, on any CPU, thread count and batch size (portable kernels, slower)")
 	parallel := fs.Int("parallel", 1, "answers written at once; the rest wait their turn")
-	keepAlive := fs.Duration("keep-alive", 5*time.Minute, "how long an idle model stays loaded (negative: forever)")
+	ka := 5 * time.Minute
+	if v := os.Getenv("NOLLAMA_KEEP_ALIVE"); v != "" {
+		d, err := parseKeepAlive(v)
+		if err != nil {
+			return fmt.Errorf("NOLLAMA_KEEP_ALIVE: %w", err)
+		}
+		ka = d
+	}
+	keepAlive := fs.Duration("keep-alive", ka, "how long an idle model stays loaded (0: unload once answered; negative: forever)")
 	numCtx := fs.Int("num-ctx", 4096, "context window when a request doesn't set num_ctx")
 	truncate := fs.Bool("truncate", false, "drop a chat's oldest messages when it doesn't fit the context window, instead of answering 400 (requests can still send \"truncate\": false)")
 	cacheMB := fs.Int("prompt-cache-mb", 256, "memory for reusing the start of recent prompts (0: off)")
@@ -148,7 +164,7 @@ func cmdServe(args []string) error {
 		Models: list(*allow), AllowPaths: *allowPaths, AllowedOrigins: list(*origins), AllowedHosts: list(*hosts),
 		MaxBodyBytes: int64(*maxBodyMB) << 20, MaxTokens: *maxTokens, MaxNumCtx: *maxNumCtx, PerClient: *perClient,
 		MaxMemory: memLimit, LowPriority: *lowPrio, KVCacheType: *kvType, Deterministic: *det, GPU: *gpu,
-		Draft: *draft, DraftTokens: *draftTokens}
+		Draft: *draft, DraftTokens: *draftTokens, UnloadWhenIdle: *keepAlive == 0}
 	if err := checkKVCacheType(*kvType); err != nil {
 		return err
 	}

@@ -30,6 +30,10 @@ becomes `## vX.Y.Z` and its lines are the release notes (`release.sh` reads them
 - Speculative decoding (experimental: on the CPU engine today it makes answers slower, so it is off unless you ask for it): `nollama serve --draft qwen3-0.6b` (or `NOLLAMA_DRAFT`, `nollama run --draft`) loads a small model beside the one answering to guess a few tokens at a time, which the larger model checks in one pass. With temperature 0 the answer is exactly the one you'd get without it, and with sampling it follows the same distribution. `draft_tokens` in a request's options (0: off) and `--draft-tokens` set how many tokens it guesses. In Go: `engine.GenerateOptions.Draft` and `engine.CheckDraft`.
 
 - Faster prompt reading on ARM64: Q4_K and F16 weights are multiplied two rows at a time against four prompt tokens (F16 as two pairs), Q6_K one row against four, with activations laid out so sub-block scales apply once per 64 weights. On an M1 Max the kernels run 1.37x (Q4_K), 1.16x (Q6_K) and 1.17x (F16) faster than the 4-column ones on one core. They follow the same reference order as every other kernel, so logits are bit for bit unchanged. `AGENT_ENGINE_NOGEMM=1` turns them off. x86-64 is unchanged.
+- `nollama serve --keep-alive 0` (and `server.Config{UnloadWhenIdle: true}`) unloads the model as soon as its last answer finishes. Before, 0 quietly meant the 5-minute default.
+- `NOLLAMA_KEEP_ALIVE` sets the server's keep-alive, in the same formats as Ollama's `OLLAMA_KEEP_ALIVE` (`300`, `5m`, `-1`).
+- A request with `keep_alive: 0` that finishes while other answers are still being written now unloads the model once they finish, instead of being ignored.
+- `/api/ps` always reports `expires_at` as a time (far in the future for a model kept loaded forever), never `""`, which Ollama's own client can't parse.
 
 ## v0.0.1-alpha.1
 
