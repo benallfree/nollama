@@ -242,3 +242,43 @@ func TestGPUForwardDiscrete(t *testing.T) {
 		t.Errorf("caches differ by %.2e", kd)
 	}
 }
+
+// TestGPUSplitAttention decodes over a long context with split attention and with the one-pass kernel.
+func TestGPUSplitAttention(t *testing.T) {
+	m, err := Load(testGGUF(t), LoadOptions{GPU: "off"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	g, err := newGPUModel(m)
+	if err != nil {
+		t.Skip(err)
+	}
+	defer g.close()
+	prompt := make([]int, 600)
+	for i := range prompt {
+		prompt[i] = 1000 + i*7%5000
+	}
+	decode := func(off bool) []float32 {
+		attnSplitOff = off
+		defer func() { attnSplitOff = false }()
+		s := m.newState(1024, 600)
+		for _, f := range []func() error{
+			func() error { return g.forward(s, prompt, 0) },
+			func() error { return g.forward(s, []int{42}, len(prompt)) },
+			func() error { return g.forward(s, []int{43, 44, 45}, len(prompt)+1) }, // a short batch, as speculative decoding sends
+		} {
+			if err := f(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		g.forget(s)
+		return append([]float32(nil), s.logits...)
+	}
+	split, one := decode(false), decode(true)
+	d := logitDiff(split, one)
+	t.Logf("split vs one-pass attention: logits differ by %.1e of their spread", d)
+	if d > 1e-4 {
+		t.Fatalf("split attention is off by %.1e", d)
+	}
+}

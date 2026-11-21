@@ -328,10 +328,20 @@ func TestGPUElementwise(t *testing.T) {
 
 // TestGPUAttention checks attention over the f32 cache against a float64 reference, with and without a
 // packed-sequence mask, for a batch of tokens appended after earlier positions (GQA: 16 query heads on 8 KV heads).
+// The second case is a short batch over a long context, which runs split attention.
 func TestGPUAttention(t *testing.T) {
 	b := testBackend(t)
+	for _, c := range []struct{ pos, n int }{{37, 5}, {700, 3}} {
+		t.Run(fmt.Sprintf("pos=%d,n=%d", c.pos, c.n), func(t *testing.T) { testGPUAttention(t, b, c.pos, c.n) })
+	}
+}
+
+func testGPUAttention(t *testing.T, b gpuBackend, pos, n int) {
 	r := rand.New(rand.NewPCG(11, 12))
-	const heads, kvHeads, hd, pos, n = 16, 8, 128, 37, 5
+	const heads, kvHeads, hd = 16, 8, 128
+	split := gpuAttention{n: n, pos: pos, headDim: hd, ctxP: (pos + n + 15) &^ 15}
+	_, splits, ok := split.split()
+	t.Logf("split attention: %v (%d splits)", ok, splits)
 	ctxP := (pos + n + 15) &^ 15
 	kvd := kvHeads * hd
 	q := randFloats(r, n*heads*hd)
@@ -347,7 +357,7 @@ func TestGPUAttention(t *testing.T) {
 			for tk := 2; tk < n; tk++ {
 				lo[tk], hi[tk] = 10, pos+2
 				binary.LittleEndian.PutUint32(mask[8*tk:], 10)
-				binary.LittleEndian.PutUint32(mask[8*tk+4:], pos+2)
+				binary.LittleEndian.PutUint32(mask[8*tk+4:], uint32(pos+2))
 			}
 		}
 		mb := zeros(t, b, 2*n)

@@ -264,3 +264,96 @@ extern "C" __global__ void copy_f32(float *dst, const float *src, uint n) {
 	uint i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i < n) dst[i] = src[i];
 }
+
+// Split attention for a few tokens over a long context; see attention_split_f32 in gpu.metal. Grid (heads, tokens,
+// splits), 256 threads; dynamic shared memory headDim + chunk + 8*headDim floats.
+struct AttnSplitArgs {
+	uint heads, kvHeads, headDim, ctxP, pos;
+	float scale;
+	uint chunk, splits;
+};
+
+extern "C" __global__ void attention_split_f32(const float *q, const float *kT, const float *v, float *part,
+                                               const uint2 *mask, AttnSplitArgs a) {
+	extern __shared__ float shm[];
+	__shared__ float red[32];
+	uint h = blockIdx.x, t = blockIdx.y, sp = blockIdx.z, tid = threadIdx.x, nt = blockDim.x;
+	uint lane = tid % 32, sg = tid / 32, nsg = nt / 32;
+	uint hd = a.headDim, kvh = h / (a.heads / a.kvHeads), kvd = a.kvHeads * hd;
+	uint ctx = a.pos + t + 1, c0 = sp * a.chunk, c1 = min(ctx, c0 + a.chunk);
+	uint2 m = mask[t];
+	float *P = part + (((size_t)t * a.heads + h) * a.splits + sp) * (hd + 2);
+	float *qs = shm, *ss = shm + hd, *vr = shm + hd + a.chunk;
+	if (c0 >= ctx) {
+		for (uint d = tid; d < hd + 2; d += nt) P[d] = d == 0 ? -INFINITY : 0;
+		return;
+	}
+	const float *qh = q + ((size_t)t * a.heads + h) * hd;
+	for (uint d = tid; d < hd; d += nt) qs[d] = qh[d];
+	__syncthreads();
+
+	const float *kh = kT + (size_t)kvh * hd * a.ctxP;
+	float mx = -INFINITY;
+	for (uint j = c0 + tid; j < c1; j += nt) {
+		float x = -INFINITY;
+		if (j < m.x || j >= m.y) {
+			x = 0;
+			for (uint d = 0; d < hd; d++) x += qs[d] * kh[(size_t)d * a.ctxP + j];
+			x *= a.scale;
+		}
+		ss[j - c0] = x;
+		mx = fmaxf(mx, x);
+	}
+	mx = block_max(mx, red);
+	if (mx == -INFINITY) {
+		for (uint d = tid; d < hd + 2; d += nt) P[d] = d == 0 ? -INFINITY : 0;
+		return;
+	}
+	__syncthreads(); // ss is complete
+	float sum = 0;
+	for (uint j = c0 + tid; j < c1; j += nt) {
+		float e = __expf(ss[j - c0] - mx);
+		ss[j - c0] = e;
+		sum += e;
+	}
+	sum = block_sum(sum, red);
+	__syncthreads();
+
+	float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0}; // headDim <= 256
+	const float *vh = v + kvh * hd;
+	for (uint j = c0 + sg; j < c1; j += nsg) {
+		float w = ss[j - c0];
+		const float *row = vh + (size_t)j * kvd;
+		for (uint i = 0, d = lane; d < hd; i++, d += 32) acc[i] += w * row[d];
+	}
+	for (uint i = 0, d = lane; d < hd; i++, d += 32) vr[sg * hd + d] = acc[i];
+	__syncthreads();
+	for (uint d = tid; d < hd; d += nt) {
+		float o = 0;
+		for (uint i = 0; i < nsg; i++) o += vr[i * hd + d];
+		P[2 + d] = o;
+	}
+	if (tid == 0) {
+		P[0] = mx;
+		P[1] = sum;
+	}
+}
+
+// Grid (heads, tokens), headDim threads (rounded up to 32).
+extern "C" __global__ void attention_combine_f32(const float *part, float *out, AttnSplitArgs a) {
+	uint h = blockIdx.x, t = blockIdx.y, hd = a.headDim, tid = threadIdx.x;
+	if (tid >= hd) return;
+	const float *P = part + ((size_t)t * a.heads + h) * a.splits * (hd + 2);
+	float M = -INFINITY;
+	for (uint s = 0; s < a.splits; s++) M = fmaxf(M, P[s * (hd + 2)]);
+	float num = 0, den = 0;
+	for (uint s = 0; s < a.splits; s++) {
+		const float *p = P + s * (hd + 2);
+		if (p[0] != -INFINITY) {
+			float w = __expf(p[0] - M);
+			den += w * p[1];
+			num += w * p[2 + tid];
+		}
+	}
+	out[((size_t)t * a.heads + h) * hd + tid] = num / den;
+}

@@ -17,7 +17,8 @@ import (
 var cudaPTX string
 
 var cudaKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "matmul_q8_0_f32", "rmsnorm_f32", "rope_neox_f32",
-	"swiglu_f32", "add_f32", "copy_f32", "kv_store_f32", "attention_f32"}
+	"swiglu_f32", "add_f32", "copy_f32", "kv_store_f32", "attention_f32",
+	"attention_split_f32", "attention_combine_f32"}
 
 // cudaBackend is the gpuBackend for NVIDIA GPUs, through the driver API (no toolkit needed).
 type cudaBackend struct {
@@ -192,8 +193,17 @@ func (b *cudaBatch) attention(a gpuAttention) {
 		panic(fmt.Sprintf("cuda: attention over a %s cache isn't supported", kvTypeName(a.kvType)))
 	}
 	const nt = 256
+	if chunk, splits, ok := a.split(); ok {
+		args := cuda.Arg{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos),
+			a.scale(), uint32(chunk), uint32(splits))}
+		b.launch("attention_split_f32", [3]uint32{uint32(a.heads), uint32(a.n), uint32(splits)}, [3]uint32{nt, 1, 1},
+			4*(a.headDim+chunk+nt/32*a.headDim), carg(a.q), carg(a.k), carg(a.v), carg(a.scratch), carg(a.mask), args)
+		b.launch("attention_combine_f32", [3]uint32{uint32(a.heads), uint32(a.n), 1},
+			[3]uint32{uint32((a.headDim + 31) &^ 31), 1, 1}, 0, carg(a.scratch), carg(a.out), args)
+		return
+	}
 	b.launch("attention_f32", [3]uint32{uint32(a.heads), uint32(a.n), 1}, [3]uint32{nt, 1, 1}, 4*(a.headDim+nt),
 		carg(a.q), carg(a.k), carg(a.v), carg(a.out), carg(a.scratch), carg(a.mask),
 		cuda.Arg{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos),
-			math.Float32bits(float32(1/math.Sqrt(float64(a.headDim)))))})
+			a.scale())})
 }

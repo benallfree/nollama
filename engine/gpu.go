@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -17,7 +18,7 @@ import (
 //   - the f32 KV cache keeps the CPU's layout (keys [kvHeads][headDim][ctxP], values [ctxP][kvHeads*headDim]),
 //     so prompt caching and threads work unchanged.
 //
-// Experimental: nothing in forward uses it yet.
+// gpuModel (gpu_forward.go) runs the forward pass on it.
 type gpuBackend interface {
 	name() string // "metal (Apple M1 Max)"
 	unified() bool
@@ -113,4 +114,36 @@ func u32(vs ...uint32) []byte {
 		binary.LittleEndian.PutUint32(b[4*i:], v)
 	}
 	return b
+}
+
+// Split attention ("flash decoding"): one token attending to a long context is a few threadgroups doing long
+// serial loops, so batches of up to attnSplitTokens tokens split the context into chunks that run in
+// parallel, then merge the chunks' partial results. The partials go in the scratch buffer.
+const (
+	attnSplitTokens = 8
+	attnSplitChunk  = 256 // positions per chunk, one per thread
+)
+
+var attnSplitOff = false // tests compare against the one-pass kernel
+
+// split returns the chunk size and count for split attention, or ok false for the one-pass kernel.
+func (a gpuAttention) split() (chunk, splits int, ok bool) {
+	if a.n > attnSplitTokens || a.headDim > 256 || attnSplitOff {
+		return 0, 0, false
+	}
+	ctx := a.pos + a.n
+	for chunk = attnSplitChunk; chunk <= 2048; chunk *= 2 {
+		splits = (ctx + chunk - 1) / chunk
+		if splits < 2 {
+			break
+		}
+		if splits*(a.headDim+2) <= a.ctxP { // partials fit in the scratch (n*heads*ctxP floats)
+			return chunk, splits, true
+		}
+	}
+	return 0, 0, false
+}
+
+func (a gpuAttention) scale() uint32 {
+	return math.Float32bits(float32(1 / math.Sqrt(float64(a.headDim))))
 }

@@ -413,3 +413,153 @@ kernel void copy_f32(device float *dst [[buffer(0)]],
 		dst[i] = src[i];
 	}
 }
+
+// attention_split_f32 is attention for a few tokens over a long context ("flash decoding"): threadgroup
+// (head, token, split) covers positions [split*chunk, split*chunk+chunk) and writes a partial result,
+// part[((t*heads + h)*splits + split)*(headDim+2)] = {max score, sum of exp, unnormalized output[headDim]}.
+// attention_combine_f32 merges the splits. Threadgroup memory: headDim + chunk + simdgroups*headDim floats.
+struct AttnSplitArgs {
+	uint heads;
+	uint kvHeads;
+	uint headDim;
+	uint ctxP;
+	uint pos;
+	float scale;
+	uint chunk;
+	uint splits;
+};
+
+kernel void attention_split_f32(device const float *q [[buffer(0)]],
+                                device const float *kT [[buffer(1)]],
+                                device const float *v [[buffer(2)]],
+                                device float *part [[buffer(3)]],
+                                device const uint2 *mask [[buffer(4)]],
+                                constant AttnSplitArgs &a [[buffer(5)]],
+                                threadgroup float *shm [[threadgroup(0)]],
+                                uint3 tg [[threadgroup_position_in_grid]],
+                                uint tid [[thread_index_in_threadgroup]],
+                                uint3 ntg [[threads_per_threadgroup]],
+                                uint sg [[simdgroup_index_in_threadgroup]],
+                                uint nsg [[simdgroups_per_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+	uint nt = ntg.x;
+	uint h = tg.x, t = tg.y, sp = tg.z;
+	uint hd = a.headDim, kvh = h / (a.heads / a.kvHeads), kvd = a.kvHeads * hd;
+	uint ctx = a.pos + t + 1, c0 = sp * a.chunk, c1 = min(ctx, c0 + a.chunk);
+	uint2 m = mask[t];
+	device float *P = part + (((ulong)t * a.heads + h) * a.splits + sp) * (hd + 2);
+	threadgroup float *qs = shm, *ss = shm + hd, *red = shm + hd + a.chunk;
+	if (c0 >= ctx) { // past this token's context
+		for (uint d = tid; d < hd + 2; d += nt) {
+			P[d] = d == 0 ? -INFINITY : 0;
+		}
+		return;
+	}
+	device const float *qh = q + ((ulong)t * a.heads + h) * hd;
+	for (uint d = tid; d < hd; d += nt) {
+		qs[d] = qh[d];
+	}
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+
+	device const float *kh = kT + (ulong)kvh * hd * a.ctxP;
+	float mx = -INFINITY;
+	for (uint j = c0 + tid; j < c1; j += nt) {
+		float x = -INFINITY;
+		if (j < m.x || j >= m.y) {
+			x = 0;
+			for (uint d = 0; d < hd; d++) {
+				x += qs[d] * kh[(ulong)d * a.ctxP + j];
+			}
+			x *= a.scale;
+		}
+		ss[j - c0] = x;
+		mx = max(mx, x);
+	}
+	mx = simd_max(mx);
+	if (lane == 0) {
+		red[sg] = mx;
+	}
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+	mx = red[0];
+	for (uint i = 1; i < nsg; i++) {
+		mx = max(mx, red[i]);
+	}
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+	if (mx == -INFINITY) { // every position here is masked
+		for (uint d = tid; d < hd + 2; d += nt) {
+			P[d] = d == 0 ? -INFINITY : 0;
+		}
+		return;
+	}
+	float sum = 0;
+	for (uint j = c0 + tid; j < c1; j += nt) {
+		float e = exp(ss[j - c0] - mx);
+		ss[j - c0] = e;
+		sum += e;
+	}
+	sum = simd_sum(sum);
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+	if (lane == 0) {
+		red[sg] = sum;
+	}
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+	sum = 0;
+	for (uint i = 0; i < nsg; i++) {
+		sum += red[i];
+	}
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+
+	// values: simdgroup sg sums positions c0+sg, c0+sg+nsg, ...; lane covers channels lane, lane+32, ...
+	float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0}; // headDim <= 256
+	device const float *vh = v + kvh * hd;
+	for (uint j = c0 + sg; j < c1; j += nsg) {
+		float w = ss[j - c0];
+		device const float *vr = vh + (ulong)j * kvd;
+		for (uint i = 0, d = lane; d < hd; i++, d += 32) {
+			acc[i] += w * vr[d];
+		}
+	}
+	for (uint i = 0, d = lane; d < hd; i++, d += 32) {
+		red[sg * hd + d] = acc[i];
+	}
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+	for (uint d = tid; d < hd; d += nt) {
+		float o = 0;
+		for (uint i = 0; i < nsg; i++) {
+			o += red[i * hd + d];
+		}
+		P[2 + d] = o;
+	}
+	if (tid == 0) {
+		P[0] = mx;
+		P[1] = sum;
+	}
+}
+
+// attention_combine_f32 merges attention_split_f32's partial results; one threadgroup (headDim threads) per
+// (head, token).
+kernel void attention_combine_f32(device const float *part [[buffer(0)]],
+                                  device float *out [[buffer(1)]],
+                                  constant AttnSplitArgs &a [[buffer(2)]],
+                                  uint2 tg [[threadgroup_position_in_grid]],
+                                  uint tid [[thread_index_in_threadgroup]]) {
+	uint h = tg.x, t = tg.y, hd = a.headDim;
+	if (tid >= hd) {
+		return;
+	}
+	device const float *P = part + ((ulong)t * a.heads + h) * a.splits * (hd + 2);
+	float M = -INFINITY;
+	for (uint s = 0; s < a.splits; s++) {
+		M = max(M, P[s * (hd + 2)]);
+	}
+	float num = 0, den = 0;
+	for (uint s = 0; s < a.splits; s++) {
+		device const float *p = P + s * (hd + 2);
+		if (p[0] != -INFINITY) {
+			float w = exp(p[0] - M);
+			den += w * p[1];
+			num += w * p[2 + tid];
+		}
+	}
+	out[((ulong)t * a.heads + h) * hd + tid] = num / den;
+}

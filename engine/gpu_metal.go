@@ -14,7 +14,7 @@ import (
 var metalSource string
 
 // metalKernels are the kernels metalSource defines.
-var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "attention_f32", "kv_store_f32", "copy_f32"}
+var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "attention_f32", "attention_split_f32", "attention_combine_f32", "kv_store_f32", "copy_f32"}
 
 // metalBackend is the gpuBackend for Apple GPUs (unified memory only).
 type metalBackend struct {
@@ -198,11 +198,27 @@ func (b *metalBatch) attention(a gpuAttention) {
 		panic(fmt.Sprintf("metal: attention over a %s cache isn't supported", kvTypeName(a.kvType)))
 	}
 	const nt = 256
+	if chunk, splits, ok := a.split(); ok {
+		args := metal.Arg{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos),
+			a.scale(), uint32(chunk), uint32(splits))}
+		b.ds = append(b.ds, metal.Dispatch{
+			P:       b.m.ps["attention_split_f32"],
+			Args:    []metal.Arg{marg(a.q), marg(a.k), marg(a.v), marg(a.scratch), marg(a.mask), args},
+			Groups:  metal.Size{W: uint(a.heads), H: uint(a.n), D: uint(splits)},
+			Threads: metal.Size{W: nt, H: 1, D: 1},
+			Shared:  4 * (a.headDim + chunk + nt/32*a.headDim),
+		}, metal.Dispatch{
+			P:       b.m.ps["attention_combine_f32"],
+			Args:    []metal.Arg{marg(a.scratch), marg(a.out), args},
+			Groups:  metal.Size{W: uint(a.heads), H: uint(a.n), D: 1},
+			Threads: metal.Size{W: uint((a.headDim + 31) &^ 31), H: 1, D: 1},
+		})
+		return
+	}
 	b.ds = append(b.ds, metal.Dispatch{
 		P: b.m.ps["attention_f32"],
 		Args: []metal.Arg{marg(a.q), marg(a.k), marg(a.v), marg(a.out), marg(a.scratch), marg(a.mask),
-			{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos),
-				math.Float32bits(float32(1/math.Sqrt(float64(a.headDim)))))}},
+			{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos), a.scale())}},
 		Groups:  metal.Size{W: uint(a.heads), H: uint(a.n), D: 1},
 		Threads: metal.Size{W: nt, H: 1, D: 1},
 		Shared:  4 * (a.headDim + nt),
