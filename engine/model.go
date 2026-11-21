@@ -43,6 +43,9 @@ type Info struct {
 	Embedding     int
 	Threads       int
 	Kernels       string
+	// Pooling is how the model's GGUF says to make one embedding from a text's hidden states: "last" for an
+	// embedding model such as Qwen3-Embedding, "" when it doesn't say (a chat model; Embed still uses the last token).
+	Pooling string
 }
 
 type weight struct {
@@ -89,6 +92,9 @@ type Model struct {
 	id          string      // in thread files
 	fingerprint [32]byte    // of the GGUF file, in snapshots (snapshot.go)
 	respond     func(prompt string) string
+
+	addEOS bool // the tokenizer appends EOS to a text it embeds (tokenizer.ggml.add_eos_token)
+	eosID  int  // tokenizer.ggml.eos_token_id, or -1
 }
 
 // getState returns an idle state with room for maxCtx positions and batches of maxN.
@@ -310,6 +316,23 @@ func newModel(g *ggufFile, opts LoadOptions) (*Model, error) {
 		params += n
 		types[typeName(ti.Type)]++
 	}
+	pooling := ""
+	if v, ok := g.getInt(arch + ".pooling_type"); ok {
+		switch v {
+		case 0: // none
+		case 3:
+			pooling = "last"
+		default:
+			return nil, fmt.Errorf("engine: pooling type %d not supported (want last-token pooling)", v)
+		}
+	}
+	m.eosID = -1
+	if v, ok := g.getInt("tokenizer.ggml.eos_token_id"); ok && v >= 0 && v < hp.vocab {
+		m.eosID = v
+	}
+	if v, ok := g.KV["tokenizer.ggml.add_eos_token"].(bool); ok {
+		m.addEOS = v && m.eosID >= 0
+	}
 	ft, _ := g.getInt("general.file_type")
 	q := fileTypeNames[ft]
 	if q == "" {
@@ -318,7 +341,7 @@ func newModel(g *ggufFile, opts LoadOptions) (*Model, error) {
 	m.info = Info{
 		Arch: arch, Name: g.getString("general.name"), Params: params, ContextLength: hp.ctx,
 		Quant: q, TensorTypes: types, FileSize: g.size, Layers: hp.layers, Embedding: hp.dim,
-		Threads: threads, Kernels: kernelName,
+		Threads: threads, Kernels: kernelName, Pooling: pooling,
 	}
 	return m, nil
 }
@@ -338,6 +361,9 @@ func (m *Model) Info() Info { return m.info }
 
 // Tokenize converts raw text (special tokens recognized) into token ids.
 func (m *Model) Tokenize(s string) []int { return m.tok.encode(s) }
+
+// VocabSize is the number of token ids the model knows.
+func (m *Model) VocabSize() int { return m.hp.vocab }
 
 // Detokenize converts token ids back to text.
 func (m *Model) Detokenize(ids []int) string {

@@ -219,6 +219,7 @@ type state struct {
 	scores       [][]float32 // per worker
 	cos, sin     []float32   // maxN * headDim/2
 	lastAct      *acts
+	hidden       []float32 // when set (Embed), forward stores the last token's normed hidden state here and skips the LM head
 }
 
 func (m *Model) newState(maxCtx, maxN int) *state {
@@ -415,6 +416,10 @@ func (m *Model) forward(s *state, tokens []int, pos int) {
 		s.x[i] += s.tmp[i]
 	}
 
+	if s.hidden != nil { // embeddings: the final hidden state, no logits
+		rmsnorm(s.hidden, s.x[(n-1)*dim:n*dim], m.norm, hp.eps)
+		return
+	}
 	la := s.lastAct
 	la.n = 1
 	rmsnorm(la.f, s.x[(n-1)*dim:n*dim], m.norm, hp.eps)

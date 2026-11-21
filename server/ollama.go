@@ -404,12 +404,16 @@ func (s *Server) show(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.release(l, nil)
 	info := l.m.Info()
+	caps := []string{"completion"}
+	if info.Pooling != "" { // an embedding model, as Ollama reports one
+		caps = []string{"embedding"}
+	}
 	writeJSON(w, 200, map[string]any{
 		"modelfile":    "",
 		"parameters":   "",
 		"template":     "",
 		"details":      detailsOf(l.name, info),
-		"capabilities": []string{"completion"},
+		"capabilities": caps,
 		"model_info": map[string]any{
 			"general.architecture":          info.Arch,
 			"general.basename":              info.Name,

@@ -9,7 +9,7 @@ nothing else: no Ollama, no Python, no cgo.
 
 > nollama is alpha. Today it runs Qwen3 models on the CPU, with hand-tuned assembly for ARM64 and x86-64: good for small
 > models doing short, focused jobs, such as labeling a ticket, pulling JSON out of an email or summarizing a record.
-> GPU support, more model families, tool calls, images and embeddings aren't there yet.
+> It also makes embeddings, with Qwen3-Embedding. GPU support, more model families, tool calls and images aren't there yet.
 
 ## Install
 
@@ -74,6 +74,20 @@ r = client.chat.completions.create(model="qwen3-1.7b", messages=[{"role": "user"
 print(r.choices[0].message.content)
 ```
 
+Embeddings, for search and similarity (Ollama's `/api/embed` and OpenAI's `/v1/embeddings`; pull the model first with
+`nollama pull qwen3-embedding-0.6b`):
+
+```bash
+curl http://127.0.0.1:11434/api/embed -d '{
+  "model": "qwen3-embedding:0.6b",
+  "input": ["The capital of China is Beijing.", "Gravity is a force that attracts two bodies towards each other."]
+}'
+```
+
+Vectors are unit length, so a dot product is the cosine similarity. For retrieval, Qwen3-Embedding wants an instruction
+on queries (not on documents): `Instruct: Given a web search query, retrieve relevant passages that answer the
+query\nQuery:<the query>`. `dimensions` keeps the first n values (32 to 1024).
+
 Other commands: `nollama pull <model>`, `nollama list`, `nollama rm <model>`. `nollama serve --help` lists the server's
 flags (threads, answers at once, how long an idle model stays loaded, context window). `NOLLAMA_HOST` sets the address
 and `NOLLAMA_MODELS` the models folder.
@@ -108,6 +122,14 @@ label, _ := schema.Compile([]byte(`{"type":"object","properties":{"label":{"enum
 res, _ := m.Generate(ctx, m.ChatPrompt([]engine.Message{{Role: "user", Content: "I was charged twice."}}),
 	engine.GenerateOptions{MaxTokens: 30, Constraint: label.Fit}, nil)
 fmt.Println(res.Text) // {"label": "billing"}
+```
+
+Embeddings work the same way, with an embedding model:
+
+```go
+es, _ := m.Embed(ctx, []string{engine.EmbedQuery("", "What is the capital of China?"), "The capital of China is Beijing."},
+	engine.EmbedOptions{})
+fmt.Println(engine.Cosine(es[0].Vector, es[1].Vector)) // about 0.77
 ```
 
 The engine also keeps the start of recent prompts (`LoadOptions.PromptCache`), so a long system prompt is read once,
@@ -193,9 +215,10 @@ client := openai.NewClient(option.WithBaseURL(ts.URL+"/v1"), option.WithAPIKey("
 | `qwen3-0.6b` | 640 MB | about 1 GB | tags, yes/no, short extraction |
 | `qwen3-1.7b` | 1.8 GB | about 2 GB | a good default for a small server |
 | `qwen3-4b` | 2.5 GB | about 3 GB | better answers, slower |
+| `qwen3-embedding-0.6b` | 640 MB | about 1 GB | embeddings (1024 values) for search and similarity |
 
 These come from Qwen's own Hugging Face repository and are checked against their SHA-256. Ollama's spellings work too
-(`qwen3:1.7b`). Any other Qwen3 GGUF works by `hf:<org>/<repo>/<file>.gguf`, by path to a `.gguf` file (in
+(`qwen3:1.7b`, `qwen3-embedding:0.6b`). Any other Qwen3 GGUF works by `hf:<org>/<repo>/<file>.gguf`, by path to a `.gguf` file (in
 `nollama run`; the server takes paths only with `--allow-paths`), or, for the server too, by name once the file is in
 the models folder (`mymodel.gguf` there is `mymodel`). The engine
 runs Qwen3 dense models in Q8_0, Q4_K_M, F16 and BF16; other architectures are not supported yet.
@@ -240,14 +263,16 @@ Run them yourself with `go run ./engine/cmd/bench bench` (it needs Ollama runnin
 ## What's supported
 
 Ollama's API: `/api/chat`, `/api/generate` (with `raw`, `system`, `context`), `/api/tags`, `/api/ps`, `/api/show`,
-`/api/pull`, `/api/delete`, `/api/version`, streaming and not, `format` (`"json"` or a JSON schema), `options`
+`/api/pull`, `/api/delete`, `/api/version`, `/api/embed` (`input`, `truncate`, `dimensions`) and the older
+`/api/embeddings`, streaming and not, `format` (`"json"` or a JSON schema), `options`
 (`temperature`, `top_p`, `top_k`, `num_predict`, `num_ctx`, `seed`, `stop`), `keep_alive`.
 
-OpenAI's API: `/v1/chat/completions`, `/v1/completions`, `/v1/models`, streaming (with `stream_options.include_usage`)
+OpenAI's API: `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/embeddings` (text or token ids,
+`dimensions`, `encoding_format` `float` or `base64`), streaming (with `stream_options.include_usage`)
 and not, `response_format` (`json_object`, `json_schema`), `max_tokens`/`max_completion_tokens`, `temperature`,
 `top_p`, `seed`, `stop`.
 
-Not yet: GPUs, model families other than Qwen3, tool calls, images, embeddings, `/api/create`, thinking mode
+Not yet: GPUs, model families other than Qwen3, tool calls, images, `/api/create`, thinking mode
 (Qwen3's thinking is always off), and several models loaded at once (nollama holds one and swaps on demand).
 
 ## Security

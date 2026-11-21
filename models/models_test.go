@@ -9,14 +9,15 @@ import (
 
 func TestNormalize(t *testing.T) {
 	for in, want := range map[string]string{
-		"qwen3:1.7b":        "qwen3-1.7b",
-		"qwen3-1.7b":        "qwen3-1.7b",
-		"qwen3-1.7b:latest": "qwen3-1.7b",
-		" qwen3:0.6b ":      "qwen3-0.6b",
-		"hf:a/b/c:d.gguf":   "hf:a/b/c:d.gguf",
-		"/tmp/x:y.gguf":     "/tmp/x:y.gguf",
-		"some-local-model":  "some-local-model",
-		"some:local:model":  "some-local:model",
+		"qwen3:1.7b":           "qwen3-1.7b",
+		"qwen3-1.7b":           "qwen3-1.7b",
+		"qwen3-1.7b:latest":    "qwen3-1.7b",
+		"qwen3-embedding:0.6b": "qwen3-embedding-0.6b",
+		" qwen3:0.6b ":         "qwen3-0.6b",
+		"hf:a/b/c:d.gguf":      "hf:a/b/c:d.gguf",
+		"/tmp/x:y.gguf":        "/tmp/x:y.gguf",
+		"some-local-model":     "some-local-model",
+		"some:local:model":     "some-local:model",
 	} {
 		if got := Normalize(in); got != want {
 			t.Errorf("Normalize(%q) = %q, want %q", in, got, want)

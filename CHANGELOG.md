@@ -14,6 +14,7 @@ becomes `## vX.Y.Z` and its lines are the release notes (`release.sh` reads them
 - `nollamatest` package: test code that uses nollama with no model download. A tiny random-weight Qwen3 model (about 1 MB, built in memory) runs the real engine; a scripted model answers with a function you write; `nollamatest.NewServer(t)` runs either behind the real Ollama/OpenAI HTTP server, answering to every catalog model name.
 - `engine.LoadOptions.Respond` makes a model answer from a script instead of its weights, and `server.Config.Load` lets a test choose how model files are opened.
 - Save and load a conversation's state, and the prompt cache's, through any `io.Writer`/`io.Reader` (`Model.SaveThread`, `LoadThread`, `SavePromptCache`, `LoadPromptCache`): a long conversation picks up after a restart without being read again. Snapshots are tied to the model file by a fingerprint, versioned and checksummed, half or full precision, optionally compressed.
+- Embeddings: `/api/embed` (one text or a list, `truncate`, `dimensions`), `/api/embeddings` and `/v1/embeddings` (text or token ids, `dimensions`, `encoding_format` `float` or `base64`) answer with unit-length vectors from Qwen3-Embedding, which `qwen3-embedding-0.6b` (or `qwen3-embedding:0.6b`) downloads. In Go, `Model.Embed` and `engine.EmbedQuery` for the query instruction. `/api/show` reports an embedding model's capability as `embedding`.
 
 ## v0.0.1-alpha.1
 

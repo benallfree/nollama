@@ -122,8 +122,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/delete", s.manage("deleting models", s.cfg.NoDelete, s.deleteModel))
 	mux.HandleFunc("POST /api/generate", s.ollamaGenerate)
 	mux.HandleFunc("POST /api/chat", s.ollamaChat)
-	mux.HandleFunc("POST /api/embed", s.notSupported)
-	mux.HandleFunc("POST /api/embeddings", s.notSupported)
+	mux.HandleFunc("POST /api/embed", s.ollamaEmbed)
+	mux.HandleFunc("POST /api/embeddings", s.ollamaEmbeddings)
 	mux.HandleFunc("POST /api/create", s.manage("creating models", false, s.notSupported))
 	mux.HandleFunc("POST /api/copy", s.manage("copying models", false, s.notSupported))
 	mux.HandleFunc("POST /api/push", s.manage("pushing models", false, s.notSupported))
@@ -131,7 +131,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/models/{model...}", s.openaiModel)
 	mux.HandleFunc("POST /v1/chat/completions", s.openaiChat)
 	mux.HandleFunc("POST /v1/completions", s.openaiCompletions)
-	mux.HandleFunc("POST /v1/embeddings", s.openaiNotSupported)
+	mux.HandleFunc("POST /v1/embeddings", s.openaiEmbeddings)
 	return s.logged(s.guard(mux))
 }
 

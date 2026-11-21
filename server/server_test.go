@@ -2,7 +2,11 @@ package server
 
 import (
 	"bufio"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/benallfree/nollama/internal/tinymodel"
 )
 
 func newTest(t *testing.T, dir string) *httptest.Server {
@@ -63,8 +69,146 @@ func TestNoModels(t *testing.T) {
 	if code, _ := call(t, ts, "POST", "/api/generate", `{"model":"x","prompt":"hi","format":"yaml"}`); code != 400 && code != 404 {
 		t.Errorf("bad format: %d", code)
 	}
-	if code, _ := call(t, ts, "POST", "/api/embed", `{}`); code != 501 {
-		t.Errorf("embed: %d", code)
+	if code, _ := call(t, ts, "POST", "/api/create", `{}`); code != 501 {
+		t.Errorf("create: %d", code)
+	}
+	if code, _ := call(t, ts, "POST", "/api/embed", `{"model":"qwen3-embedding:0.6b","input":["a","b"]}`); code != 404 {
+		t.Errorf("embed, missing model: %d", code)
+	}
+	if code, _ := call(t, ts, "POST", "/v1/embeddings", `{"model":"x","input":{"text":"a"}}`); code != 400 {
+		t.Errorf("v1 embeddings, bad input: %d", code)
+	}
+	if code, _ := call(t, ts, "POST", "/v1/embeddings", `{"model":"x","input":"a","encoding_format":"int8"}`); code != 400 {
+		t.Errorf("v1 embeddings, bad encoding: %d", code)
+	}
+}
+
+func TestEmbedInput(t *testing.T) {
+	for in, want := range map[string]string{`"a"`: "[a] []", `["a","b"]`: "[a b] []", `[1,2]`: "[] [[1 2]]", `[[1],[2,3]]`: "[] [[1] [2 3]]"} {
+		var e embedInput
+		if err := json.Unmarshal([]byte(in), &e); err != nil {
+			t.Errorf("%s: %v", in, err)
+			continue
+		}
+		if got := fmt.Sprint(e.texts, " ", e.tokens); got != want {
+			t.Errorf("%s: %s, want %s", in, got, want)
+		}
+	}
+}
+
+// The embedding routes on the tiny random-weight model, in every test run.
+func TestEmbedTiny(t *testing.T) {
+	dir := t.TempDir()
+	if err := tinymodel.Write(filepath.Join(dir, "tiny.gguf"), tinymodel.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	ts := newTest(t, dir)
+	code, out := call(t, ts, "POST", "/api/embed", `{"model":"tiny","input":["one","two","three"]}`)
+	if code != 200 || len(out["embeddings"].([]any)) != 3 {
+		t.Fatalf("embed: %d %v", code, out)
+	}
+	code, out = call(t, ts, "POST", "/v1/embeddings", `{"model":"tiny","input":[[1,2,3],[4,5]],"dimensions":16}`)
+	if code != 200 || len(out["data"].([]any)) != 2 || len(out["data"].([]any)[1].(map[string]any)["embedding"].([]any)) != 16 {
+		t.Fatalf("v1 embeddings, token ids: %d %v", code, out)
+	}
+	if code, _ := call(t, ts, "POST", "/v1/embeddings", `{"model":"tiny","input":[[99999999]]}`); code != 400 {
+		t.Errorf("token outside the vocabulary: %d", code)
+	}
+	if code, out := call(t, ts, "POST", "/api/embeddings", `{"model":"tiny","prompt":"one"}`); code != 200 || len(out["embedding"].([]any)) == 0 {
+		t.Errorf("embeddings: %d %v", code, out)
+	}
+	if code, out := call(t, ts, "POST", "/api/embed", `{"model":"tiny","input":"`+strings.Repeat("word ", 50)+`","options":{"num_ctx":8}}`); code != 200 || out["prompt_eval_count"].(float64) != 8 {
+		t.Errorf("truncated: %d %v", code, out)
+	}
+}
+
+// TestEmbed runs the three embedding routes against a real model:
+// EMBED_GGUF=/path/to/Qwen3-Embedding-0.6B-Q8_0.gguf go test ./server
+func TestEmbed(t *testing.T) {
+	p := os.Getenv("EMBED_GGUF")
+	if p == "" {
+		t.Skip("EMBED_GGUF not set")
+	}
+	dir := t.TempDir()
+	if err := os.Symlink(p, filepath.Join(dir, "emb.gguf")); err != nil {
+		t.Fatal(err)
+	}
+	ts := newTest(t, dir)
+	model := filepath.Join(dir, "emb.gguf")
+	vec := func(v any) []float64 {
+		var out []float64
+		for _, x := range v.([]any) {
+			out = append(out, x.(float64))
+		}
+		return out
+	}
+	dot := func(a, b []float64) (s float64) {
+		for i := range a {
+			s += a[i] * b[i]
+		}
+		return s
+	}
+
+	code, out := call(t, ts, "POST", "/api/embed", `{"model":"`+model+`","input":["The cat sat on the mat.","A cat was sitting on a rug.","Quarterly revenue grew by ten percent."]}`)
+	if code != 200 {
+		t.Fatalf("embed: %d %v", code, out)
+	}
+	es := out["embeddings"].([]any)
+	if len(es) != 3 || out["prompt_eval_count"].(float64) < 3 {
+		t.Fatalf("embed: %v embeddings, prompt_eval_count %v", len(es), out["prompt_eval_count"])
+	}
+	a, b, c := vec(es[0]), vec(es[1]), vec(es[2])
+	if len(a) != 1024 || math.Abs(dot(a, a)-1) > 1e-4 {
+		t.Errorf("embed: %d values, |v|² %.5f", len(a), dot(a, a))
+	}
+	if dot(a, b) <= dot(a, c) {
+		t.Errorf("similar %.3f <= unrelated %.3f", dot(a, b), dot(a, c))
+	}
+
+	if code, out := call(t, ts, "POST", "/api/show", `{"model":"`+model+`"}`); code != 200 || fmt.Sprint(out["capabilities"]) != "[embedding]" {
+		t.Errorf("show: %d %v", code, out["capabilities"])
+	}
+
+	code, out = call(t, ts, "POST", "/api/embeddings", `{"model":"`+model+`","prompt":"The cat sat on the mat."}`)
+	if code != 200 || dot(vec(out["embedding"]), a) < 0.9999 {
+		t.Errorf("embeddings: %d", code)
+	}
+
+	code, out = call(t, ts, "POST", "/v1/embeddings", `{"model":"`+model+`","input":["The cat sat on the mat."],"dimensions":64}`)
+	if code != 200 {
+		t.Fatalf("v1 embeddings: %d %v", code, out)
+	}
+	d := out["data"].([]any)[0].(map[string]any)
+	if v := vec(d["embedding"]); len(v) != 64 || math.Abs(dot(v, v)-1) > 1e-4 || d["index"].(float64) != 0 {
+		t.Errorf("v1 embeddings, 64 dimensions: %d values", len(v))
+	}
+	if out["usage"].(map[string]any)["prompt_tokens"].(float64) < 2 {
+		t.Errorf("usage: %v", out["usage"])
+	}
+
+	code, out = call(t, ts, "POST", "/v1/embeddings", `{"model":"`+model+`","input":"The cat sat on the mat.","encoding_format":"base64"}`)
+	if code != 200 {
+		t.Fatalf("v1 embeddings base64: %d %v", code, out)
+	}
+	raw, err := base64.StdEncoding.DecodeString(out["data"].([]any)[0].(map[string]any)["embedding"].(string))
+	if err != nil || len(raw) != 4*1024 {
+		t.Fatalf("base64: %d bytes, %v", len(raw), err)
+	}
+	b64 := make([]float64, 1024)
+	for i := range b64 {
+		b64[i] = float64(math.Float32frombits(binary.LittleEndian.Uint32(raw[4*i:])))
+	}
+	if dot(b64, a) < 0.9999 {
+		t.Errorf("base64 vector differs: %.5f", dot(b64, a))
+	}
+
+	// too long: /api/embed truncates by default, /v1/embeddings refuses
+	long := strings.Repeat("word ", 300)
+	if code, out := call(t, ts, "POST", "/api/embed", `{"model":"`+model+`","input":"`+long+`","options":{"num_ctx":64}}`); code != 200 || out["prompt_eval_count"].(float64) != 64 {
+		t.Errorf("truncated embed: %d %v", code, out["prompt_eval_count"])
+	}
+	if code, _ := call(t, ts, "POST", "/api/embed", `{"model":"`+model+`","input":"`+long+`","truncate":false,"options":{"num_ctx":64}}`); code != 400 {
+		t.Errorf("embed, truncate false: %d", code)
 	}
 }
 
