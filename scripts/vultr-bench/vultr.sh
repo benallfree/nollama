@@ -118,7 +118,8 @@ cmd_start() {
 	ollama=""
 	rssh "$run" 'command -v ollama >/dev/null' && ollama=-ollama
 	plan=$(cat "$run/plan")
-	rssh "$run" "cd /root/bench && setsid nohup ./bench vps -models \"\$(cat models.arg)\" $ollama -label $plan -json results.json </dev/null >results.md 2>bench.log & echo started"
+	# only the setsid'd command goes to the background (a backgrounded `cd && ...` list would keep the SSH channel open)
+	rssh "$run" "cd /root/bench || exit 1; setsid nohup ./bench vps -models \"\$(cat models.arg)\" $ollama -label $plan -json results.json </dev/null >results.md 2>bench.log & echo started"
 }
 
 cmd_status() {
