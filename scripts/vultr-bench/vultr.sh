@@ -143,7 +143,7 @@ cmd_list() {
 }
 
 cmd_all() {
-	run=$(cmd_create "$@" | tail -1)
+	run=$(cmd_create "$@" | tee /dev/stderr | tail -1)
 	trap 'cmd_destroy "$run"' EXIT INT TERM HUP
 	cmd_wait "$run"
 	cmd_push "$run"
