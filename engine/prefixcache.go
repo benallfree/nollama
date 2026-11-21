@@ -74,6 +74,7 @@ func (m *Model) restorePrefix(s *state, e *prefixEntry, n int) {
 	for li := range e.k {
 		m.loadKV(s, li, e.k[li], e.v[li], len(e.tokens), n)
 	}
+	m.kvChanged(s) // a discrete GPU's copy of a pooled state may end where this prefix does
 }
 
 // storePrefix keeps the first tokens of ids, whose keys and values are in s, unless the cache already has them. A pin

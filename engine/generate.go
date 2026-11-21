@@ -526,20 +526,38 @@ func (m *Model) sample(logits []float32, o GenerateOptions, rng *rand.Rand) int 
 // else a sample from the top accepted ones. cur is the constraint's verdict on out. done says the output is finished
 // after it; ok is false when no token fits.
 func (m *Model) sampleConstrained(logits []float32, o GenerateOptions, rng *rand.Rand, out []byte, cur Fit) (tok int, done, ok bool) {
+	prefix := string(out)
+	var fit Fit // of the last token tried: the chosen one, since sampleFiltered tries it last
+	try := func(id int) bool {
+		if m.tok.eos[id] {
+			fit = FitDone
+			return cur == FitComplete || cur == FitDone
+		}
+		if m.tok.isControl(id) {
+			return false // <|im_start|> and the like; user-defined ones such as <tool_call> are text the constraint judges
+		}
+		fit = o.Constraint(prefix + string(m.tok.tokenBytes(id)))
+		return fit != FitNo
+	}
+	fits := map[int]Fit{}
+	tok, ok = sampleFiltered(logits, o.Temperature, o.TopK, rng, func(id int) bool {
+		good := try(id)
+		if good {
+			fits[id] = fit
+		}
+		return good
+	})
+	return tok, ok && fits[tok] == FitDone && !m.tok.eos[tok], ok
+}
+
+// sampleFiltered picks the next token among those allow accepts: the best-scoring one when greedy (temperature <= 0
+// or topK 1), else a sample from the topK (0: 40) best accepted ones. allow is called lazily, best candidates first,
+// first among those within 30 of the best logit and over the whole vocabulary only if none of them is allowed. ok is
+// false when no token is allowed.
+func sampleFiltered(logits []float32, temperature float64, topK int, rng *rand.Rand, allow func(id int) bool) (tok int, ok bool) {
 	type cand struct {
 		id int
 		v  float32
-	}
-	prefix := string(out)
-	try := func(id int) (Fit, bool) {
-		if m.tok.eos[id] {
-			return FitDone, cur == FitComplete || cur == FitDone
-		}
-		if m.tok.isControl(id) {
-			return FitNo, false // <|im_start|> and the like; user-defined ones such as <tool_call> are text the constraint judges
-		}
-		f := o.Constraint(prefix + string(m.tok.tokenBytes(id)))
-		return f, f != FitNo
 	}
 	// the best candidates first; widen to the whole vocabulary only if none of them fits
 	for _, width := range []float32{30, float32(math.Inf(1))} {
@@ -555,22 +573,20 @@ func (m *Model) sampleConstrained(logits []float32, o GenerateOptions, rng *rand
 			}
 		}
 		sort.Slice(cs, func(a, b int) bool { return cs[a].v > cs[b].v })
-		greedy := o.Temperature <= 0 || o.TopK == 1
-		k := o.TopK
+		greedy := temperature <= 0 || topK == 1
+		k := topK
 		if k <= 0 {
 			k = 40
 		}
 		var fits []cand
-		var fitOf []Fit
 		for _, c := range cs {
-			f, good := try(c.id)
-			if !good {
+			if !allow(c.id) {
 				continue
 			}
 			if greedy {
-				return c.id, f == FitDone && !m.tok.eos[c.id], true
+				return c.id, true
 			}
-			fits, fitOf = append(fits, c), append(fitOf, f)
+			fits = append(fits, c)
 			if len(fits) >= k {
 				break
 			}
@@ -581,18 +597,18 @@ func (m *Model) sampleConstrained(logits []float32, o GenerateOptions, rng *rand
 		var sum float64
 		ps := make([]float64, len(fits))
 		for i, c := range fits {
-			ps[i] = exp64(float64(c.v-fits[0].v) / o.Temperature)
+			ps[i] = exp64(float64(c.v-fits[0].v) / temperature)
 			sum += ps[i]
 		}
 		r := rng.Float64() * sum
 		for i := range fits {
 			r -= ps[i]
 			if r < 0 || i == len(fits)-1 {
-				return fits[i].id, fitOf[i] == FitDone && !m.tok.eos[fits[i].id], true
+				return fits[i].id, true
 			}
 		}
 	}
-	return 0, false, false
+	return 0, false
 }
 
 // WarmResult says what Warm kept.
