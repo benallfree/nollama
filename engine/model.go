@@ -30,6 +30,9 @@ type LoadOptions struct {
 	// ThreadMemory is the memory, in bytes, for conversations' state between calls (threads.go); 0 keeps them only
 	// on disk, when a call names a folder.
 	ThreadMemory int64
+	// KVCacheType stores the attention keys and values in a smaller format to save memory on long contexts:
+	// "f32" (default), "f16", "q8_0" or "q4_0" (see kvcache.go and KVCacheTypes).
+	KVCacheType string
 	// ID names the model in thread files, so one model never reads another's (default: the file's name and size).
 	ID string
 	// Respond, when set, makes the model answer from a script instead of its weights: each Generate call passes the
@@ -53,7 +56,8 @@ type Info struct {
 	Kernels       string
 	// Pooling is how the model's GGUF says to make one embedding from a text's hidden states: "last" for an
 	// embedding model such as Qwen3-Embedding, "" when it doesn't say (a chat model; Embed still uses the last token).
-	Pooling string
+	Pooling     string
+	KVCacheType string // the KV cache's format, e.g. "q8_0"
 }
 
 type weight struct {
@@ -103,6 +107,7 @@ type Model struct {
 	id          string      // in thread files
 	fingerprint [32]byte    // of the GGUF file, in snapshots (snapshot.go)
 	respond     func(prompt string) string
+	kvTyp       uint32 // KV cache format (kvcache.go)
 
 	addEOS bool // the tokenizer appends EOS to a text it embeds (tokenizer.ggml.add_eos_token)
 	eosID  int  // tokenizer.ggml.eos_token_id, or -1
@@ -263,6 +268,10 @@ func newModel(g *ggufFile, opts LoadOptions) (*Model, error) {
 	m.id = opts.ID
 	m.respond = opts.Respond
 	m.fingerprint = ggufFingerprint(g)
+	var err error
+	if m.kvTyp, err = parseKVCacheType(opts.KVCacheType); err != nil {
+		return nil, err
+	}
 	req := func(k string) (int, error) {
 		v, ok := g.getInt(arch + "." + k)
 		if !ok {
@@ -271,7 +280,6 @@ func newModel(g *ggufFile, opts LoadOptions) (*Model, error) {
 		return v, nil
 	}
 	hp := &m.hp
-	var err error
 	for _, kv := range []struct {
 		k string
 		p *int
@@ -304,6 +312,9 @@ func newModel(g *ggufFile, opts LoadOptions) (*Model, error) {
 	}
 	if hp.heads%hp.kvHeads != 0 || hp.headDim%2 != 0 {
 		return nil, errors.New("engine: bad head configuration")
+	}
+	if (m.kvTyp == typeQ8_0 || m.kvTyp == typeQ4_0) && hp.headDim%32 != 0 {
+		return nil, fmt.Errorf("engine: KV cache type %s needs a head size that's a multiple of 32 (this model's is %d)", kvTypeName(m.kvTyp), hp.headDim)
 	}
 
 	getW := func(name string, cols, rows int) (*weight, error) {
@@ -443,6 +454,7 @@ func newModel(g *ggufFile, opts LoadOptions) (*Model, error) {
 		Arch: arch, Name: g.getString("general.name"), Params: params, ContextLength: hp.ctx,
 		Quant: q, TensorTypes: types, FileSize: g.size, Layers: hp.layers, Embedding: hp.dim,
 		Threads: threads, Kernels: kernelName, Pooling: pooling,
+		KVCacheType: kvTypeName(m.kvTyp),
 	}
 	ok = true
 	return m, nil

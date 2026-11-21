@@ -548,6 +548,7 @@ func (s *Server) show(w http.ResponseWriter, r *http.Request) {
 			info.Arch + ".embedding_length": info.Embedding,
 			"nollama.threads":               info.Threads,
 			"nollama.kernels":               info.Kernels,
+			"nollama.kv_cache_type":         info.KVCacheType,
 		},
 		"modified_at": now(),
 	})

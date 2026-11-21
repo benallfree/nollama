@@ -113,6 +113,7 @@ func cmdServe(args []string) error {
 	numCtx := fs.Int("num-ctx", 4096, "context window when a request doesn't set num_ctx")
 	truncate := fs.Bool("truncate", false, "drop a chat's oldest messages when it doesn't fit the context window, instead of answering 400 (requests can still send \"truncate\": false)")
 	cacheMB := fs.Int("prompt-cache-mb", 256, "memory for reusing the start of recent prompts (0: off)")
+	kvType := kvCacheFlag(fs)
 	quiet := fs.Bool("quiet", false, "don't log requests")
 	apiKey := fs.String("api-key", os.Getenv("NOLLAMA_API_KEY"), "require this key (Authorization: Bearer <key>); prefer NOLLAMA_API_KEY, which other users can't see in ps")
 	readOnly := fs.Bool("read-only", false, "turn off model management (pull, delete, create, copy, push)")
@@ -140,7 +141,10 @@ func cmdServe(args []string) error {
 		APIKey: strings.TrimSpace(*apiKey), ReadOnly: *readOnly, NoPull: *noPull, NoDelete: *noDelete,
 		Models: list(*allow), AllowPaths: *allowPaths, AllowedOrigins: list(*origins), AllowedHosts: list(*hosts),
 		MaxBodyBytes: int64(*maxBodyMB) << 20, MaxTokens: *maxTokens, MaxNumCtx: *maxNumCtx, PerClient: *perClient,
-		MaxMemory: memLimit, LowPriority: *lowPrio}
+		MaxMemory: memLimit, LowPriority: *lowPrio, KVCacheType: *kvType}
+	if err := checkKVCacheType(*kvType); err != nil {
+		return err
+	}
 	if !*quiet {
 		cfg.Logf = log.Printf
 	}
@@ -335,6 +339,7 @@ func cmdRun(args []string) error {
 	temp := fs.Float64("temperature", 0.7, "sampling temperature (0: always the likeliest token)")
 	system := fs.String("system", "", "system prompt")
 	verbose := fs.Bool("verbose", false, "print token counts and speed after each answer")
+	kvType := kvCacheFlag(fs)
 	fs.Parse(args)
 	if fs.NArg() < 1 {
 		return errors.New("usage: nollama run [flags] <model> [prompt]")
@@ -343,7 +348,7 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	m, err := engine.Load(src.Path, engine.LoadOptions{Threads: *threads, PromptCache: 256 << 20})
+	m, err := engine.Load(src.Path, engine.LoadOptions{Threads: *threads, PromptCache: 256 << 20, KVCacheType: *kvType})
 	if err != nil {
 		return err
 	}
@@ -493,4 +498,23 @@ func size(n int64) string {
 		return fmt.Sprintf("%.0f MB", float64(n)/(1<<20))
 	}
 	return fmt.Sprintf("%d KB", n>>10)
+}
+
+// kvCacheFlag adds -kv-cache-type, defaulting to NOLLAMA_KV_CACHE_TYPE.
+func kvCacheFlag(fs *flag.FlagSet) *string {
+	def := os.Getenv("NOLLAMA_KV_CACHE_TYPE")
+	if def == "" {
+		def = engine.KVCacheF32
+	}
+	return fs.String("kv-cache-type", def, "format of the attention cache: "+strings.Join(engine.KVCacheTypes, ", ")+
+		" (smaller saves memory on long contexts; also NOLLAMA_KV_CACHE_TYPE)")
+}
+
+func checkKVCacheType(t string) error {
+	for _, k := range engine.KVCacheTypes {
+		if strings.EqualFold(strings.TrimSpace(t), k) {
+			return nil
+		}
+	}
+	return fmt.Errorf("unknown KV cache type %q (want one of %s)", t, strings.Join(engine.KVCacheTypes, ", "))
 }

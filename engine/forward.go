@@ -206,8 +206,9 @@ func rmsnorm(out, x, w []float32, eps float64) {
 // state is one generation's KV cache and scratch buffers.
 type state struct {
 	maxCtx, maxN int
-	ctxP         int         // maxCtx rounded up to 16
-	kc, vc       [][]float32 // per layer: kc [kvHeads][headDim][ctxP] (transposed), vc [ctxP][kvHeads*headDim]
+	ctxP         int         // maxCtx rounded up to 16 (32 for a compact cache)
+	kc, vc       [][]float32 // f32 cache, per layer: kc [kvHeads][headDim][ctxP] (transposed), vc [ctxP][kvHeads*headDim]
+	kv           *compactKV  // the cache in a smaller format instead (LoadOptions.KVCacheType; kvcache.go)
 	qbuf, obuf   [][]float32 // per worker: 4 gathered queries / outputs
 	x            []float32   // residual, maxN*dim
 	an, aa, af   *acts       // normed input (dim), attention out (q dim), ffn hidden (ffn)
@@ -250,12 +251,18 @@ func (m *Model) stateBytes(maxCtx, maxN int) int64 {
 	hp := m.hp
 	qd, kvd := hp.heads*hp.headDim, hp.kvHeads*hp.headDim
 	ctxP := (maxCtx + 15) &^ 15
-	f := int64(hp.layers) * 2 * int64(ctxP*kvd)               // kc, vc
+	var f, kvb int64
+	if m.kvTyp == typeF32 {
+		f = int64(hp.layers) * 2 * int64(ctxP*kvd) // kc, vc
+	} else {
+		ctxP = (maxCtx + 31) &^ 31
+		kvb = m.compactBytes(ctxP)
+	}
 	f += int64(maxN) * int64(hp.dim+qd+2*kvd+2*hp.ffn+hp.dim) // x, q, k, v, gate, up, tmp
 	f += int64(hp.vocab)                                      // logits
 	f += int64(m.pool.n) * int64(4*ctxP+8*hp.headDim)         // per worker: scores, qbuf, obuf
 	f += int64(maxN * hp.headDim)                             // cos, sin
-	b := f*4 + actsBytes(maxN, hp.dim) + actsBytes(maxN, qd) + actsBytes(maxN, hp.ffn) + actsBytes(1, hp.dim)
+	b := f*4 + kvb + actsBytes(maxN, hp.dim) + actsBytes(maxN, qd) + actsBytes(maxN, hp.ffn) + actsBytes(1, hp.dim)
 	return b
 }
 
@@ -263,11 +270,16 @@ func (m *Model) newState(maxCtx, maxN int) *state {
 	hp := m.hp
 	qd, kvd := hp.heads*hp.headDim, hp.kvHeads*hp.headDim
 	s := &state{maxCtx: maxCtx, maxN: maxN, ctxP: (maxCtx + 15) &^ 15}
-	s.kc = make([][]float32, hp.layers)
-	s.vc = make([][]float32, hp.layers)
-	for i := range s.kc {
-		s.kc[i] = make([]float32, s.ctxP*kvd)
-		s.vc[i] = make([]float32, s.ctxP*kvd)
+	if m.kvTyp == typeF32 {
+		s.kc = make([][]float32, hp.layers)
+		s.vc = make([][]float32, hp.layers)
+		for i := range s.kc {
+			s.kc[i] = make([]float32, s.ctxP*kvd)
+			s.vc[i] = make([]float32, s.ctxP*kvd)
+		}
+	} else {
+		s.ctxP = (maxCtx + 31) &^ 31 // whole blocks of 32 positions
+		m.allocCompact(s)
 	}
 	s.x = make([]float32, maxN*hp.dim)
 	s.an = newActs(maxN, hp.dim)
@@ -356,7 +368,11 @@ func (m *Model) forward(s *state, tokens []int, pos int) {
 		m.matmul(p, s.an, 0, mmSeg{l.wq, s.q, qd}, mmSeg{l.wk, s.k, kvd}, mmSeg{l.wv, s.v, kvd})
 
 		// per-head QK norm + RoPE (NeoX), then store K/V in the cache
-		kc, vc, ctxP := s.kc[li], s.vc[li], s.ctxP
+		var kc, vc []float32
+		if s.kv == nil {
+			kc, vc = s.kc[li], s.vc[li]
+		}
+		ctxP := s.ctxP
 		perToken(func(t int) {
 			cs, sn := s.cos[t*half:(t+1)*half], s.sin[t*half:(t+1)*half]
 			for h := 0; h < hp.heads; h++ {
@@ -369,11 +385,20 @@ func (m *Model) forward(s *state, tokens []int, pos int) {
 				rmsnorm(v, v, l.kNorm, hp.eps)
 				rope(v, cs, sn)
 			}
-			for i, v := range s.k[t*kvd : (t+1)*kvd] {
-				kc[i*ctxP+pos+t] = v
+			if kc != nil {
+				for i, v := range s.k[t*kvd : (t+1)*kvd] {
+					kc[i*ctxP+pos+t] = v
+				}
+				copy(vc[(pos+t)*kvd:(pos+t+1)*kvd], s.v[t*kvd:(t+1)*kvd])
+			} else {
+				m.storeKey(s, li, pos+t, s.k[t*kvd:(t+1)*kvd])
 			}
-			copy(vc[(pos+t)*kvd:(pos+t+1)*kvd], s.v[t*kvd:(t+1)*kvd])
 		})
+		if kc == nil { // in order: a block of values is quantized when it fills
+			for t := 0; t < n; t++ {
+				m.storeValue(s, li, pos+t, s.v[t*kvd:(t+1)*kvd])
+			}
+		}
 
 		// Causal attention. Queries sharing a KV head are processed four at a
 		// time (items (t, head-in-group) in order), so each K/V row loaded
@@ -392,8 +417,11 @@ func (m *Model) forward(s *state, tokens []int, pos int) {
 					copy(qb[i*hd:(i+1)*hd], s.q[ts[i]*qd+hs[i]*hd:ts[i]*qd+(hs[i]+1)*hd])
 				}
 				ctxQ := pos + ts[3] + 1 // items are in token order: the last has the longest context
-				nblk := (ctxQ + 15) / 16
-				scores4(qb, kc[kvh*hd*ctxP:], ctxP, nblk, sc, ctxP)
+				if kc != nil {
+					scores4(qb, kc[kvh*hd*ctxP:], ctxP, (ctxQ+15)/16, sc, ctxP)
+				} else {
+					m.scoresQ(s, s.kv.scratch[w], li, kvh, ctxQ, qb, sc)
+				}
 				n4 := (ctxQ + 3) / 4
 				for i := 0; i < 4; i++ {
 					row := sc[i*ctxP : i*ctxP+4*n4]
@@ -424,7 +452,11 @@ func (m *Model) forward(s *state, tokens []int, pos int) {
 					}
 					clear(row[ctx:])
 				}
-				wsum4(sc, ctxP, vc[kvh*hd:], kvd, n4, ob, hd, hd)
+				if vc != nil {
+					wsum4(sc, ctxP, vc[kvh*hd:], kvd, n4, ob, hd, hd)
+				} else {
+					m.wsumQ(s, s.kv.scratch[w], li, kvh, ctxQ, sc, ob)
+				}
 				for i := 0; i < 4; i++ {
 					if 4*qi+i < items {
 						copy(att[ts[i]*qd+hs[i]*hd:ts[i]*qd+(hs[i]+1)*hd], ob[i*hd:(i+1)*hd])

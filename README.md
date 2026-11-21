@@ -132,8 +132,8 @@ print(r.choices[0].message.content)  # It's 18°C and sunny in Paris.
 
 Other commands: `nollama pull <model>`, `nollama list`, `nollama rm <model>`, and `nollama bundle` to
 [ship a model inside the binary](#ship-the-model-inside-the-binary). `nollama serve --help` lists the server's
-flags (threads, answers at once, how long an idle model stays loaded, context window). `NOLLAMA_HOST` sets the address
-and `NOLLAMA_MODELS` the models folder.
+flags (threads, answers at once, how long an idle model stays loaded, context window, KV cache type). `NOLLAMA_HOST`
+sets the address, `NOLLAMA_MODELS` the models folder and `NOLLAMA_KV_CACHE_TYPE` the KV cache's format.
 
 ## Context limits
 
@@ -367,6 +367,42 @@ Either way, a model inside the program resolves like any other: `models.Resolve`
 `bundled:<name>` or `embedded:<name>`, and `engine.Load(src.Path, …)` opens it, so code written for downloaded models
 needs no change, and models not built in still download as usual. `engine.LoadBytes` takes any GGUF already in
 memory, and `engine.LoadRange` one at an offset inside any file.
+
+## Long contexts: a smaller KV cache
+
+While it answers, the model keeps the attention keys and values of every token so far (the KV cache). At full
+precision that's 224 KB per token for Qwen3 0.6B and 1.7B (288 KB for 4B), so a 4,096-token conversation takes about
+900 MB on top of the model. `--kv-cache-type` (or `NOLLAMA_KV_CACHE_TYPE`, or `engine.LoadOptions.KVCacheType`) stores
+it smaller. The names are Ollama's `OLLAMA_KV_CACHE_TYPE` values:
+
+| Type | Per token (0.6B, 1.7B) | 4,096 tokens | 32,768 tokens | Perplexity vs `f32` (0.6B, 1.7B) |
+|---|---|---|---|---|
+| `f32` (default) | 224 KB | 896 MB | 7.0 GB | exactly what the model computes |
+| `f16` | 112 KB | 448 MB | 3.5 GB | +0.3%, +0.9% (Ollama's default cache) |
+| `q8_0` | 60 KB | 238 MB | 1.9 GB | +0.1%, −0.0% |
+| `q4_0` | 46 KB | 182 MB | 1.4 GB | −4.1%, +0.1% |
+
+`q4_0` stores values in 4 bits but keeps keys at 8 (`q8_0`): with 4-bit keys Qwen3's perplexity more than doubles,
+because attention scores are sensitive to errors in keys and not in values.
+
+Quality was measured on a fixed 361-token text, teacher-forced, with Ollama's Q4_K_M files: perplexity, and how far
+each token's log-probability moves from `f32` (on average 0.12 to 0.17 for `f16`, 0.19 to 0.25 for `q8_0`, 0.28 to
+0.29 for `q4_0`). Changes within a couple of percent either way are noise: rounding the cache to `f16` alone moves a
+small model's log-probabilities that much. `go test ./engine -run TestKVCacheQuality` with `GGUF` set repeats it.
+
+Speed (provisional: measured on a heavily loaded M1 Max, load average 150 to 230, so only the attention kernels'
+relative cost is meaningful): attention over a compact cache takes 1.5× (`q8_0`), 2× (`f16`) or 2 to 3.5× (`q4_0`) the
+time of `f32` attention, single-threaded over 2,048 positions. From that, writing at a 2K-token context should be about
+5% slower with `q8_0` and 10 to 25% slower with `f16` or `q4_0`, and less at shorter contexts; reading a prompt is
+dominated by the weights either way. These are estimates until they're measured on an idle machine.
+`go test ./engine -run '^$' -bench BenchmarkKVAttention` measures the kernels.
+
+The prompt cache and threads keep their copies at full precision, within their own budgets (`--prompt-cache-mb`,
+`LoadOptions.ThreadMemory`); the KV cache type sets the memory of the answers being written.
+
+```bash
+nollama serve --kv-cache-type q8_0
+```
 
 ## Models
 

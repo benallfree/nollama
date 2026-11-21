@@ -71,15 +71,8 @@ func (m *Model) lookupPrefix(scope string, ids []int) (e *prefixEntry, n int) {
 
 // restorePrefix copies the first n positions of e into s.
 func (m *Model) restorePrefix(s *state, e *prefixEntry, n int) {
-	kvd := m.hp.kvHeads * m.hp.headDim
-	en := len(e.tokens)
-	for li := range s.kc {
-		kc, vc := s.kc[li], s.vc[li]
-		ek, ev := e.k[li], e.v[li]
-		for i := 0; i < kvd; i++ {
-			copy(kc[i*s.ctxP:i*s.ctxP+n], ek[i*en:i*en+n])
-		}
-		copy(vc[:n*kvd], ev[:n*kvd])
+	for li := range e.k {
+		m.loadKV(s, li, e.k[li], e.v[li], len(e.tokens), n)
 	}
 }
 
@@ -116,15 +109,9 @@ func (m *Model) storePrefix(scope string, s *state, ids []int, pin string) int {
 	c.mu.Unlock()
 
 	// copy outside the lock: it's tens of megabytes
-	kvd := m.hp.kvHeads * m.hp.headDim
-	e := &prefixEntry{scope: scope, tokens: append([]int(nil), ids[:n]...), k: make([][]float32, len(s.kc)), v: make([][]float32, len(s.vc))}
-	for li := range s.kc {
-		k := make([]float32, kvd*n)
-		for i := 0; i < kvd; i++ {
-			copy(k[i*n:(i+1)*n], s.kc[li][i*s.ctxP:i*s.ctxP+n])
-		}
-		e.k[li] = k
-		e.v[li] = append([]float32(nil), s.vc[li][:n*kvd]...)
+	e := &prefixEntry{scope: scope, tokens: append([]int(nil), ids[:n]...), k: make([][]float32, m.hp.layers), v: make([][]float32, m.hp.layers)}
+	for li := range e.k {
+		e.k[li], e.v[li] = m.saveKV(s, li, n)
 	}
 	size := int64(n) * per
 

@@ -33,6 +33,7 @@ type Config struct {
 	// MaxMemory and LowPriority are then ignored, and Close leaves it open.
 	Resources   *engine.Resources
 	PromptCache int64         // bytes for the engine's prompt cache (0: off)
+	KVCacheType string        // the KV cache's format: "f32" (default), "f16", "q8_0" or "q4_0" (engine.KVCacheTypes)
 	Parallel    int           // answers written at once (default 1); the rest wait their turn
 	KeepAlive   time.Duration // how long an idle model stays loaded (default 5m; negative: forever)
 	NumCtx      int           // context window when a request doesn't set num_ctx (default 4096, capped at the model's)
@@ -236,14 +237,15 @@ func (s *Server) acquire(name string) (*loaded, time.Duration, error) {
 		s.cur = nil
 		s.retire(old)
 	}
-	m, err := s.cfg.Load(src.Path, engine.LoadOptions{Resources: s.res, PromptCache: s.cfg.PromptCache})
+	m, err := s.cfg.Load(src.Path, engine.LoadOptions{Resources: s.res, PromptCache: s.cfg.PromptCache,
+		KVCacheType: s.cfg.KVCacheType})
 	if err != nil {
 		return nil, 0, fmt.Errorf("loading %s: %w", src.Name, err)
 	}
 	s.cur = &loaded{name: src.Name, src: src, m: m}
 	s.hold(s.cur)
 	load := time.Since(start)
-	s.cfg.Logf("loaded %s in %s (%s)", src.Name, load.Round(time.Millisecond), m.Info().Kernels)
+	s.cfg.Logf("loaded %s in %s (%s, KV cache %s)", src.Name, load.Round(time.Millisecond), m.Info().Kernels, m.Info().KVCacheType)
 	return s.cur, load, nil
 }
 

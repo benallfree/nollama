@@ -158,15 +158,9 @@ func (m *Model) storeThread(o GenerateOptions, s *state, tokens []int) {
 	if n < prefixMin {
 		return
 	}
-	kvd := m.hp.kvHeads * m.hp.headDim
-	e := &prefixEntry{scope: o.CacheScope, tokens: append([]int(nil), tokens...), k: make([][]float32, len(s.kc)), v: make([][]float32, len(s.vc))}
-	for li := range s.kc {
-		k := make([]float32, kvd*n)
-		for i := 0; i < kvd; i++ {
-			copy(k[i*n:(i+1)*n], s.kc[li][i*s.ctxP:i*s.ctxP+n])
-		}
-		e.k[li] = k
-		e.v[li] = append([]float32(nil), s.vc[li][:n*kvd]...)
+	e := &prefixEntry{scope: o.CacheScope, tokens: append([]int(nil), tokens...), k: make([][]float32, m.hp.layers), v: make([][]float32, m.hp.layers)}
+	for li := range e.k {
+		e.k[li], e.v[li] = m.saveKV(s, li, n)
 	}
 	m.keepThread(o.CacheScope, o.Thread, e)
 	if o.ThreadDir == "" {

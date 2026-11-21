@@ -133,9 +133,10 @@ func cmdRun(args []string) error {
 	prompt := fs.String("prompt", "short", "short|long")
 	gen := fs.Int("gen", 128, "tokens to generate")
 	runs := fs.Int("runs", 3, "measured runs (after one warm-up)")
+	kv := fs.String("kv", "", "KV cache type (f32, f16, q8_0, q4_0)")
 	fs.Parse(args)
 	t0 := time.Now()
-	m, err := engine.Load(*gguf, engine.LoadOptions{Threads: *threads})
+	m, err := engine.Load(*gguf, engine.LoadOptions{Threads: *threads, KVCacheType: *kv})
 	if err != nil {
 		return err
 	}
