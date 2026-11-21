@@ -88,7 +88,8 @@ Vectors are unit length, so a dot product is the cosine similarity. For retrieva
 on queries (not on documents): `Instruct: Given a web search query, retrieve relevant passages that answer the
 query\nQuery:<the query>`. `dimensions` keeps the first n values (32 to 1024).
 
-Other commands: `nollama pull <model>`, `nollama list`, `nollama rm <model>`. `nollama serve --help` lists the server's
+Other commands: `nollama pull <model>`, `nollama list`, `nollama rm <model>`, and `nollama bundle` to
+[ship a model inside the binary](#ship-the-model-inside-the-binary). `nollama serve --help` lists the server's
 flags (threads, answers at once, how long an idle model stays loaded, context window). `NOLLAMA_HOST` sets the address
 and `NOLLAMA_MODELS` the models folder.
 
@@ -129,7 +130,7 @@ import (
 
 src, _ := models.Resolve("qwen3-1.7b", models.DefaultDir())
 _ = models.Fetch(src, nil, nil) // downloads once, checks the SHA-256
-m, _ := engine.Load(src.Path, engine.LoadOptions{})
+m, _ := engine.LoadSource(src, engine.LoadOptions{}) // a file, or a model built into the binary
 defer m.Close()
 
 label, _ := schema.Compile([]byte(`{"type":"object","properties":{"label":{"enum":["bug","billing","question"]}},"required":["label"]}`))
@@ -225,6 +226,43 @@ ts := nollamatest.NewServer(t, nollamatest.WithResponder(nollamatest.Reply("Bonj
 client := openai.NewClient(option.WithBaseURL(ts.URL+"/v1"), option.WithAPIKey("unused"))
 // or an Ollama client pointed at ts.URL
 ```
+
+## Ship the model inside the binary
+
+A model can travel inside the executable, so the program runs it on a machine with no network and nothing to
+download. Two ways:
+
+**Add it to a built binary.** `nollama bundle` writes a copy of a program with GGUF files added to its end:
+
+```bash
+nollama bundle -o mytool qwen3-0.6b                 # a nollama that has qwen3-0.6b built in
+nollama bundle -o myapp -exe ./myapp tagger=qwen3-0.6b   # your own Go program, model named "tagger"
+nollama bundle -check myapp                         # list what's inside and check each SHA-256
+```
+
+The copy finds its models by name: `mytool run qwen3-0.6b`, `/api/tags` and `/v1/models` list them, and in your own
+program `models.Resolve("tagger", dir)` returns them before any download. Each model sits on a 64 KiB boundary and is
+mmapped straight from the executable, so it loads as fast as a separate file (tens of milliseconds). Catalog models are
+checked against their SHA-256 as they're copied in, and the bundle records every model's SHA-256 for `-check` and
+`models.Verify`. On macOS the result runs with the linker's ad-hoc signature, but `codesign` can't sign a file with
+data after its end: bundle before shipping only if you don't need a Developer ID signature, and use `go:embed` (below)
+if you do. On Windows, sign after bundling; nollama still finds the models. macOS checks a new executable the
+first time it runs, which takes a few seconds for one this size; after that it starts at once.
+
+**Compile it in with `go:embed`.** The model becomes part of the program's own data, signed along with it:
+
+```go
+//go:embed qwen3-0.6b.gguf
+var qwen []byte
+
+func init() { models.Embed("qwen3-0.6b", qwen) }
+
+src, _ := models.Resolve("qwen3-0.6b", models.DefaultDir()) // the embedded one, no download
+m, _ := engine.LoadSource(src, engine.LoadOptions{})
+```
+
+The operating system pages embedded data in from the executable as it's read, so there's no copy and no startup cost.
+`engine.LoadBytes` takes any GGUF already in memory, and `engine.LoadRange` one at an offset inside any file.
 
 ## Models
 

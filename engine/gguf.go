@@ -78,7 +78,8 @@ type ggufFile struct {
 	KV      map[string]any
 	Tensors map[string]*tensorInfo
 	Order   []string
-	data    []byte // whole mmapped file
+	data    []byte // the whole GGUF: mmapped, read into memory, or given by the caller
+	mapping []byte // what to munmap on close (nil when there is nothing to unmap)
 	dataOff int    // where tensor data starts (the header's end, aligned)
 	size    int64
 }
@@ -209,7 +210,11 @@ func (r *ggufReader) value(t uint32) any {
 	return nil
 }
 
-func openGGUF(path string) (*ggufFile, error) {
+func openGGUF(path string) (*ggufFile, error) { return openGGUFRange(path, 0, 0) }
+
+// openGGUFRange maps the GGUF that takes up size bytes of the file at path starting at off: a GGUF bundled inside
+// another file, such as an executable. size 0 means to the end of the file.
+func openGGUFRange(path string, off, size int64) (*ggufFile, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -219,16 +224,25 @@ func openGGUF(path string) (*ggufFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	data, err := mmapFile(f, st.Size())
+	if size == 0 {
+		size = st.Size() - off
+	}
+	if off < 0 || size <= 0 || off+size > st.Size() {
+		return nil, fmt.Errorf("gguf: %s has %d bytes, no GGUF at %d..%d", path, st.Size(), off, off+size)
+	}
+	mapping, data, err := mmapRange(f, off, size)
 	if err != nil {
 		return nil, err
 	}
 	g, err := parseGGUF(data)
 	if err != nil {
-		munmap(data)
+		if mapping != nil {
+			munmap(mapping)
+		}
 		return nil, err
 	}
-	g.size = st.Size()
+	g.mapping = mapping
+	g.size = size
 	return g, nil
 }
 
@@ -291,9 +305,10 @@ func parseGGUF(data []byte) (*ggufFile, error) {
 }
 
 func (g *ggufFile) close() error {
-	if g.data != nil {
-		err := munmap(g.data)
-		g.data = nil
+	g.data = nil
+	if g.mapping != nil {
+		err := munmap(g.mapping)
+		g.mapping = nil
 		return err
 	}
 	return nil

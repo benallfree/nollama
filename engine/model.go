@@ -6,11 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+
+	"github.com/benallfree/nollama/models"
 )
 
 // LoadOptions configures Load.
@@ -135,10 +136,57 @@ func Load(path string, opts LoadOptions) (*Model, error) {
 		return nil, err
 	}
 	if opts.ID == "" {
-		if st, err := os.Stat(path); err == nil {
-			opts.ID = fmt.Sprintf("%s:%d", filepath.Base(path), st.Size())
-		}
+		opts.ID = fmt.Sprintf("%s:%d", filepath.Base(path), g.size)
 	}
+	return load(g, opts)
+}
+
+// LoadRange opens the GGUF that takes up size bytes of the file at path starting at offset, such as a model
+// bundled at the end of an executable (see models.Bundle). It is mmapped like a file of its own, so it loads as
+// fast. size 0 means to the end of the file.
+func LoadRange(path string, offset, size int64, opts LoadOptions) (*Model, error) {
+	g, err := openGGUFRange(path, offset, size)
+	if err != nil {
+		return nil, err
+	}
+	if opts.ID == "" {
+		opts.ID = fmt.Sprintf("%s@%d:%d", filepath.Base(path), offset, g.size)
+	}
+	return load(g, opts)
+}
+
+// LoadBytes opens a GGUF already in memory, such as one compiled into the program with go:embed. The model reads
+// data in place and never writes to it; data must stay unchanged until Close. A //go:embed []byte or string is
+// paged in from the executable by the operating system as it's read, so it costs no copy and no startup time.
+func LoadBytes(data []byte, opts LoadOptions) (*Model, error) {
+	g, err := parseGGUF(data)
+	if err != nil {
+		return nil, err
+	}
+	g.size = int64(len(data))
+	if opts.ID == "" {
+		opts.ID = fmt.Sprintf("bytes:%d", g.size)
+	}
+	return load(g, opts)
+}
+
+// LoadSource opens the model a models.Source points at: a file, a model bundled in the executable, or one
+// registered with models.Embed.
+func LoadSource(src models.Source, opts LoadOptions) (*Model, error) {
+	if opts.ID == "" && (src.Data != nil || src.Offset > 0) {
+		// the same name a downloaded copy has, so a conversation saved with one reads back with the other
+		opts.ID = fmt.Sprintf("%s.gguf:%d", src.Name, src.Size)
+	}
+	switch {
+	case src.Data != nil:
+		return LoadBytes(src.Data, opts)
+	case src.Offset > 0:
+		return LoadRange(src.Path, src.Offset, src.Size, opts)
+	}
+	return Load(src.Path, opts)
+}
+
+func load(g *ggufFile, opts LoadOptions) (*Model, error) {
 	m, err := newModel(g, opts)
 	if err != nil {
 		g.close()

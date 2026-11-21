@@ -290,7 +290,7 @@ func (s *Server) loadOnly(w http.ResponseWriter, name string, ka *time.Duration,
 	if unloading {
 		s.mu.Lock()
 		if s.cur != nil {
-			if src, err := s.resolve(name); err == nil && src.Path == s.cur.src.Path {
+			if src, err := s.resolve(name); err == nil && src.Key() == s.cur.src.Key() {
 				if s.cur.active > 0 {
 					s.cur.drop = true // after the answers it is writing
 				} else {
@@ -322,7 +322,7 @@ type ollamaDetails struct {
 }
 
 func (s *Server) tags(w http.ResponseWriter, r *http.Request) {
-	local, err := models.List(s.cfg.ModelsDir)
+	local, err := models.Available(s.cfg.ModelsDir)
 	if err != nil {
 		ollamaError(w, err)
 		return
@@ -341,12 +341,8 @@ func (s *Server) tags(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		d := ollamaDetails{Format: "gguf", Family: family(m.Name), Families: []string{family(m.Name)}}
-		digest := ""
-		if k, ok := models.Find(m.Name); ok {
-			digest = k.SHA256
-		}
 		out = append(out, tag{Name: m.Name, Model: m.Name, ModifiedAt: time.Unix(m.ModTime, 0).UTC().Format(time.RFC3339),
-			Size: m.Size, Digest: digest, Details: d})
+			Size: m.Size, Digest: m.SHA256, Details: d})
 	}
 	writeJSON(w, 200, map[string]any{"models": out})
 }
@@ -499,6 +495,10 @@ func (s *Server) deleteModel(w http.ResponseWriter, r *http.Request) {
 		ollamaError(w, err)
 		return
 	}
+	if src.Inside {
+		ollamaError(w, badRequest{fmt.Errorf("%s is built into this program, not a download; it can't be deleted", src.Name)})
+		return
+	}
 	if src.URL == "" {
 		ollamaError(w, badRequest{fmt.Errorf("%s is a file you named, not a download; nollama leaves it alone", src.Name)})
 		return
@@ -508,7 +508,7 @@ func (s *Server) deleteModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	if s.cur != nil && s.cur.src.Path == src.Path {
+	if s.cur != nil && s.cur.src.Key() == src.Key() {
 		old := s.cur
 		s.cur = nil
 		s.retire(old)

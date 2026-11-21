@@ -1,5 +1,6 @@
 // Package models finds model files: a name nollama knows (downloaded from its publisher and checked against its
-// SHA-256), an hf:<org>/<repo>/<file>.gguf from Hugging Face, or a path to a .gguf file.
+// SHA-256), an hf:<org>/<repo>/<file>.gguf from Hugging Face, a path to a .gguf file, or a model inside the program
+// itself (bundled at the end of the executable with Bundle, or compiled in and registered with Embed).
 package models
 
 import (
@@ -68,13 +69,29 @@ func DefaultDir() string {
 	return filepath.Join(dir, "nollama", "models")
 }
 
-// Source is where a model's file comes from: a local path (used as it is), or a download into the cache.
+// Source is where a model's file comes from: a local path (used as it is), a download into the cache, or the
+// program itself (a model bundled at the end of its executable, or one registered with Embed).
 type Source struct {
 	Name   string // the name asked for (an Ollama-style "qwen3:0.6b" comes back as "qwen3-0.6b")
-	Path   string // the local file
+	Path   string // the local file (for a bundled model, the executable; for an embedded one, "embedded:<name>")
 	URL    string // "" for a local file
 	SHA256 string // "" when unverified (an hf: model)
-	Size   int64
+	Size   int64  // the download's size; for a model inside the program, the model's size
+
+	Inside bool   // inside the program: bundled in the executable (Path, Offset, Size) or embedded (Data)
+	Offset int64  // where a bundled model starts in Path
+	Data   []byte // an embedded model's bytes
+}
+
+// Key tells sources apart: two sources with the same key are the same model bytes.
+func (s Source) Key() string {
+	switch {
+	case s.Data != nil:
+		return "embedded:" + s.Name
+	case s.Offset > 0:
+		return fmt.Sprintf("%s@%d", s.Path, s.Offset)
+	}
+	return s.Path
 }
 
 // Normalize turns an Ollama-style name into nollama's: "qwen3:0.6b" is "qwen3-0.6b", and ":latest" is dropped.
@@ -88,10 +105,14 @@ func Normalize(spec string) string {
 	return strings.Replace(spec, ":", "-", 1)
 }
 
-// Resolve turns a model spec into a source: a catalog name (or its Ollama spelling, "qwen3:0.6b"),
-// "hf:<org>/<repo>/<file>.gguf", or a path to a .gguf file. Downloads go under dir.
+// Resolve turns a model spec into a source: a model inside the program (bundled or embedded, by its name), a
+// catalog name (or its Ollama spelling, "qwen3:0.6b"), "hf:<org>/<repo>/<file>.gguf", or a path to a .gguf file.
+// Downloads go under dir.
 func Resolve(spec, dir string) (Source, error) {
 	spec = Normalize(spec)
+	if src, ok := findInside(spec); ok {
+		return src, nil
+	}
 	if m, ok := Find(spec); ok {
 		return Source{Name: spec, Path: filepath.Join(dir, m.Name+".gguf"), URL: m.URL, SHA256: m.SHA256, Size: m.Size}, nil
 	}
@@ -153,6 +174,9 @@ func ExpandHome(p string) string {
 
 // Present reports whether the source's file is on disk.
 func (s Source) Present() bool {
+	if s.Inside {
+		return true
+	}
 	_, err := os.Stat(s.Path)
 	return err == nil
 }
@@ -160,6 +184,9 @@ func (s Source) Present() bool {
 // Fetch makes sure the source's file is on disk, downloading it (to a .part file, then renamed) when it isn't, and
 // checking its SHA-256 when known. progress, when set, gets the bytes done and the total (0 when unknown).
 func Fetch(src Source, client *http.Client, progress func(done, total int64)) error {
+	if src.Inside {
+		return nil
+	}
 	if _, err := os.Stat(src.Path); err == nil {
 		return nil
 	} else if src.URL == "" {
@@ -226,6 +253,8 @@ type Local struct {
 	Path    string
 	Size    int64
 	ModTime int64 // Unix seconds
+	SHA256  string
+	Inside  bool // bundled in the executable or embedded, not a download
 }
 
 // List returns the .gguf files under dir: catalog downloads by name, hf: downloads by their spec.
@@ -251,7 +280,11 @@ func List(dir string) ([]Local, error) {
 			// hf/<org>_<repo>_<file>.gguf: the org and repo can't be told apart again, so the file stands for itself
 			name = p
 		}
-		out = append(out, Local{Name: name, Path: p, Size: fi.Size(), ModTime: fi.ModTime().Unix()})
+		l := Local{Name: name, Path: p, Size: fi.Size(), ModTime: fi.ModTime().Unix()}
+		if k, ok := Find(name); ok {
+			l.SHA256 = k.SHA256
+		}
+		out = append(out, l)
 		return nil
 	})
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })

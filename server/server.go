@@ -50,7 +50,8 @@ type Config struct {
 	MaxNumCtx      int      // largest context window a request may ask for with num_ctx (default 32768, capped at the model's)
 	PerClient      int      // requests one client IP may have open at once (default 8; negative: no limit)
 
-	// Load opens a model file (default engine.Load). A test can wrap it, e.g. to set LoadOptions.Respond (see the
+	// Load opens a model file (default engine.Load); a model built into the program is opened with
+	// engine.LoadSource instead. A test can wrap it, e.g. to set LoadOptions.Respond (see the
 	// nollamatest package).
 	Load func(path string, opts engine.LoadOptions) (*engine.Model, error)
 }
@@ -201,7 +202,7 @@ func (s *Server) acquire(name string) (*loaded, time.Duration, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.cur != nil && s.cur.src.Path == src.Path {
+	if s.cur != nil && s.cur.src.Key() == src.Key() {
 		s.hold(s.cur)
 		return s.cur, 0, nil
 	}
@@ -210,7 +211,13 @@ func (s *Server) acquire(name string) (*loaded, time.Duration, error) {
 		s.cur = nil
 		s.retire(old)
 	}
-	m, err := s.cfg.Load(src.Path, engine.LoadOptions{Threads: s.cfg.Threads, PromptCache: s.cfg.PromptCache})
+	opts := engine.LoadOptions{Threads: s.cfg.Threads, PromptCache: s.cfg.PromptCache}
+	var m *engine.Model
+	if src.Inside {
+		m, err = engine.LoadSource(src, opts) // bundled in the executable or embedded: not a file of its own
+	} else {
+		m, err = s.cfg.Load(src.Path, opts)
+	}
 	if err != nil {
 		return nil, 0, fmt.Errorf("loading %s: %w", src.Name, err)
 	}

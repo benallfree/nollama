@@ -334,7 +334,7 @@ func (s *Server) openaiCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) openaiModels(w http.ResponseWriter, r *http.Request) {
-	local, err := models.List(s.cfg.ModelsDir)
+	local, err := models.Available(s.cfg.ModelsDir)
 	if err != nil {
 		openaiError(w, err)
 		return

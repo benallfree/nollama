@@ -19,6 +19,7 @@ becomes `## vX.Y.Z` and its lines are the release notes (`release.sh` reads them
 - Opt-in truncation: `"truncate": true` on `/api/chat` and `/v1/chat/completions`, or `nollama serve --truncate`, keeps the system prompt and the most recent messages, and reports what was dropped in a `truncated` field and the server log.
 - `prompt_eval_count` and `eval_count` are always in Ollama's final answer, even when 0. `/v1/completions` streams `usage` with `stream_options.include_usage`.
 - Engine: context errors are `*engine.ContextError` (matches `engine.ErrContextExceeded`) with the counts; `engine.TrimMessages` trims a conversation to a token budget.
+- Models inside the binary: `nollama bundle -o <file> <model>...` adds GGUF files to the end of nollama or any Go program built with it, found by name and mmapped from the executable; `nollama bundle -check` verifies them. Go programs can also compile a model in with `go:embed` and `models.Embed`. New `engine.LoadSource`, `engine.LoadRange`, `engine.LoadBytes`, `models.Bundle`, `models.Available` and `models.Verify`; `/api/tags`, `/v1/models` and `nollama list` show built-in models.
 
 ## v0.0.1-alpha.1
 

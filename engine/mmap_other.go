@@ -2,16 +2,12 @@
 
 package engine
 
-import (
-	"io"
-	"os"
-)
+import "os"
 
-// Fallback: read the whole file into memory.
-func mmapFile(f *os.File, size int64) ([]byte, error) {
-	b := make([]byte, size)
-	_, err := io.ReadFull(f, b)
-	return b, err
+// Fallback where nollama doesn't mmap: read the range into memory.
+func mmapRange(f *os.File, off, size int64) (mapping, data []byte, err error) {
+	b, err := readRange(f, off, size)
+	return nil, b, err
 }
 
 func munmap(b []byte) error { return nil }

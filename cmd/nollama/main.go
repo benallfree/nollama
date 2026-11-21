@@ -5,6 +5,7 @@
 //	nollama run qwen3-1.7b     chat with a model in the terminal (or: nollama run qwen3-1.7b "a prompt")
 //	nollama list               the models downloaded
 //	nollama rm qwen3-1.7b      delete a downloaded model
+//	nollama bundle -o myai qwen3-0.6b   a copy of nollama with the model inside, so it downloads nothing
 package main
 
 import (
@@ -35,6 +36,10 @@ Usage:
   nollama run <model> [prompt]   chat in the terminal, or answer one prompt
   nollama list                   the models downloaded
   nollama rm <model>             delete a downloaded model
+  nollama bundle -o <file> <model>...
+                                 write a copy of nollama (or -exe, any program built
+                                 with nollama) with the models inside it
+  nollama bundle -check <file>   list the models inside a file and check their SHA-256
   nollama version
 
 Models: %s, hf:<org>/<repo>/<file>.gguf, or a path to a .gguf file.
@@ -68,6 +73,8 @@ func main() {
 		err = cmdList(args)
 	case "rm":
 		err = cmdRm(args)
+	case "bundle":
+		err = cmdBundle(args)
 	case "version", "--version", "-v":
 		fmt.Println("nollama", version)
 	case "help", "-h", "--help":
@@ -214,16 +221,21 @@ func cmdPull(args []string) error {
 		return errors.New("usage: nollama pull <model>")
 	}
 	src, err := pull(args[0])
-	if err == nil {
+	if err == nil && src.Inside {
+		fmt.Println(src.Name, "is built into this program")
+	} else if err == nil {
 		fmt.Println(src.Path)
 	}
 	return err
 }
 
 func cmdList(args []string) error {
-	local, err := models.List(modelsDir())
+	local, err := models.Available(modelsDir())
 	if err != nil {
 		return err
+	}
+	if err := models.BundleError(); err != nil {
+		fmt.Fprintln(os.Stderr, "nollama:", err)
 	}
 	if len(local) == 0 {
 		fmt.Printf("no models in %s yet; try: nollama pull %s\n", modelsDir(), models.Catalog[1].Name)
@@ -231,7 +243,11 @@ func cmdList(args []string) error {
 	}
 	fmt.Printf("%-28s %10s  %s\n", "NAME", "SIZE", "MODIFIED")
 	for _, m := range local {
-		fmt.Printf("%-28s %10s  %s\n", m.Name, size(m.Size), time.Unix(m.ModTime, 0).Format("2006-01-02 15:04"))
+		where := ""
+		if m.Inside {
+			where = "  (built in)"
+		}
+		fmt.Printf("%-28s %10s  %s%s\n", m.Name, size(m.Size), time.Unix(m.ModTime, 0).Format("2006-01-02 15:04"), where)
 	}
 	return nil
 }
@@ -243,6 +259,9 @@ func cmdRm(args []string) error {
 	src, err := models.Resolve(args[0], modelsDir())
 	if err != nil {
 		return err
+	}
+	if src.Inside {
+		return fmt.Errorf("%s is built into this program, not a download; it can't be deleted", src.Name)
 	}
 	if src.URL == "" {
 		return fmt.Errorf("%s is a file you named, not a download; nollama leaves it alone", src.Path)
@@ -269,7 +288,7 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	m, err := engine.Load(src.Path, engine.LoadOptions{Threads: *threads, PromptCache: 256 << 20})
+	m, err := engine.LoadSource(src, engine.LoadOptions{Threads: *threads, PromptCache: 256 << 20})
 	if err != nil {
 		return err
 	}
@@ -329,6 +348,86 @@ func cmdRun(args []string) error {
 			return err
 		}
 	}
+}
+
+func cmdBundle(args []string) error {
+	fs := flag.NewFlagSet("bundle", flag.ExitOnError)
+	out := fs.String("o", "", "the file to write")
+	exe := fs.String("exe", "", "the program to add the models to (default: this nollama); any Go program that uses nollama's models package finds them")
+	check := fs.String("check", "", "list the models inside this file and check their SHA-256, instead of writing one")
+	fs.Usage = func() {
+		fmt.Fprint(os.Stderr, `usage: nollama bundle -o <file> [-exe <program>] <model>... 
+       nollama bundle -check <file>
+
+Writes a copy of the program with the models added to its end. The copy finds them by name with nothing to
+download: "nollama run qwen3-0.6b", the server's /api/tags, and models.Resolve in your own Go program. A model is
+<name>, <name>=<spec> to give it another name, or any spec nollama run takes; it's downloaded first if needed.
+
+`)
+		fs.PrintDefaults()
+	}
+	fs.Parse(args)
+	if *check != "" {
+		return checkBundle(*check)
+	}
+	if *out == "" || fs.NArg() == 0 {
+		fs.Usage()
+		os.Exit(2)
+	}
+	if *exe == "" {
+		self, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		*exe = self
+	}
+	var srcs []models.Source
+	for _, arg := range fs.Args() {
+		name, spec, renamed := strings.Cut(arg, "=")
+		if !renamed {
+			spec = arg
+		}
+		src, err := pull(spec)
+		if err != nil {
+			return err
+		}
+		if renamed {
+			src.Name = models.Normalize(name)
+		}
+		srcs = append(srcs, src)
+	}
+	list, err := models.Bundle(*out, *exe, srcs)
+	if err != nil {
+		return err
+	}
+	for _, b := range list {
+		fmt.Printf("%-28s %10s  sha256 %s\n", b.Name, size(b.Size), b.SHA256)
+	}
+	fmt.Println("wrote", *out)
+	return nil
+}
+
+func checkBundle(path string) error {
+	_, list, err := models.ReadBundle(path)
+	if err != nil {
+		return err
+	}
+	if len(list) == 0 {
+		return fmt.Errorf("%s has no models inside", path)
+	}
+	bad := 0
+	for _, b := range list {
+		err := models.Verify(models.Source{Name: b.Name, Path: path, Offset: b.Offset, Size: b.Size, SHA256: b.SHA256})
+		status := "sha256 ok"
+		if err != nil {
+			status, bad = err.Error(), bad+1
+		}
+		fmt.Printf("%-28s %10s  %s\n", b.Name, size(b.Size), status)
+	}
+	if bad > 0 {
+		return fmt.Errorf("%d of %d models failed their check", bad, len(list))
+	}
+	return nil
 }
 
 func size(n int64) string {
