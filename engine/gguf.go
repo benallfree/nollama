@@ -79,6 +79,7 @@ type ggufFile struct {
 	Tensors map[string]*tensorInfo
 	Order   []string
 	data    []byte // whole mmapped file
+	dataOff int    // where tensor data starts (the header's end, aligned)
 	size    int64
 }
 
@@ -268,6 +269,7 @@ func parseGGUF(data []byte) (*ggufFile, error) {
 		align = int(a)
 	}
 	base := (r.pos + align - 1) / align * align
+	g.dataOff = min(base, len(data))
 	for _, ti := range g.Tensors {
 		var n uint64 = 1
 		for _, d := range ti.Dims {

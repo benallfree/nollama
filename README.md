@@ -113,6 +113,46 @@ fmt.Println(res.Text) // {"label": "billing"}
 The engine also keeps the start of recent prompts (`LoadOptions.PromptCache`), so a long system prompt is read once,
 and can keep a conversation's state between calls (`GenerateOptions.Thread`).
 
+### Save a conversation and pick it up later
+
+A thread's state (the keys and values of every token the model read and wrote) can be saved wherever your app keeps
+things, and loaded back after a restart or on another machine. The next turn then reads only the new message, not the
+whole conversation:
+
+```go
+var buf bytes.Buffer
+_ = m.SaveThread(&buf, "", "chat-42", engine.SnapshotOptions{})   // after a Generate with Thread: "chat-42"
+// ... store buf.Bytes() in a file, a database row, object storage ...
+
+info, err := m.LoadThread(bytes.NewReader(saved), "", "chat-42", engine.SnapshotOptions{})
+res, _ := m.Generate(ctx, prompt, engine.GenerateOptions{Thread: "chat-42"}, nil) // res.CachedTokens: the saved part
+```
+
+`SavePromptCache` and `LoadPromptCache` do the same for the prompt cache, so a long system prompt warmed once (`Warm`)
+can ship with your app or survive restarts, pinned so other prompts don't push it out.
+
+A snapshot is tied to the model file it came from (a fingerprint of the GGUF's header and samples of its weights, so a
+renamed copy works and a finetune with the same shapes doesn't), versioned and checksummed; a mismatch returns
+`engine.ErrSnapshotModel`, damage `engine.ErrSnapshotCorrupt`. It's half precision by default, which moves token
+probabilities by about one in a million; `SnapshotOptions{Full: true}` stores exact floats, and the conversation then
+continues bit for bit as if it had never stopped. `Compress: true` deflates it: that saves 11 to 17% at full precision,
+but only 2 to 6% at half, whose bits are mostly noise to a compressor.
+
+Snapshots are big: every token keeps its keys and values for every layer, about 112 KB per token at half precision for
+Qwen3 0.6B. Restoring is still far cheaper than reading again. A 2,149-token conversation on `qwen3:0.6b` (Q4_K_M,
+Apple M1 Max, 4 threads, other jobs running, so the reading time is on the slow side):
+
+| | Size | Save | Load |
+|---|---|---|---|
+| Reading the conversation again | | | 29 to 35 s |
+| Half precision | 247 MB | 1.5 to 3 s | 0.5 to 1.0 s |
+| Half, compressed | 231 MB | 1.6 s | 1.5 s |
+| Full precision | 493 MB | 0.7 s | 0.3 to 0.8 s |
+| Full, compressed | 409 MB | 1.7 s | 2.4 s |
+
+(`GenerateOptions.ThreadDir` already keeps threads on disk in a folder the engine manages; snapshots are for when your
+app wants to hold the state itself.)
+
 ## Test without a model
 
 The `nollamatest` package lets your tests run in CI with no download. A scripted model answers with a function you

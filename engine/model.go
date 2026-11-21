@@ -84,10 +84,11 @@ type Model struct {
 	stateMu sync.Mutex
 	states  []*state // idle generation states (KV caches), reused to avoid GC churn
 
-	prefix  prefixCache // the start of recent prompts (keys and values), for reuse
-	threads threadStore // conversations' state between calls
-	id      string      // in thread files
-	respond func(prompt string) string
+	prefix      prefixCache // the start of recent prompts (keys and values), for reuse
+	threads     threadStore // conversations' state between calls
+	id          string      // in thread files
+	fingerprint [32]byte    // of the GGUF file, in snapshots (snapshot.go)
+	respond     func(prompt string) string
 }
 
 // getState returns an idle state with room for maxCtx positions and batches of maxN.
@@ -150,6 +151,7 @@ func newModel(g *ggufFile, opts LoadOptions) (*Model, error) {
 	m.threads.budget = opts.ThreadMemory
 	m.id = opts.ID
 	m.respond = opts.Respond
+	m.fingerprint = ggufFingerprint(g)
 	req := func(k string) (int, error) {
 		v, ok := g.getInt(arch + "." + k)
 		if !ok {

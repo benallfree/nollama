@@ -13,6 +13,7 @@ becomes `## vX.Y.Z` and its lines are the release notes (`release.sh` reads them
 - The same settings are fields of `server.Config` for embedders.
 - `nollamatest` package: test code that uses nollama with no model download. A tiny random-weight Qwen3 model (about 1 MB, built in memory) runs the real engine; a scripted model answers with a function you write; `nollamatest.NewServer(t)` runs either behind the real Ollama/OpenAI HTTP server, answering to every catalog model name.
 - `engine.LoadOptions.Respond` makes a model answer from a script instead of its weights, and `server.Config.Load` lets a test choose how model files are opened.
+- Save and load a conversation's state, and the prompt cache's, through any `io.Writer`/`io.Reader` (`Model.SaveThread`, `LoadThread`, `SavePromptCache`, `LoadPromptCache`): a long conversation picks up after a restart without being read again. Snapshots are tied to the model file by a fingerprint, versioned and checksummed, half or full precision, optionally compressed.
 
 ## v0.0.1-alpha.1
 
