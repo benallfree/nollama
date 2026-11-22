@@ -61,7 +61,7 @@ func (m *metalBackend) name() string {
 }
 func (m *metalBackend) unified() bool { return true }
 
-func (m *metalBackend) halfPrompts() bool { return false }
+func (m *metalBackend) halfPrompts() bool { return !m.det }
 func (m *metalBackend) int8Prompts() bool { return false }
 func (m *metalBackend) supportsKV(t uint32) bool {
 	return t == typeF32 || (t == typeF16 || t == typeQ8_0 || t == typeQ4_0) && !m.det
@@ -228,7 +228,7 @@ func (b *metalBatch) matmulTiled(w *weight, x, out gpuRef, n int) {
 		Writes:  1 << 2,
 		Groups:  metal.Size{W: uint((w.rows + 63) / 64), H: uint((n + 63) / 64), D: 1},
 		Threads: metal.Size{W: 256, H: 1, D: 1},
-		Shared:  64 * 68 * 4, // the two 64x32 input tiles, then the 64x64 output tile (rows padded: MM_LD, MM_OLD)
+		Shared:  (64*36 + 32*68) * 2, // the two half tiles: 64 rows x 32 k (MM_LD), 32 k x 64 tokens (MM_XLD)
 	})
 }
 
@@ -452,13 +452,14 @@ func (b *metalBatch) attention(a gpuAttention) {
 		return
 	}
 	if a.n > attnSplitTokens && a.headDim == 128 && !metalAttnOnePass && !metalAttnTile { // prompts on the matrix units
+		const fqt = 64 // tokens per threadgroup (8 simdgroups)
 		b.ds = append(b.ds, metal.Dispatch{
 			P: b.m.ps["attention_flash"+kv],
 			Args: []metal.Arg{marg(a.q), marg(a.k), marg(a.v), marg(a.out), marg(a.mask),
 				{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos), a.scale(), uint32(a.n), ss)}, stage},
 			Writes:  1 << 3,
-			Groups:  metal.Size{W: uint(a.heads), H: uint((a.n + 31) / 32), D: 1},
-			Threads: metal.Size{W: 128, H: 1, D: 1},
+			Groups:  metal.Size{W: uint(a.heads), H: uint((a.n + fqt - 1) / fqt), D: 1},
+			Threads: metal.Size{W: uint(4 * fqt), H: 1, D: 1},
 		})
 		return
 	}

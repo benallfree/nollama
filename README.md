@@ -518,13 +518,13 @@ prompt, then after the long one.
 
 | Machine | Model | nollama: reading short / long | nollama: writing | Ollama: reading long | Ollama: writing |
 |---|---|---|---|---|---|
-| Apple M1 Max (Metal), idle GPU | 1.7b Q8_0 | 620 / 1,370 tok/s | 105 to 111 / 93 to 99 tok/s | 2,416 tok/s | 111 tok/s |
-| Apple M1 Max (Metal), idle GPU | 1.7b Q4_K_M | 610 / 1,300 tok/s | 120 to 128 / 112 tok/s (`f16` cache: 130 to 136 short) | 2,174 tok/s | 134 to 144 tok/s |
+| Apple M1 Max (Metal), idle GPU | 1.7b Q8_0 | 620 / 1,550 tok/s | 105 to 111 / 93 to 99 tok/s | 2,416 tok/s | 111 tok/s |
+| Apple M1 Max (Metal), idle GPU | 1.7b Q4_K_M | 610 / 1,460 tok/s | 120 to 128 / 112 tok/s (`f16` cache: 130 to 136 short) | 2,174 tok/s | 134 to 144 tok/s |
 | NVIDIA A16 (CUDA), Vultr `vcg-a16-6c-60g-16vram` | 1.7b Q8_0 | 690 / 1,340 tok/s | 63 / 60 tok/s | 3,224 tok/s | 68 to 70 tok/s |
 | NVIDIA A16 (CUDA), Vultr `vcg-a16-6c-60g-16vram` | 1.7b Q4_K_M | 960 / 1,550 tok/s | 80 / 75 tok/s | 3,036 tok/s | 83 to 85 tok/s |
 | NVIDIA A16 (CUDA), Vultr `vcg-a16-6c-60g-16vram` | 4b Q4_K_M | 477 / 733 tok/s | 38 / 34 tok/s | 1,290 tok/s | 40 to 41 tok/s |
 
-Writing runs at 85 to 100% of Ollama's GPU speed. Reading prompts is the gap: 40 to 60% of Ollama's, so a long prompt
+Writing runs at 85 to 100% of Ollama's GPU speed. Reading prompts is the gap: 40 to 65% of Ollama's, so a long prompt
 takes about twice as long before the first word. `go run ./engine/cmd/bench run -gguf FILE -gpu auto -prompt long`
 measures one model; `-kv f16` picks the cache.
 
