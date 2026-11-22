@@ -525,7 +525,9 @@ prompt, then after the long one.
 | NVIDIA A16 (CUDA), Vultr `vcg-a16-6c-60g-16vram` | 4b Q4_K_M | 477 / 733 tok/s | 38 / 34 tok/s | 1,290 tok/s | 40 to 41 tok/s |
 
 Writing runs at 85 to 100% of Ollama's GPU speed. Reading prompts is the gap: 40 to 65% of Ollama's, so a long prompt
-takes about twice as long before the first word. `go run ./engine/cmd/bench run -gguf FILE -gpu auto -prompt long`
+takes about twice as long before the first word. The A16 rows predate copying a prompt's keys and values back through
+page-locked memory, which made reading the long prompt 5 to 8% faster there (against the previous build on the same
+machine). `go run ./engine/cmd/bench run -gguf FILE -gpu auto -prompt long`
 measures one model; `-kv f16` picks the cache.
 
 ### On small cloud servers

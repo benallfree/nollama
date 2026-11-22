@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"fmt"
 	"math"
+	"sync"
 	"unsafe"
 
 	"github.com/benallfree/nollama/engine/internal/cuda"
@@ -52,6 +53,27 @@ type cudaBackend struct {
 	weights cuda.Ptr // the model file, uploaded once
 	base    uintptr  // address of the file's first byte in host memory
 	det     bool     // the deterministic kernels (gpu_det.cu): the CPU's reference results, bit for bit
+	hostMu  sync.Mutex
+	host    []byte // page-locked memory lent to copy-backs (hostStage)
+}
+
+// hostStage lends n bytes of page-locked memory for reading a forward's new keys and values back (done returns it).
+// Copies into it run at full DMA speed; into memory from make they went through the driver's staging and page faults
+// (on an A16, the copy-back of a 512-token prompt took 77 to 113 ms of a 340 to 390 ms forward). It returns nil, and
+// the caller uses ordinary memory, if page-locked memory can't be had.
+func (c *cudaBackend) hostStage(n int) (buf []byte, done func()) {
+	c.hostMu.Lock()
+	if len(c.host) < n {
+		c.dev.HostFree(c.host)
+		c.host = nil
+		b, err := c.dev.HostAlloc((n + 1<<20 - 1) &^ (1<<20 - 1))
+		if err != nil {
+			c.hostMu.Unlock()
+			return nil, func() {}
+		}
+		c.host = b
+	}
+	return c.host[:n], c.hostMu.Unlock
 }
 
 func openCUDA(det bool) (gpuBackend, error) {
@@ -125,6 +147,7 @@ func (c *cudaBackend) loadWeights(file []byte) error {
 }
 
 func (c *cudaBackend) close() {
+	c.dev.HostFree(c.host)
 	if c.weights != 0 {
 		c.dev.Free(c.weights)
 	}

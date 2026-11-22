@@ -956,12 +956,14 @@ __device__ __forceinline__ void attention_flash_kv(const float *q, const typenam
 	uint ctxEnd = a.pos + t0 + nt;
 	KV cache{kT, v, stage, a.ctxP, kvd, FA_HD, kvh, a.stageStart};
 	for (uint c0 = 0; c0 < ctxEnd; c0 += FA_KC) {
+		// stage in the order the cache stores (coalesced reads): the f32 cache has keys by channel and values by
+		// position, the compact caches the other way round
 		for (uint i = tid; i < FA_HD * FA_KC; i += 128) {
-			uint d = i / FA_KC, j = i % FA_KC;
+			uint d = KV::byChannel ? i % FA_HD : i / FA_KC, j = KV::byChannel ? i / FA_HD : i % FA_KC;
 			ks[d * FA_KLD + j] = __float2half(c0 + j < ctxEnd ? cache.key(c0 + j, d) : 0.f);
 		}
 		for (uint i = tid; i < FA_KC * FA_HD; i += 128) {
-			uint j = i / FA_HD, d = i % FA_HD;
+			uint j = KV::byChannel ? i % FA_KC : i / FA_HD, d = KV::byChannel ? i / FA_KC : i % FA_HD;
 			vs[j * FA_VLD + d] = __float2half(c0 + j < ctxEnd ? cache.val(c0 + j, d) : 0.f);
 		}
 		__syncthreads();

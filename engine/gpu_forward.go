@@ -439,7 +439,8 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 			gs.lastEnd = pos + n
 		} else if !g.shared && f16 { // bring the cache up to date with the keys and values this call wrote
 			nl := len(m.layers)
-			vs := make([]byte, nl*n*kvd*2)
+			vs, done := g.stageBuf(nl * n * kvd * 2)
+			defer done()
 			b.read(gs.vStage, vs)
 			for li := range m.layers {
 				b.read(gs.kc[li].at(2*pos*kvd), s.kv.k[li][2*pos*kvd:2*(pos+n)*kvd])
@@ -451,7 +452,10 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 			gs.lastEnd = pos + n
 		} else if !g.shared { // bring kc/vc up to date with the keys and values this call wrote
 			nl := len(m.layers)
-			ks, vs := make([]float32, nl*n*kvd), make([]float32, nl*n*kvd)
+			buf, done := g.stageBuf(2 * 4 * nl * n * kvd)
+			defer done()
+			kvs := unsafe.Slice((*float32)(unsafe.Pointer(unsafe.SliceData(buf))), 2*nl*n*kvd)
+			ks, vs := kvs[:nl*n*kvd], kvs[nl*n*kvd:]
 			g.readFloats(gs.kStage, ks) // two reads for all layers
 			g.readFloats(gs.vStage, vs)
 			for li := range m.layers {
@@ -488,6 +492,17 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 		g.readFloats(gs.logits, s.logits)
 	}
 	return nil
+}
+
+// stageBuf is n bytes to read a copy-back into: the backend's page-locked memory when it lends some (CUDA), else
+// ordinary memory. done gives it back.
+func (g *gpuModel) stageBuf(n int) (buf []byte, done func()) {
+	if hs, ok := g.b.(interface{ hostStage(int) ([]byte, func()) }); ok {
+		if buf, done = hs.hostStage(n); buf != nil {
+			return buf, done
+		}
+	}
+	return make([]byte, n), func() {}
 }
 
 // readFloats copies len(dst) floats from the device.

@@ -23,6 +23,8 @@ func (d *Device) Alloc(n int) (Ptr, error)        { return 0, errNo }
 func (d *Device) Free(p Ptr)                      {}
 func (d *Device) Write(dst Ptr, src []byte) error { return errNo }
 func (d *Device) Read(src Ptr, dst []byte) error  { return errNo }
+func (d *Device) HostAlloc(n int) ([]byte, error) { return nil, errNo }
+func (d *Device) HostFree(b []byte)               {}
 
 type Module struct{}
 type Kernel struct{ Name string }

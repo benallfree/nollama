@@ -41,6 +41,8 @@ var (
 	cuMemcpyHtoD              func(dst uint64, src unsafe.Pointer, n uint64) result
 	cuMemcpyDtoH              func(dst unsafe.Pointer, src uint64, n uint64) result
 	cuMemsetD8                func(dst uint64, v uint8, n uint64) result
+	cuMemAllocHost            func(p *unsafe.Pointer, n uint64) result
+	cuMemFreeHost             func(p unsafe.Pointer) result
 	cuStreamCreate            func(s *uintptr, flags uint32) result
 	cuStreamDestroy           func(s uintptr) result
 	cuStreamSynchronize       func(s uintptr) result
@@ -86,6 +88,7 @@ func load() error {
 			{&cuModuleGetFunction, "cuModuleGetFunction"}, {&cuFuncSetAttribute, "cuFuncSetAttribute"},
 			{&cuMemAlloc, "cuMemAlloc_v2"}, {&cuMemFree, "cuMemFree_v2"},
 			{&cuMemcpyHtoD, "cuMemcpyHtoD_v2"}, {&cuMemcpyDtoH, "cuMemcpyDtoH_v2"}, {&cuMemsetD8, "cuMemsetD8_v2"},
+			{&cuMemAllocHost, "cuMemAllocHost_v2"}, {&cuMemFreeHost, "cuMemFreeHost"},
 			{&cuStreamCreate, "cuStreamCreate"}, {&cuStreamDestroy, "cuStreamDestroy_v2"},
 			{&cuStreamSynchronize, "cuStreamSynchronize"}, {&cuLaunchKernel, "cuLaunchKernel"},
 			{&cuGetErrorString, "cuGetErrorString"},
@@ -246,6 +249,24 @@ func (d *Device) Read(src Ptr, dst []byte) error {
 		}
 		return errorOf("cuMemcpyDtoH", cuMemcpyDtoH(unsafe.Pointer(unsafe.SliceData(dst)), uint64(src), uint64(len(dst))))
 	})
+}
+
+// HostAlloc allocates n bytes of page-locked host memory: copies between it and the device run at full DMA speed,
+// where pageable memory goes through the driver's own staging.
+func (d *Device) HostAlloc(n int) ([]byte, error) {
+	var p unsafe.Pointer
+	err := d.do(func() error { return errorOf(fmt.Sprintf("cuMemAllocHost(%d)", n), cuMemAllocHost(&p, uint64(n))) })
+	if err != nil {
+		return nil, err
+	}
+	return unsafe.Slice((*byte)(p), n), nil
+}
+
+// HostFree frees memory from HostAlloc.
+func (d *Device) HostFree(b []byte) {
+	if len(b) > 0 {
+		d.do(func() error { cuMemFreeHost(unsafe.Pointer(unsafe.SliceData(b))); return nil })
+	}
 }
 
 // Module is loaded PTX.
