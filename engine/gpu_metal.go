@@ -20,7 +20,7 @@ var metalDetSource string
 var metalDetKernels = []string{"rmsnorm_det", "swiglu_det", "quant_q8_0_det", "quant_q8_k_det", "matvec_q8_0_det", "matvec_q4k_det", "matmul_q8_0_det", "matvec1_q8_0_det", "attention_det"}
 
 // metalKernels are the kernels metalSource defines.
-var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "matmul_q4k_f32", "matmul_q6k_f32", "matvec_q6k_f32", "matvec_f16_f32", "matmul_f16_f32", "norm_rope_f32", "add_norm_f32", "attention_f32", "attention_tile_f32", "attention_split_f32", "attention_combine_f32", "kv_store_f32", "copy_f32"}
+var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "matmul_q4k_f32", "matmul_q6k_f32", "matvec_q6k_f32", "matvec_f16_f32", "matmul_f16_f32", "matvec_q4k_pair", "matvec_q8_0_pair", "matvec_q6k_pair", "matvec_f16_pair", "norm_rope_f32", "add_norm_f32", "attention_f32", "attention_tile_f32", "attention_split_f32", "attention_combine_f32", "kv_store_f32", "copy_f32"}
 
 // metalBackend is the gpuBackend for Apple GPUs (unified memory only).
 type metalBackend struct {
@@ -152,7 +152,22 @@ func (b *metalBatch) matmul(w *weight, x, out gpuRef, n int, act gpuRef) {
 }
 
 // matvec is the one-token kernel (a simdgroup per mvRows rows), also usable for small batches.
-func (b *metalBatch) matvec(w *weight, x, out gpuRef, n int) {
+func (b *metalBatch) matvec(w *weight, x, out gpuRef, n int) { b.matvecPair(w, nil, x, out, n) }
+
+// gateUp fuses the matvecs and swiglu for small batches (same weight types); prompts run the three steps.
+func (b *metalBatch) gateUp(wg, wu *weight, x, gate, up, out gpuRef, n int, act gpuRef) {
+	if b.m.det || n >= matmulTiledMin || wg.typ != wu.typ || wg.rows != wu.rows || wg.cols != wu.cols {
+		b.matmul(wg, x, gate, n, act)
+		b.matmul(wu, x, up, n, act)
+		b.swiglu(gate, up, out, n*wg.rows)
+		return
+	}
+	b.wrote()
+	b.matvecPair(wg, wu, x, out, n)
+}
+
+// matvecPair is matvec, or with w2 the pair kernel: silu(w x) * (w2 x).
+func (b *metalBatch) matvecPair(w, w2 *weight, x, out gpuRef, n int) {
 	var kernel string
 	var nb int
 	switch w.typ {
@@ -167,14 +182,20 @@ func (b *metalBatch) matvec(w *weight, x, out gpuRef, n int) {
 	default:
 		panic("metal: matmul doesn't support " + typeName(w.typ))
 	}
-	const nsg = 4       // simdgroups per threadgroup
-	const rows = mvRows // rows per simdgroup
+	nsg := mvSimdgroups
+	rows := mvRows // output rows per simdgroup
+	w2arg := b.weightArg(w)
+	if w2 != nil {
+		kernel = kernel[:len(kernel)-len("f32")] + "pair"
+		rows /= 2
+		w2arg = b.weightArg(w2)
+	}
 	b.ds = append(b.ds, metal.Dispatch{
 		P:       b.m.ps[kernel],
-		Args:    []metal.Arg{b.weightArg(w), marg(x), marg(out), {Bytes: u32(uint32(w.rows), uint32(nb), uint32(w.rowBytes), uint32(w.cols))}},
+		Args:    []metal.Arg{b.weightArg(w), marg(x), marg(out), {Bytes: u32(uint32(w.rows), uint32(nb), uint32(w.rowBytes), uint32(w.cols))}, w2arg},
 		Writes:  1 << 2,
 		Groups:  metal.Size{W: uint((w.rows + nsg*rows - 1) / (nsg * rows)), H: uint(n), D: 1},
-		Threads: metal.Size{W: 32 * nsg, H: 1, D: 1},
+		Threads: metal.Size{W: uint(32 * nsg), H: 1, D: 1},
 	})
 }
 
@@ -183,6 +204,10 @@ var metalAttnOnePass = false
 
 // mvRows is MV_ROWS in gpu.metal: rows per simdgroup in the matvecs.
 const mvRows = 8
+
+// mvSimdgroups is the matvecs' simdgroups per threadgroup: 2 measured best on an M1 Max (more threadgroups for the
+// small matrices), 4 close behind, 8 worse.
+var mvSimdgroups = 2
 
 // matmulTiled is the 32x32-tile kernel for prompt batches (Q8_0 only so far).
 func (b *metalBatch) matmulTiled(w *weight, x, out gpuRef, n int) {
@@ -308,11 +333,24 @@ func (b *metalBatch) normRope(x, w, cs, sn gpuRef, tokens, heads, headDim int, e
 		b.rope(x, cs, sn, tokens, heads, headDim)
 		return
 	}
+	b.normRopeKV(x, w, cs, sn, gpuRef{}, tokens, heads, headDim, 0, 0, eps)
+}
+
+func (b *metalBatch) normRopeKV(x, w, cs, sn, kc gpuRef, tokens, heads, headDim, pos, ctxP int, eps float64) {
+	if b.m.det {
+		panic("metal: normRopeKV in deterministic mode")
+	}
 	b.wrote()
+	store, writes := uint32(0), uint32(1<<0)
+	kcArg := marg(x)
+	if kc.buf != nil {
+		store, writes, kcArg = 1, 1<<0|1<<5, marg(kc)
+	}
 	b.ds = append(b.ds, metal.Dispatch{
-		P:       b.m.ps["norm_rope_f32"],
-		Args:    []metal.Arg{marg(x), marg(w), marg(cs), marg(sn), {Bytes: u32(uint32(heads), uint32(headDim), math.Float32bits(float32(eps)))}},
-		Writes:  1 << 0,
+		P: b.m.ps["norm_rope_f32"],
+		Args: []metal.Arg{marg(x), marg(w), marg(cs), marg(sn),
+			{Bytes: u32(uint32(heads), uint32(headDim), math.Float32bits(float32(eps)), store, uint32(ctxP), uint32(pos))}, kcArg},
+		Writes:  writes,
 		Groups:  metal.Size{W: uint(tokens * heads), H: 1, D: 1},
 		Threads: metal.Size{W: uint(headDim / 2), H: 1, D: 1},
 		Shared:  32 * 4,

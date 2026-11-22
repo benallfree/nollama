@@ -65,6 +65,11 @@ type gpuBatch interface {
 	rope(x, cs, sn gpuRef, tokens, heads, headDim int)
 	// normRope is rmsnorm(x, w, x, tokens*heads, headDim, eps) then rope(x, cs, sn, tokens, heads, headDim).
 	normRope(x, w, cs, sn gpuRef, tokens, heads, headDim int, eps float64)
+	// normRopeKV is normRope that also writes the result into a layer's f32 key cache kc at positions pos.. (the
+	// keys half of storeKV). Not in deterministic mode.
+	normRopeKV(x, w, cs, sn, kc gpuRef, tokens, heads, headDim, pos, ctxP int, eps float64)
+	// gateUp is matmul(wg, x, gate), matmul(wu, x, up), swiglu(gate, up, out): one dispatch where the backend can.
+	gateUp(wg, wu *weight, x, gate, up, out gpuRef, n int, act gpuRef)
 	// addNorm is add(x, y, rows*n) then rmsnorm(x, w, out, rows, n, eps).
 	addNorm(x, y, w, out gpuRef, rows, n int, eps float64)
 	swiglu(gate, up, out gpuRef, n int) // out = silu(gate) * up

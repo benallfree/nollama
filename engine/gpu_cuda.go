@@ -26,6 +26,7 @@ var cudaDetKernels = []string{"rmsnorm_det", "swiglu_det", "quant_q8_0_det", "qu
 	"matvec1_q8_0_det", "matmul_q8_0_det", "matvec_q4k_det", "attention_det"}
 
 var cudaKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "matvec_q6k_f32", "matvec_f16_f32",
+	"matvec_q4k_pair", "matvec_q8_0_pair", "matvec_q6k_pair", "matvec_f16_pair",
 	"matmul_q8_0_f32", "matmul_q4k_f32", "matmul_q6k_f32", "matmul_f16_f32",
 	"matmul_q8_0_tc", "matmul_q4k_tc", "matmul_q6k_tc", "matmul_f16_tc", "rmsnorm_f32", "rope_neox_f32",
 	"swiglu_f32", "add_f32", "norm_rope_f32", "add_norm_f32", "copy_f32", "kv_store_f32", "attention_f32",
@@ -294,9 +295,37 @@ func (b *cudaBatch) normRope(x, w, cs, sn gpuRef, tokens, heads, headDim int, ep
 		b.rope(x, cs, sn, tokens, heads, headDim)
 		return
 	}
+	b.normRopeKV(x, w, cs, sn, gpuRef{}, tokens, heads, headDim, 0, 0, eps)
+}
+
+func (b *cudaBatch) normRopeKV(x, w, cs, sn, kc gpuRef, tokens, heads, headDim, pos, ctxP int, eps float64) {
+	if b.c.det {
+		panic("cuda: normRopeKV in deterministic mode")
+	}
 	b.wrote()
+	store, kcArg := uint32(0), carg(x)
+	if kc.buf != nil {
+		store, kcArg = 1, carg(kc)
+	}
 	b.launch("norm_rope_f32", [3]uint32{uint32(tokens * heads), 1, 1}, [3]uint32{uint32(headDim / 2), 1, 1}, 0,
-		carg(x), carg(w), carg(cs), carg(sn), cuda.Arg{Bytes: u32(uint32(heads), uint32(headDim), math.Float32bits(float32(eps)))})
+		carg(x), carg(w), carg(cs), carg(sn),
+		cuda.Arg{Bytes: u32(uint32(heads), uint32(headDim), math.Float32bits(float32(eps)), store, uint32(ctxP), uint32(pos))}, kcArg)
+}
+
+// gateUp fuses the matvecs and swiglu for small batches (same weight types); prompts run the three steps.
+func (b *cudaBatch) gateUp(wg, wu *weight, x, gate, up, out gpuRef, n int, act gpuRef) {
+	k, ok := cudaMatmuls[wg.typ]
+	if b.c.det || !ok || n >= matmulTiledMin || wg.typ != wu.typ || wg.rows != wu.rows || wg.cols != wu.cols {
+		b.matmul(wg, x, gate, n, act)
+		b.matmul(wu, x, up, n, act)
+		b.swiglu(gate, up, out, n*wg.rows)
+		return
+	}
+	b.wrote()
+	const rows = 4 * cudaMVRows / 2 // 4 warps per block, half the virtual rows each
+	b.launch(k.matvec[:len(k.matvec)-len("f32")]+"pair", [3]uint32{uint32((wg.rows + rows - 1) / rows), uint32(n), 1}, [3]uint32{128, 1, 1}, 0,
+		b.weightArg(wg), carg(x), carg(out), cuda.Arg{Bytes: u32(uint32(wg.rows), uint32(wg.cols/k.step), uint32(wg.rowBytes), uint32(wg.cols))},
+		b.weightArg(wu))
 }
 
 func (b *cudaBatch) addNorm(x, y, w, out gpuRef, rows, n int, eps float64) {

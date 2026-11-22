@@ -29,6 +29,7 @@ type gpuModel struct {
 	kNorm    []gpuRef
 	outNorm  gpuRef
 	shared   bool // the KV cache is the GPU's memory (unified memory)
+	det      bool // deterministic kernels: the CPU's steps one by one, no fused cache writes
 
 	mu     sync.Mutex
 	states map[*state]*gpuState
@@ -65,7 +66,7 @@ func newGPUModel(m *Model, det bool) (*gpuModel, error) {
 	}
 
 	// All norm weights in one buffer.
-	g := &gpuModel{m: m, b: b, states: map[*state]*gpuState{}, shared: b.unified() && !gpuForceDiscrete}
+	g := &gpuModel{m: m, b: b, states: map[*state]*gpuState{}, shared: b.unified() && !gpuForceDiscrete, det: det}
 	var all []float32
 	var offs []int
 	add := func(v []float32) {
@@ -284,15 +285,23 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 		if li == 0 { // later layers' input norm is fused into the previous layer's last add
 			bt.rmsnorm(gs.x, g.attnNorm[li], gs.an, n, dim, hp.eps)
 		}
+		v := gs.v
+		if !g.det { // values straight into the cache (its layout is [pos][kvd]), keys by their normRope
+			v = gs.vc[li].at(4 * pos * kvd)
+		}
 		bt.matmul(l.wq, gs.an, gs.q, n, gs.act)
 		bt.matmul(l.wk, gs.an, gs.k, n, gs.act)
-		bt.matmul(l.wv, gs.an, gs.v, n, gs.act)
+		bt.matmul(l.wv, gs.an, v, n, gs.act)
 		bt.normRope(gs.q, g.qNorm[li], gs.cs, gs.sn, n, hp.heads, hd, hp.eps)
-		bt.normRope(gs.k, g.kNorm[li], gs.cs, gs.sn, n, hp.kvHeads, hd, hp.eps)
-		bt.storeKV(gs.k, gs.v, gs.kc[li], gs.vc[li], n, pos, kvd, gs.ctxP)
+		if g.det {
+			bt.normRope(gs.k, g.kNorm[li], gs.cs, gs.sn, n, hp.kvHeads, hd, hp.eps)
+			bt.storeKV(gs.k, v, gs.kc[li], gs.vc[li], n, pos, kvd, gs.ctxP)
+		} else {
+			bt.normRopeKV(gs.k, g.kNorm[li], gs.cs, gs.sn, gs.kc[li], n, hp.kvHeads, hd, pos, gs.ctxP, hp.eps)
+		}
 		if !g.shared {
 			// keys transposed, [kvd][n], so the CPU copies them into kc a row at a time
-			bt.storeKV(gs.k, gs.v, gs.kStage.at(4*li*n*kvd), gs.vStage.at(4*li*n*kvd), n, 0, kvd, n)
+			bt.storeKV(gs.k, v, gs.kStage.at(4*li*n*kvd), gs.vStage.at(4*li*n*kvd), n, 0, kvd, n)
 		}
 		for t0 := 0; t0 < n; t0 += gs.attnChunk {
 			c := min(gs.attnChunk, n-t0)
@@ -304,9 +313,7 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 		}
 		bt.matmul(l.wo, gs.att, gs.tmp, n, gs.act)
 		bt.addNorm(gs.x, gs.tmp, g.ffnNorm[li], gs.an, n, dim, hp.eps)
-		bt.matmul(l.wgate, gs.an, gs.gate, n, gs.act)
-		bt.matmul(l.wup, gs.an, gs.up, n, gs.act)
-		bt.swiglu(gs.gate, gs.up, gs.hf, n*hp.ffn)
+		bt.gateUp(l.wgate, l.wup, gs.an, gs.gate, gs.up, gs.hf, n, gs.act)
 		bt.matmul(l.wdown, gs.hf, gs.tmp, n, gs.act)
 		if li+1 < len(m.layers) {
 			bt.addNorm(gs.x, gs.tmp, g.attnNorm[li+1], gs.an, n, dim, hp.eps)

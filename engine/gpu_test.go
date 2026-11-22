@@ -455,3 +455,64 @@ func skipGPU(t *testing.T, err error) {
 	}
 	t.Skip(err)
 }
+
+// TestGPUGateUp checks the fused gate/up/SwiGLU step against the separate matmuls and swiglu, for each weight type and
+// for both the fused (small batch) and unfused (prompt) paths.
+func TestGPUGateUp(t *testing.T) {
+	b := testBackend(t)
+	for _, c := range []struct {
+		typ        uint32
+		size, bs   int // block bytes and elements
+		f16s       []int
+		rows, cols int
+	}{{typeQ4_K, q4kBytes, qk, []int{0, 2}, 77, 2048}, {typeQ6_K, q6kBytes, qk, []int{208}, 77, 2048},
+		{typeF16, 512, 256, f16Offsets(256), 77, 2048}, {typeQ8_0, 34, 32, []int{0}, 77, 2048}} {
+		if !b.supports(c.typ) {
+			continue
+		}
+		r := rand.New(rand.NewPCG(7, 8))
+		nb := c.cols / c.bs
+		wbytes := c.rows * nb * c.size
+		file := alignedBytes(2 * wbytes)
+		copy(file, randBlocks(r, 2*c.rows*nb, c.size, c.f16s))
+		if err := b.loadWeights(file); err != nil {
+			t.Fatal(err)
+		}
+		wg := &weight{typ: c.typ, cols: c.cols, rows: c.rows, rowBytes: nb * c.size, data: file[:wbytes]}
+		wu := &weight{typ: c.typ, cols: c.cols, rows: c.rows, rowBytes: nb * c.size, data: file[wbytes:]}
+		const n = 12
+		x := upload(t, b, randFloats(r, n*c.cols))
+		act := zeros(t, b, gpuActBytes(n, c.cols)/4)
+		gate, up, want, got := zeros(t, b, n*c.rows), zeros(t, b, n*c.rows), zeros(t, b, n*c.rows), zeros(t, b, n*c.rows)
+		for _, nt := range []int{1, 3, n} {
+			bt := b.batch()
+			bt.matmul(wg, x, gate, nt, act)
+			bt.matmul(wu, x, up, nt, act)
+			bt.swiglu(gate, up, want, nt*c.rows)
+			bt.gateUp(wg, wu, x, gate, up, got, nt, act)
+			submit(t, bt)
+			maxRelDiff(t, fmt.Sprintf("%s gateUp, %d tokens", typeName(c.typ), nt), download(b, got, nt*c.rows), download(b, want, nt*c.rows), 1e-5)
+		}
+	}
+}
+
+// TestGPUNormRopeKV checks normRopeKV against normRope then storeKV.
+func TestGPUNormRopeKV(t *testing.T) {
+	b := testBackend(t)
+	r := rand.New(rand.NewPCG(9, 10))
+	const tokens, heads, hd, ctxP, pos = 3, 4, 128, 32, 5
+	kvd := heads * hd
+	x0 := randFloats(r, tokens*kvd)
+	w := upload(t, b, randFloats(r, hd))
+	cs, sn := upload(t, b, randFloats(r, tokens*hd/2)), upload(t, b, randFloats(r, tokens*hd/2))
+	xa, xb := upload(t, b, x0), upload(t, b, x0)
+	kca, kcb := zeros(t, b, kvd*ctxP), zeros(t, b, kvd*ctxP)
+	vdummy, vc := zeros(t, b, tokens*kvd), zeros(t, b, kvd*ctxP)
+	bt := b.batch()
+	bt.normRope(xa, w, cs, sn, tokens, heads, hd, 1e-6)
+	bt.storeKV(xa, vdummy, kca, vc, tokens, pos, kvd, ctxP)
+	bt.normRopeKV(xb, w, cs, sn, kcb, tokens, heads, hd, pos, ctxP, 1e-6)
+	submit(t, bt)
+	maxRelDiff(t, "normRopeKV x", download(b, xb, tokens*kvd), download(b, xa, tokens*kvd), 0)
+	maxRelDiff(t, "normRopeKV cache", download(b, kcb, kvd*ctxP), download(b, kca, kvd*ctxP), 0)
+}

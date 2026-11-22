@@ -64,29 +64,56 @@ __device__ __forceinline__ void scale_min_k4(int j, const uchar *q, float *sc, f
 	}
 }
 
-// scale_min_k4r is scale_min_k4 on the scale bytes held in h.y, h.z, h.w (a Q4_K block's first 16 bytes).
-__device__ __forceinline__ void scale_min_k4r(uint j, uint4 h, float *sc, float *mn) {
-	uint w[3] = {h.y, h.z, h.w};
-#define SCB(k) ((w[(k) / 4] >> (8 * ((k) % 4))) & 0xFF)
-	if (j < 4) {
-		*sc = SCB(j) & 63;
-		*mn = SCB(j + 4) & 63;
+// scale_min_k4x2 is the 6-bit scales and mins of Q4_K sub-blocks k and k+1 (k even) from a block's first 16 bytes h:
+// masks on registers, both bytes at once (see gpu.metal).
+__device__ __forceinline__ float4 scale_min_k4x2(uint k, uint4 h) {
+	uint sh = 8 * (k % 4), y = h.y >> sh, z = h.z >> sh, sc, mn;
+	if (k < 4) {
+		sc = y & 0x3f3f, mn = z & 0x3f3f;
 	} else {
-		*sc = (SCB(j + 4) & 0xF) | ((SCB(j - 4) >> 6) << 4);
-		*mn = (SCB(j + 4) >> 4) | ((SCB(j) >> 6) << 4);
+		uint w = h.w >> sh;
+		sc = (w & 0x0f0f) | ((y >> 2) & 0x3030), mn = ((w >> 4) & 0x0f0f) | ((z >> 2) & 0x3030);
 	}
-#undef SCB
+	return make_float4(sc & 0xff, (sc >> 8) & 0xff, mn & 0xff, (mn >> 8) & 0xff);
 }
 
 // MV_ROWS: rows per warp in the matvecs. Each lane loads its slice of the activations once per block and uses it
 // for every row: re-reading the activations per row, not the weights, limits a one-row-per-warp kernel.
 #define MV_ROWS 8
 
+// Pair mode (gate/up/SwiGLU in one launch, see gpu.metal): a warp's MV_ROWS virtual rows are MV_ROWS/2 rows of w and
+// the same rows of w2, and it writes silu(w row . x) * (w2 row . x).
+#define MV_OUT (PAIR ? MV_ROWS / 2 : MV_ROWS)
+
+template <bool PAIR>
+__device__ __forceinline__ const uchar *mv_row(const uchar *w, const uchar *w2, uint r0, int r, uint rows, uint rowBytes) {
+	if (PAIR) return (r < MV_ROWS / 2 ? w : w2) + (size_t)min(r0 + (uint)(r % (MV_ROWS / 2)), rows - 1) * rowBytes;
+	return w + (size_t)min(r0 + (uint)r, rows - 1) * rowBytes;
+}
+
+template <bool PAIR>
+__device__ __forceinline__ void mv_store(float *sum, float *y, size_t base, uint r0, uint rows, uint lane) {
+#pragma unroll
+	for (int r = 0; r < MV_ROWS; r++) sum[r] = warp_sum(sum[r]);
+	if (lane != 0) return;
+#pragma unroll
+	for (int r = 0; r < MV_OUT; r++) {
+		if (r0 + r >= rows) break;
+		if (PAIR) {
+			float g = sum[r];
+			y[base + r] = g / (1 + expf(-g)) * sum[r + MV_ROWS / 2];
+		} else {
+			y[base + r] = sum[r];
+		}
+	}
+}
+
 // y[t*rows + r] = W row r · x[t] for Q4_K. A warp computes MV_ROWS rows; eight lanes share a block (lane groups
 // take blocks g, g+4, ...), lane i covering sub-blocks 2j, 2j+1 (j = i/2) through quant bytes 16*(i%2).. of
 // chunk j. 4 warps per block; grid (rows / (4*MV_ROWS), tokens).
-extern "C" __global__ void matvec_q4k_f32(const uchar *w, const float *x, float *y, MatvecArgs a) {
-	uint r0 = (blockIdx.x * 4 + threadIdx.x / 32) * MV_ROWS, lane = threadIdx.x % 32;
+template <bool PAIR>
+__device__ __forceinline__ void matvec_q4k(const uchar *w, const float *x, float *y, MatvecArgs a, const uchar *w2) {
+	uint r0 = (blockIdx.x * 4 + threadIdx.x / 32) * MV_OUT, lane = threadIdx.x % 32;
 	if (r0 >= a.rows) return;
 	const float *xt = x + (size_t)blockIdx.y * a.cols;
 	uint il = lane % 8, j = il / 2, off = 32 * j + (il % 2) * 16;
@@ -104,12 +131,12 @@ extern "C" __global__ void matvec_q4k_f32(const uchar *w, const float *x, float 
 		}
 #pragma unroll
 		for (int r = 0; r < MV_ROWS; r++) {
-			const uchar *blk = w + (size_t)min(r0 + r, a.rows - 1) * a.rowBytes + b * 144;
+			const uchar *blk = mv_row<PAIR>(w, w2, r0, r, a.rows, a.rowBytes) + b * 144;
 			uint4 hd = *(const uint4 *)blk; // d, dmin, scales[12]: one 16-byte load (blocks are 16-aligned)
 			float2 dm = __half22float2(*(const __half2 *)&hd.x);
-			float d = dm.x, dmin = dm.y, sc1, m1, sc2, m2;
-			scale_min_k4r(2 * j, hd, &sc1, &m1);
-			scale_min_k4r(2 * j + 1, hd, &sc2, &m2);
+			float d = dm.x, dmin = dm.y;
+			float4 sm = scale_min_k4x2(2 * j, hd);
+			float sc1 = sm.x, sc2 = sm.y, m1 = sm.z, m2 = sm.w;
 			uint4 q = *(const uint4 *)(blk + 16 + off);
 			uint qv[4] = {q.x, q.y, q.z, q.w};
 			float s1 = 0, s2 = 0;
@@ -122,17 +149,16 @@ extern "C" __global__ void matvec_q4k_f32(const uchar *w, const float *x, float 
 			sum[r] += d * (sc1 * s1 + sc2 * s2) - dmin * (m1 * t1 + m2 * t2);
 		}
 	}
-#pragma unroll
-	for (int r = 0; r < MV_ROWS; r++) {
-		float v = warp_sum(sum[r]);
-		if (lane == 0 && r0 + r < a.rows) y[(size_t)blockIdx.y * a.rows + r0 + r] = v;
-	}
+	mv_store<PAIR>(sum, y, (size_t)blockIdx.y * a.rows + r0, r0, a.rows, lane);
 }
+extern "C" __global__ void matvec_q4k_f32(const uchar *w, const float *x, float *y, MatvecArgs a) { matvec_q4k<false>(w, x, y, a, w); }
+extern "C" __global__ void matvec_q4k_pair(const uchar *w, const float *x, float *y, MatvecArgs a, const uchar *w2) { matvec_q4k<true>(w, x, y, a, w2); }
 
 // Q6_K (210-byte blocks: ql[128], qh[64], scales[16] int8, d f16). Eight lanes share a block; lane i takes half
 // h = i/4 and l = 8*(i%4)..+8, which with l+32, l+64, l+96 is 32 elements.
-extern "C" __global__ void matvec_q6k_f32(const uchar *w, const float *x, float *y, MatvecArgs a) {
-	uint r0 = (blockIdx.x * 4 + threadIdx.x / 32) * MV_ROWS, lane = threadIdx.x % 32;
+template <bool PAIR>
+__device__ __forceinline__ void matvec_q6k(const uchar *w, const float *x, float *y, MatvecArgs a, const uchar *w2) {
+	uint r0 = (blockIdx.x * 4 + threadIdx.x / 32) * MV_OUT, lane = threadIdx.x % 32;
 	if (r0 >= a.rows) return;
 	const float *xt = x + (size_t)blockIdx.y * a.cols;
 	uint il = lane % 8, h = il / 4, l0 = 8 * (il % 4), is = l0 / 16;
@@ -146,7 +172,7 @@ extern "C" __global__ void matvec_q6k_f32(const uchar *w, const float *x, float 
 			for (int i = 0; i < 8; i++) xv[q][i] = xh[32 * q + i];
 #pragma unroll
 		for (int r = 0; r < MV_ROWS; r++) {
-			const uchar *blk = w + (size_t)min(r0 + r, a.rows - 1) * a.rowBytes + b * 210;
+			const uchar *blk = mv_row<PAIR>(w, w2, r0, r, a.rows, a.rowBytes) + b * 210;
 			const uchar *ql = blk + 64 * h + l0, *qh = blk + 128 + 32 * h + l0;
 			const signed char *sc = (const signed char *)(blk + 192 + 8 * h);
 			float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
@@ -161,17 +187,16 @@ extern "C" __global__ void matvec_q6k_f32(const uchar *w, const float *x, float 
 			sum[r] += f16(blk + 208) * (sc[is] * s0 + sc[is + 2] * s1 + sc[is + 4] * s2 + sc[is + 6] * s3);
 		}
 	}
-#pragma unroll
-	for (int r = 0; r < MV_ROWS; r++) {
-		float v = warp_sum(sum[r]);
-		if (lane == 0 && r0 + r < a.rows) y[(size_t)blockIdx.y * a.rows + r0 + r] = v;
-	}
+	mv_store<PAIR>(sum, y, (size_t)blockIdx.y * a.rows + r0, r0, a.rows, lane);
 }
+extern "C" __global__ void matvec_q6k_f32(const uchar *w, const float *x, float *y, MatvecArgs a) { matvec_q6k<false>(w, x, y, a, w); }
+extern "C" __global__ void matvec_q6k_pair(const uchar *w, const float *x, float *y, MatvecArgs a, const uchar *w2) { matvec_q6k<true>(w, x, y, a, w2); }
 
 // Q8_0 (34-byte blocks); a.nb counts 32-element blocks. Four lanes share a block (lane groups take blocks
 // g, g+8, ...), lane i of a group covering elements 8i..8i+7.
-extern "C" __global__ void matvec_q8_0_f32(const uchar *w, const float *x, float *y, MatvecArgs a) {
-	uint r0 = (blockIdx.x * 4 + threadIdx.x / 32) * MV_ROWS, lane = threadIdx.x % 32;
+template <bool PAIR>
+__device__ __forceinline__ void matvec_q8_0(const uchar *w, const float *x, float *y, MatvecArgs a, const uchar *w2) {
+	uint r0 = (blockIdx.x * 4 + threadIdx.x / 32) * MV_OUT, lane = threadIdx.x % 32;
 	if (r0 >= a.rows) return;
 	const float *xt = x + (size_t)blockIdx.y * a.cols;
 	uint e = (lane % 4) * 8;
@@ -181,7 +206,7 @@ extern "C" __global__ void matvec_q8_0_f32(const uchar *w, const float *x, float
 		float4 x0 = xb[0], x1 = xb[1];
 #pragma unroll
 		for (int r = 0; r < MV_ROWS; r++) {
-			const uchar *blk = w + (size_t)min(r0 + r, a.rows - 1) * a.rowBytes + b * 34;
+			const uchar *blk = mv_row<PAIR>(w, w2, r0, r, a.rows, a.rowBytes) + b * 34;
 			const ushort *q2 = (const ushort *)(blk + 2 + e); // 2-byte aligned: blocks are 34 bytes
 			ushort u0 = q2[0], u1 = q2[1], u2 = q2[2], u3 = q2[3];
 			float s = (signed char)(u0 & 0xFF) * x0.x + (signed char)(u0 >> 8) * x0.y + (signed char)(u1 & 0xFF) * x0.z +
@@ -190,16 +215,15 @@ extern "C" __global__ void matvec_q8_0_f32(const uchar *w, const float *x, float
 			sum[r] += f16(blk) * s;
 		}
 	}
-#pragma unroll
-	for (int r = 0; r < MV_ROWS; r++) {
-		float v = warp_sum(sum[r]);
-		if (lane == 0 && r0 + r < a.rows) y[(size_t)blockIdx.y * a.rows + r0 + r] = v;
-	}
+	mv_store<PAIR>(sum, y, (size_t)blockIdx.y * a.rows + r0, r0, a.rows, lane);
 }
+extern "C" __global__ void matvec_q8_0_f32(const uchar *w, const float *x, float *y, MatvecArgs a) { matvec_q8_0<false>(w, x, y, a, w); }
+extern "C" __global__ void matvec_q8_0_pair(const uchar *w, const float *x, float *y, MatvecArgs a, const uchar *w2) { matvec_q8_0<true>(w, x, y, a, w2); }
 
 // F16 weights; a.nb counts 256-element steps. Lane l takes elements 8l..8l+7 of each 256 (one 16-byte load).
-extern "C" __global__ void matvec_f16_f32(const uchar *w, const float *x, float *y, MatvecArgs a) {
-	uint r0 = (blockIdx.x * 4 + threadIdx.x / 32) * MV_ROWS, lane = threadIdx.x % 32;
+template <bool PAIR>
+__device__ __forceinline__ void matvec_f16(const uchar *w, const float *x, float *y, MatvecArgs a, const uchar *w2) {
+	uint r0 = (blockIdx.x * 4 + threadIdx.x / 32) * MV_OUT, lane = threadIdx.x % 32;
 	if (r0 >= a.rows) return;
 	const float *xt = x + (size_t)blockIdx.y * a.cols;
 	float sum[MV_ROWS] = {};
@@ -208,18 +232,16 @@ extern "C" __global__ void matvec_f16_f32(const uchar *w, const float *x, float 
 		float4 x0 = xb[0], x1 = xb[1];
 #pragma unroll
 		for (int r = 0; r < MV_ROWS; r++) {
-			uint4 v = *(const uint4 *)(w + (size_t)min(r0 + r, a.rows - 1) * a.rowBytes + (b * 256 + 8 * lane) * 2);
+			uint4 v = *(const uint4 *)(mv_row<PAIR>(w, w2, r0, r, a.rows, a.rowBytes) + (b * 256 + 8 * lane) * 2);
 			float2 p0 = __half22float2(*(__half2 *)&v.x), p1 = __half22float2(*(__half2 *)&v.y);
 			float2 p2 = __half22float2(*(__half2 *)&v.z), p3 = __half22float2(*(__half2 *)&v.w);
 			sum[r] += p0.x * x0.x + p0.y * x0.y + p1.x * x0.z + p1.y * x0.w + p2.x * x1.x + p2.y * x1.y + p3.x * x1.z + p3.y * x1.w;
 		}
 	}
-#pragma unroll
-	for (int r = 0; r < MV_ROWS; r++) {
-		float v = warp_sum(sum[r]);
-		if (lane == 0 && r0 + r < a.rows) y[(size_t)blockIdx.y * a.rows + r0 + r] = v;
-	}
+	mv_store<PAIR>(sum, y, (size_t)blockIdx.y * a.rows + r0, r0, a.rows, lane);
 }
+extern "C" __global__ void matvec_f16_f32(const uchar *w, const float *x, float *y, MatvecArgs a) { matvec_f16<false>(w, x, y, a, w); }
+extern "C" __global__ void matvec_f16_pair(const uchar *w, const float *x, float *y, MatvecArgs a, const uchar *w2) { matvec_f16<true>(w, x, y, a, w2); }
 
 struct MatmulArgs {
 	uint rows, nb, rowBytes, cols, tokens;
@@ -452,12 +474,14 @@ extern "C" __global__ void rope_neox_f32(float *x, const float *cs, const float 
 
 // norm_rope_f32: rmsnorm over each head, then rope_neox, in place; one block of headDim/2 threads per [token][head]
 // row (see gpu.metal).
+// With store set it also writes the result into the transposed key cache kT at position pos + token (gpu.metal).
 struct NormRopeArgs {
 	uint heads, headDim;
 	float eps;
+	uint store, ctxP, pos;
 };
 
-extern "C" __global__ void norm_rope_f32(float *x, const float *w, const float *cs, const float *sn, NormRopeArgs a) {
+extern "C" __global__ void norm_rope_f32(float *x, const float *w, const float *cs, const float *sn, NormRopeArgs a, float *kT) {
 	__shared__ float red[32];
 	uint half_ = a.headDim / 2, row = blockIdx.x, t = row / a.heads, i = threadIdx.x;
 	float *v = x + (size_t)row * a.headDim;
@@ -467,8 +491,14 @@ extern "C" __global__ void norm_rope_f32(float *x, const float *w, const float *
 	x0 *= scale * w[i];
 	x1 *= scale * w[i + half_];
 	float c = cs[t * half_ + i], s = sn[t * half_ + i];
-	v[i] = x0 * c - x1 * s;
-	v[i + half_] = x0 * s + x1 * c;
+	float y0 = x0 * c - x1 * s, y1 = x0 * s + x1 * c;
+	v[i] = y0;
+	v[i + half_] = y1;
+	if (a.store) {
+		float *kr = kT + (size_t)(row % a.heads) * a.headDim * a.ctxP + a.pos + t;
+		kr[(size_t)i * a.ctxP] = y0;
+		kr[(size_t)(i + half_) * a.ctxP] = y1;
+	}
 }
 
 // add_norm_f32: x += y, then out = rmsnorm(x) * w; one block per row.

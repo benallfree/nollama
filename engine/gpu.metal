@@ -10,15 +10,19 @@ static inline uchar2 scale_min_k4(int j, device const uchar *q) {
 	return uchar2((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4), (q[j + 4] >> 4) | ((q[j] >> 6) << 4));
 }
 
-// scale_min_k4r is scale_min_k4 on the scale bytes held in h.yzw (a Q4_K block's first 16 bytes).
-static inline float2 scale_min_k4r(uint j, uint4 h) {
-	uint sc[3] = {h.y, h.z, h.w};
-#define SCB(k) ((sc[(k) / 4] >> (8 * ((k) % 4))) & 0xFF)
-	if (j < 4) {
-		return float2(SCB(j) & 63, SCB(j + 4) & 63);
+// scale_min_k4x2 is the 6-bit scales and mins of Q4_K sub-blocks k and k+1 (k even) from a block's first 16 bytes
+// h (d, dmin, scales[12]): (scale k, scale k+1, min k, min k+1). Masks on registers, both bytes at once (k and k+1
+// are both below 4 or both not).
+static inline float4 scale_min_k4x2(uint k, uint4 h) {
+	uint sh = 8 * (k % 4), y = h.y >> sh, z = h.z >> sh;
+	uint sc, mn;
+	if (k < 4) {
+		sc = y & 0x3f3f, mn = z & 0x3f3f;
+	} else {
+		uint w = h.w >> sh;
+		sc = (w & 0x0f0f) | ((y >> 2) & 0x3030), mn = ((w >> 4) & 0x0f0f) | ((z >> 2) & 0x3030);
 	}
-	return float2((SCB(j + 4) & 0xF) | ((SCB(j - 4) >> 6) << 4), (SCB(j + 4) >> 4) | ((SCB(j) >> 6) << 4));
-#undef SCB
+	return float4(sc & 0xff, (sc >> 8) & 0xff, mn & 0xff, (mn >> 8) & 0xff);
 }
 
 struct MatvecArgs {
@@ -32,23 +36,62 @@ struct MatvecArgs {
 // them for all MV_ROWS rows: re-reading them per row, not the weights, was what limited these kernels.
 #define MV_ROWS 8
 
+// Pair mode (gate/up/SwiGLU in one dispatch): a simdgroup's MV_ROWS virtual rows are MV_ROWS/2 rows of w and the same
+// rows of w2 (same type and shape), and it writes silu(w row . x) * (w2 row . x), as swiglu_f32. Grid then covers
+// rows / (MV_ROWS/2 * simdgroups).
+#define MV_OUT (PAIR ? MV_ROWS / 2 : MV_ROWS)
+
+// mv_row is virtual row r's weights for a simdgroup whose first output row is r0.
+template <bool PAIR>
+static inline device const uchar *mv_row(device const uchar *w, device const uchar *w2, uint r0, int r, uint rows, uint rowBytes) {
+	if (PAIR) {
+		return (r < MV_ROWS / 2 ? w : w2) + (ulong)min(r0 + (uint)(r % (MV_ROWS / 2)), rows - 1) * rowBytes;
+	}
+	return w + (ulong)min(r0 + (uint)r, rows - 1) * rowBytes;
+}
+
+// mv_store writes a simdgroup's sums (simd_sum'ed in every lane) for its nr output rows.
+template <bool PAIR>
+static inline void mv_store(thread float *sum, device float *y, ulong base, uint nr, uint lane) {
+#pragma unroll
+	for (int r = 0; r < MV_ROWS; r++) {
+		sum[r] = simd_sum(sum[r]);
+	}
+	if (lane != 0) {
+		return;
+	}
+#pragma unroll
+	for (int r = 0; r < MV_OUT; r++) {
+		if (r < (int)nr) {
+			if (PAIR) {
+				float g = sum[r];
+				y[base + r] = g / (1 + exp(-g)) * sum[r + MV_ROWS / 2];
+			} else {
+				y[base + r] = sum[r];
+			}
+		}
+	}
+}
+
 // y[t*rows + r] = dot(W row r, x[t*cols:]) for Q4_K weights and float activations.
 // A simdgroup computes MV_ROWS rows. Eight lanes share a block (lane groups take blocks g, g+4, ...); lane i of a
 // group covers 32 elements: sub-blocks 2j and 2j+1 (j = i/2), quant bytes 16*(i%2).. of chunk j (one 16-byte
-// load). Grid: (rows / (MV_ROWS * simdgroups), tokens).
-kernel void matvec_q4k_f32(device const uchar *w [[buffer(0)]],
+// load). Grid: (rows / (MV_OUT * simdgroups), tokens).
+template <bool PAIR>
+kernel void matvec_q4k(device const uchar *w [[buffer(0)]],
                            device const float *x [[buffer(1)]],
                            device float *y [[buffer(2)]],
                            constant MatvecArgs &a [[buffer(3)]],
+                           device const uchar *w2 [[buffer(4)]],
                            uint2 tg [[threadgroup_position_in_grid]],
                            uint sg [[simdgroup_index_in_threadgroup]],
                            uint nsg [[simdgroups_per_threadgroup]],
                            uint lane [[thread_index_in_simdgroup]]) {
-	uint r0 = (tg.x * nsg + sg) * MV_ROWS;
+	uint r0 = (tg.x * nsg + sg) * MV_OUT;
 	if (r0 >= a.rows) {
 		return;
 	}
-	uint nr = min((uint)MV_ROWS, a.rows - r0);
+	uint nr = min((uint)MV_OUT, a.rows - r0);
 	device const float *xt = x + (ulong)tg.y * a.cols;
 	uint il = lane % 8, j = il / 2, off = 32 * j + (il % 2) * 16;
 	float sum[MV_ROWS] = {};
@@ -64,46 +107,43 @@ kernel void matvec_q4k_f32(device const uchar *w [[buffer(0)]],
 		}
 #pragma unroll
 		for (int r = 0; r < MV_ROWS; r++) { // rows past the end repeat the last row (not written)
-			device const uchar *blk = w + (ulong)min(r0 + r, a.rows - 1) * a.rowBytes + b * 144;
+			device const uchar *blk = mv_row<PAIR>(w, w2, r0, r, a.rows, a.rowBytes) + b * 144;
 			uint4 hd = *(device const uint4 *)blk; // d, dmin, scales[12]: one 16-byte load (blocks are 16-aligned)
 			float2 dm = float2(as_type<half2>(hd.x));
 			float d = dm.x, dmin = dm.y;
-			float2 sm1 = scale_min_k4r(2 * j, hd);
-			float2 sm2 = scale_min_k4r(2 * j + 1, hd);
+			float4 sm = scale_min_k4x2(2 * j, hd);
 			uint4 q = *(device const uint4 *)(blk + 16 + off);
 			float s1 = 0, s2 = 0;
 			for (int i = 0; i < 4; i++) {
 				uint v = q[i];
-				s1 += dot(float4(v & 0xF, (v >> 8) & 0xF, (v >> 16) & 0xF, (v >> 24) & 0xF), a1[i]);
-				s2 += dot(float4((v >> 4) & 0xF, (v >> 12) & 0xF, (v >> 20) & 0xF, v >> 28), a2[i]);
+				s1 += dot(float4(as_type<uchar4>(v & 0x0F0F0F0F)), a1[i]);
+				s2 += dot(float4(as_type<uchar4>((v >> 4) & 0x0F0F0F0F)), a2[i]);
 			}
-			sum[r] += d * (sm1.x * s1 + sm2.x * s2) - dmin * (sm1.y * t1 + sm2.y * t2);
+			sum[r] += d * (sm.x * s1 + sm.y * s2) - dmin * (sm.z * t1 + sm.w * t2);
 		}
 	}
-#pragma unroll
-	for (int r = 0; r < MV_ROWS; r++) {
-		float v = simd_sum(sum[r]);
-		if (lane == 0 && r < (int)nr) {
-			y[(ulong)tg.y * a.rows + r0 + r] = v;
-		}
-	}
+	mv_store<PAIR>(sum, y, (ulong)tg.y * a.rows + r0, nr, lane);
 }
+template [[host_name("matvec_q4k_f32")]] kernel decltype(matvec_q4k<false>) matvec_q4k<false>;
+template [[host_name("matvec_q4k_pair")]] kernel decltype(matvec_q4k<true>) matvec_q4k<true>;
 
 // Same contract for Q6_K weights (210-byte blocks: ql[128], qh[64], scales[16] int8, d f16). Eight lanes share a
 // block; lane i takes half h = i/4 and l = 8*(i%4)..+8 of it, which with l+32, l+64, l+96 is 32 elements.
-kernel void matvec_q6k_f32(device const uchar *w [[buffer(0)]],
+template <bool PAIR>
+kernel void matvec_q6k(device const uchar *w [[buffer(0)]],
                            device const float *x [[buffer(1)]],
                            device float *y [[buffer(2)]],
                            constant MatvecArgs &a [[buffer(3)]],
+                           device const uchar *w2 [[buffer(4)]],
                            uint2 tg [[threadgroup_position_in_grid]],
                            uint sg [[simdgroup_index_in_threadgroup]],
                            uint nsg [[simdgroups_per_threadgroup]],
                            uint lane [[thread_index_in_simdgroup]]) {
-	uint r0 = (tg.x * nsg + sg) * MV_ROWS;
+	uint r0 = (tg.x * nsg + sg) * MV_OUT;
 	if (r0 >= a.rows) {
 		return;
 	}
-	uint nr = min((uint)MV_ROWS, a.rows - r0);
+	uint nr = min((uint)MV_OUT, a.rows - r0);
 	device const float *xt = x + (ulong)tg.y * a.cols;
 	uint il = lane % 8, h = il / 4, l0 = 8 * (il % 4), is = l0 / 16;
 	float sum[MV_ROWS] = {};
@@ -116,19 +156,19 @@ kernel void matvec_q6k_f32(device const uchar *w [[buffer(0)]],
 		}
 #pragma unroll
 		for (int r = 0; r < MV_ROWS; r++) { // rows past the end repeat the last row (not written)
-			device const uchar *blk = w + (ulong)min(r0 + r, a.rows - 1) * a.rowBytes + b * 210;
+			device const uchar *blk = mv_row<PAIR>(w, w2, r0, r, a.rows, a.rowBytes) + b * 210;
 			device const uchar *ql = blk + 64 * h + l0, *qh = blk + 128 + 32 * h + l0;
 			device const char *sc = (device const char *)(blk + 192 + 8 * h);
 			float s[4] = {0, 0, 0, 0};
-			for (int k = 0; k < 2; k++) {
-				float4 q0, q1, q2, q3;
-				for (int i = 0; i < 4; i++) {
-					uint lo = ql[4 * k + i], hi = ql[4 * k + i + 32], hb = qh[4 * k + i];
-					q0[i] = float(int((lo & 0xF) | ((hb & 3) << 4)) - 32);
-					q1[i] = float(int((hi & 0xF) | (((hb >> 2) & 3) << 4)) - 32);
-					q2[i] = float(int((lo >> 4) | (((hb >> 4) & 3) << 4)) - 32);
-					q3[i] = float(int((hi >> 4) | (((hb >> 6) & 3) << 4)) - 32);
-				}
+			device const ushort *ql2 = (device const ushort *)ql, *qh2 = (device const ushort *)qh; // blocks are 2-aligned
+			for (int k = 0; k < 2; k++) { // four bytes of each at once
+				uint lo = as_type<uint>(ushort2(ql2[2 * k], ql2[2 * k + 1]));
+				uint hi = as_type<uint>(ushort2(ql2[16 + 2 * k], ql2[17 + 2 * k]));
+				uint hb = as_type<uint>(ushort2(qh2[2 * k], qh2[2 * k + 1]));
+				float4 q0 = float4(as_type<uchar4>((lo & 0x0F0F0F0F) | ((hb & 0x03030303) << 4))) - 32;
+				float4 q1 = float4(as_type<uchar4>((hi & 0x0F0F0F0F) | (((hb >> 2) & 0x03030303) << 4))) - 32;
+				float4 q2 = float4(as_type<uchar4>(((lo >> 4) & 0x0F0F0F0F) | (((hb >> 4) & 0x03030303) << 4))) - 32;
+				float4 q3 = float4(as_type<uchar4>(((hi >> 4) & 0x0F0F0F0F) | (((hb >> 6) & 0x03030303) << 4))) - 32;
 				s[0] += dot(q0, xv[0][k]);
 				s[1] += dot(q1, xv[1][k]);
 				s[2] += dot(q2, xv[2][k]);
@@ -138,30 +178,28 @@ kernel void matvec_q6k_f32(device const uchar *w [[buffer(0)]],
 			          (float(sc[is]) * s[0] + float(sc[is + 2]) * s[1] + float(sc[is + 4]) * s[2] + float(sc[is + 6]) * s[3]);
 		}
 	}
-#pragma unroll
-	for (int r = 0; r < MV_ROWS; r++) {
-		float v = simd_sum(sum[r]);
-		if (lane == 0 && r < (int)nr) {
-			y[(ulong)tg.y * a.rows + r0 + r] = v;
-		}
-	}
+	mv_store<PAIR>(sum, y, (ulong)tg.y * a.rows + r0, nr, lane);
 }
+template [[host_name("matvec_q6k_f32")]] kernel decltype(matvec_q6k<false>) matvec_q6k<false>;
+template [[host_name("matvec_q6k_pair")]] kernel decltype(matvec_q6k<true>) matvec_q6k<true>;
 
 // Same contract for F16 weights; a.nb counts 256-element steps. A simdgroup computes MV_ROWS rows; lane l takes
 // elements 8l..8l+7 of each 256 (one 16-byte load per row), reusing its activations across the rows.
-kernel void matvec_f16_f32(device const uchar *w [[buffer(0)]],
+template <bool PAIR>
+kernel void matvec_f16(device const uchar *w [[buffer(0)]],
                            device const float *x [[buffer(1)]],
                            device float *y [[buffer(2)]],
                            constant MatvecArgs &a [[buffer(3)]],
+                           device const uchar *w2 [[buffer(4)]],
                            uint2 tg [[threadgroup_position_in_grid]],
                            uint sg [[simdgroup_index_in_threadgroup]],
                            uint nsg [[simdgroups_per_threadgroup]],
                            uint lane [[thread_index_in_simdgroup]]) {
-	uint r0 = (tg.x * nsg + sg) * MV_ROWS;
+	uint r0 = (tg.x * nsg + sg) * MV_OUT;
 	if (r0 >= a.rows) {
 		return;
 	}
-	uint nr = min((uint)MV_ROWS, a.rows - r0);
+	uint nr = min((uint)MV_OUT, a.rows - r0);
 	device const float *xt = x + (ulong)tg.y * a.cols;
 	float sum[MV_ROWS] = {};
 	for (uint b = 0; b < a.nb; b++) {
@@ -169,35 +207,33 @@ kernel void matvec_f16_f32(device const uchar *w [[buffer(0)]],
 		float4 x0 = xb[0], x1 = xb[1];
 #pragma unroll
 		for (int r = 0; r < MV_ROWS; r++) {
-			device const half4 *wr = (device const half4 *)(w + (ulong)min(r0 + r, a.rows - 1) * a.rowBytes + (b * 256 + 8 * lane) * 2);
+			device const half4 *wr = (device const half4 *)(mv_row<PAIR>(w, w2, r0, r, a.rows, a.rowBytes) + (b * 256 + 8 * lane) * 2);
 			sum[r] += dot(float4(wr[0]), x0) + dot(float4(wr[1]), x1);
 		}
 	}
-#pragma unroll
-	for (int r = 0; r < MV_ROWS; r++) {
-		float v = simd_sum(sum[r]);
-		if (lane == 0 && r < (int)nr) {
-			y[(ulong)tg.y * a.rows + r0 + r] = v;
-		}
-	}
+	mv_store<PAIR>(sum, y, (ulong)tg.y * a.rows + r0, nr, lane);
 }
+template [[host_name("matvec_f16_f32")]] kernel decltype(matvec_f16<false>) matvec_f16<false>;
+template [[host_name("matvec_f16_pair")]] kernel decltype(matvec_f16<true>) matvec_f16<true>;
 
 // Same contract for Q8_0 weights (34-byte blocks: d f16, qs[32] int8); a.nb counts 32-element blocks. A simdgroup
 // computes MV_ROWS rows; four lanes share a block (lane groups take blocks g, g+8, ...), lane i of a group covering
 // elements 8i..8i+7.
-kernel void matvec_q8_0_f32(device const uchar *w [[buffer(0)]],
+template <bool PAIR>
+kernel void matvec_q8_0(device const uchar *w [[buffer(0)]],
                             device const float *x [[buffer(1)]],
                             device float *y [[buffer(2)]],
                             constant MatvecArgs &a [[buffer(3)]],
+                           device const uchar *w2 [[buffer(4)]],
                             uint2 tg [[threadgroup_position_in_grid]],
                             uint sg [[simdgroup_index_in_threadgroup]],
                             uint nsg [[simdgroups_per_threadgroup]],
                             uint lane [[thread_index_in_simdgroup]]) {
-	uint r0 = (tg.x * nsg + sg) * MV_ROWS;
+	uint r0 = (tg.x * nsg + sg) * MV_OUT;
 	if (r0 >= a.rows) {
 		return;
 	}
-	uint nr = min((uint)MV_ROWS, a.rows - r0);
+	uint nr = min((uint)MV_OUT, a.rows - r0);
 	device const float *xt = x + (ulong)tg.y * a.cols;
 	uint e = (lane % 4) * 8;
 	float sum[MV_ROWS] = {};
@@ -206,21 +242,17 @@ kernel void matvec_q8_0_f32(device const uchar *w [[buffer(0)]],
 		float4 x0 = xb[0], x1 = xb[1];
 #pragma unroll
 		for (int r = 0; r < MV_ROWS; r++) {
-			device const uchar *blk = w + (ulong)min(r0 + r, a.rows - 1) * a.rowBytes + b * 34;
+			device const uchar *blk = mv_row<PAIR>(w, w2, r0, r, a.rows, a.rowBytes) + b * 34;
 			device const char2 *q = (device const char2 *)(blk + 2 + e); // blocks are 34 bytes: 2-byte aligned
 			char2 q0 = q[0], q1 = q[1], q2 = q[2], q3 = q[3];
 			sum[r] += float(*(device const half *)blk) *
 			          (dot(float4(q0.x, q0.y, q1.x, q1.y), x0) + dot(float4(q2.x, q2.y, q3.x, q3.y), x1));
 		}
 	}
-#pragma unroll
-	for (int r = 0; r < MV_ROWS; r++) {
-		float v = simd_sum(sum[r]);
-		if (lane == 0 && r < (int)nr) {
-			y[(ulong)tg.y * a.rows + r0 + r] = v;
-		}
-	}
+	mv_store<PAIR>(sum, y, (ulong)tg.y * a.rows + r0, nr, lane);
 }
+template [[host_name("matvec_q8_0_f32")]] kernel decltype(matvec_q8_0<false>) matvec_q8_0<false>;
+template [[host_name("matvec_q8_0_pair")]] kernel decltype(matvec_q8_0<true>) matvec_q8_0<true>;
 
 // In place is fine (out == x).
 struct NormArgs {
@@ -266,10 +298,15 @@ kernel void rmsnorm_f32(device const float *x [[buffer(0)]],
 
 // norm_rope_f32 is rmsnorm over each head (one threadgroup of headDim/2 threads per [token][head] row of x, in place)
 // followed by rope_neox: two dispatches in one.
+// With store set it also writes the result into a transposed f32 key cache kT ([heads*headDim][ctxP]) at position
+// pos + token: the keys' normRope and storeKV in one dispatch.
 struct NormRopeArgs {
 	uint heads;
 	uint headDim;
 	float eps;
+	uint store;
+	uint ctxP;
+	uint pos;
 };
 
 kernel void norm_rope_f32(device float *x [[buffer(0)]],
@@ -277,6 +314,7 @@ kernel void norm_rope_f32(device float *x [[buffer(0)]],
                           device const float *cs [[buffer(2)]],
                           device const float *sn [[buffer(3)]],
                           constant NormRopeArgs &a [[buffer(4)]],
+                          device float *kT [[buffer(5)]],
                           threadgroup float *part [[threadgroup(0)]],
                           uint row [[threadgroup_position_in_grid]],
                           uint i [[thread_index_in_threadgroup]],
@@ -299,8 +337,14 @@ kernel void norm_rope_f32(device float *x [[buffer(0)]],
 	x0 *= scale * w[i];
 	x1 *= scale * w[i + half_];
 	float c = cs[t * half_ + i], s = sn[t * half_ + i];
-	v[i] = x0 * c - x1 * s;
-	v[i + half_] = x0 * s + x1 * c;
+	float y0 = x0 * c - x1 * s, y1 = x0 * s + x1 * c;
+	v[i] = y0;
+	v[i + half_] = y1;
+	if (a.store) {
+		device float *kr = kT + (ulong)(row % a.heads) * a.headDim * a.ctxP + a.pos + t;
+		kr[(ulong)i * a.ctxP] = y0;
+		kr[(ulong)(i + half_) * a.ctxP] = y1;
+	}
 }
 
 // add_norm_f32 is x += y then out = rmsnorm(x) * w, per row of n (one threadgroup per row): add_f32 and rmsnorm_f32 in
@@ -535,6 +579,37 @@ struct AttnArgs {
 	float scale;
 };
 
+// attn_scores writes the scaled scores of positions [c0, c1) against the head's query qs into ss[j - c0], -INFINITY for
+// masked positions. Lanes take consecutive positions (coalesced key loads), simdgroups split the head's channels, and
+// red (nsg*32 floats) sums their parts: short dependent chains instead of one thread looping over every channel, which
+// is what short contexts need (the one-pass kernel). The split kernel's chunks keep a position per thread: measured
+// faster there.
+template <typename P>
+static inline void attn_scores(threadgroup const float *qs, device const float *kh, uint ctxP, uint hd, uint c0, uint c1,
+                               uint2 m, float scale, P ss, threadgroup float *red, uint sg, uint nsg, uint lane) {
+	uint dper = (hd + nsg - 1) / nsg, d0 = sg * dper, d1 = min(hd, d0 + dper);
+	for (uint jb = c0; jb < c1; jb += 32) {
+		uint j = jb + lane;
+		float x = 0;
+		if (j < c1) {
+			device const float *kj = kh + j;
+			for (uint d = d0; d < d1; d++) {
+				x += qs[d] * kj[(ulong)d * ctxP];
+			}
+		}
+		red[sg * 32 + lane] = x;
+		threadgroup_barrier(mem_flags::mem_threadgroup);
+		if (sg == 0 && j < c1) {
+			float tot = 0;
+			for (uint i = 0; i < nsg; i++) {
+				tot += red[i * 32 + lane];
+			}
+			ss[j - c0] = (j < m.x || j >= m.y) ? tot * scale : -INFINITY;
+		}
+		threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+	}
+}
+
 kernel void attention_f32(device const float *q [[buffer(0)]],
                           device const float *kT [[buffer(1)]],
                           device const float *v [[buffer(2)]],
@@ -564,19 +639,10 @@ kernel void attention_f32(device const float *q [[buffer(0)]],
 	threadgroup_barrier(mem_flags::mem_threadgroup);
 
 	// scores and their max
-	device const float *kh = kT + (ulong)kvh * hd * a.ctxP;
+	attn_scores(qs, kT + (ulong)kvh * hd * a.ctxP, a.ctxP, hd, 0, ctx, m, a.scale, s, red, sg, nsg, lane);
 	float mx = -INFINITY;
 	for (uint j = tid; j < ctx; j += nt) {
-		float x = -INFINITY;
-		if (j < m.x || j >= m.y) {
-			x = 0;
-			for (uint d = 0; d < hd; d++) {
-				x += qs[d] * kh[(ulong)d * a.ctxP + j];
-			}
-			x *= a.scale;
-		}
-		s[j] = x;
-		mx = max(mx, x);
+		mx = max(mx, s[j]);
 	}
 	mx = simd_max(mx);
 	if (lane == 0) {

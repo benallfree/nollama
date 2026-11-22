@@ -3,7 +3,10 @@
 // Package metal is the engine's GPU backend on macOS; elsewhere Open always fails.
 package metal
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
 type Size struct{ W, H, D uint }
 
@@ -11,6 +14,7 @@ type Device struct {
 	Name       string
 	Unified    bool
 	MaxWorking uint64
+	LastGPU    time.Duration
 }
 
 func Open() (*Device, error) { return nil, errors.New("metal: macOS only") }
@@ -51,6 +55,7 @@ type Dispatch struct {
 	Groups  Size
 	Threads Size
 	Shared  int
+	Writes  uint32
 }
 
 func (d *Device) Run(ds ...Dispatch) error { return errors.New("metal: macOS only") }
