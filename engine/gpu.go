@@ -23,6 +23,7 @@ type gpuBackend interface {
 	name() string // "metal (Apple M1 Max)"
 	unified() bool
 	supports(weightType uint32) bool // weights of other types run on the CPU
+	supportsKV(kvType uint32) bool   // KV cache formats the attention kernels take (typeF32 always)
 	// halfPrompts reports that prompt-sized matmuls round their inputs to half (tensor cores): about 4e-5 of a
 	// row's magnitude instead of f32's 1e-7, still far closer to the float reference than the CPU's 8-bit path.
 	halfPrompts() bool
@@ -80,6 +81,9 @@ type gpuBatch interface {
 	copy(dst, src gpuRef, n int)        // n floats
 	// storeKV writes n tokens' keys and values (each [n][kvd]) into a layer's f32 cache at positions pos..
 	storeKV(k, v, kc, vc gpuRef, n, pos, kvd, ctxP int)
+	// storeKV16 writes them into a layer's f16 cache in the compact layout: keys by position (kc[p*kvd + i]), values
+	// by channel (vc[i*ctxP + p]), as halves.
+	storeKV16(k, v, kc, vc gpuRef, n, pos, kvd, ctxP int)
 	attention(a gpuAttention)
 	submit() error
 }
@@ -90,7 +94,7 @@ type gpuAttention struct {
 	k, v    gpuRef // the layer's cache, in kvType's layout
 	scratch gpuRef // n*heads*ctxP floats
 	mask    gpuRef // n pairs of uint32: positions [lo, hi) token t must not see (packed sequences)
-	kvType  uint32 // typeF32 only, so far
+	kvType  uint32 // typeF32, or typeF16 (the compact layout: keys [ctxP][kvd], values [kvd][ctxP])
 	n, pos  int
 	heads   int
 	kvHeads int

@@ -20,7 +20,7 @@ var metalDetSource string
 var metalDetKernels = []string{"rmsnorm_det", "swiglu_det", "quant_q8_0_det", "quant_q8_k_det", "matvec_q8_0_det", "matvec_q4k_det", "matmul_q8_0_det", "matvec1_q8_0_det", "attention_det"}
 
 // metalKernels are the kernels metalSource defines.
-var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "matmul_q4k_f32", "matmul_q6k_f32", "matvec_q6k_f32", "matvec_f16_f32", "matmul_f16_f32", "matvec_q4k_pair", "matvec_q8_0_pair", "matvec_q6k_pair", "matvec_f16_pair", "norm_rope_f32", "add_norm_f32", "attention_f32", "attention_tile_f32", "attention_flash_f32", "attention_split_f32", "attention_combine_f32", "kv_store_f32", "copy_f32"}
+var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "matmul_q4k_f32", "matmul_q6k_f32", "matvec_q6k_f32", "matvec_f16_f32", "matmul_f16_f32", "matvec_q4k_pair", "matvec_q8_0_pair", "matvec_q6k_pair", "matvec_f16_pair", "norm_rope_f32", "add_norm_f32", "attention_f32", "attention_tile_f32", "attention_flash_f32", "attention_split_f32", "attention_combine_f32", "kv_store_f32", "kv_store_f16", "copy_f32", "attention_f16", "attention_split_f16", "attention_tile_f16", "attention_flash_f16"}
 
 // metalBackend is the gpuBackend for Apple GPUs (unified memory only).
 type metalBackend struct {
@@ -61,8 +61,9 @@ func (m *metalBackend) name() string {
 }
 func (m *metalBackend) unified() bool { return true }
 
-func (m *metalBackend) halfPrompts() bool { return false }
-func (m *metalBackend) int8Prompts() bool { return false }
+func (m *metalBackend) halfPrompts() bool        { return false }
+func (m *metalBackend) int8Prompts() bool        { return false }
+func (m *metalBackend) supportsKV(t uint32) bool { return t == typeF32 || t == typeF16 && !m.det }
 
 func (m *metalBackend) supports(t uint32) bool {
 	return t == typeQ4_K || t == typeQ8_0 || (t == typeQ6_K || t == typeF16) && !m.det // deterministic mode: no Q6_K/F16 kernels yet
@@ -407,7 +408,8 @@ func (b *metalBatch) copy(dst, src gpuRef, n int) {
 
 func (b *metalBatch) attention(a gpuAttention) {
 	b.wrote()
-	if a.kvType != typeF32 {
+	kv := map[uint32]string{typeF32: "_f32", typeF16: "_f16"}[a.kvType]
+	if kv == "" || kv != "_f32" && b.m.det {
 		panic(fmt.Sprintf("metal: attention over a %s cache isn't supported", kvTypeName(a.kvType)))
 	}
 	if b.m.det { // the CPU's order: one pass per (token, head), no split (its partial sums would be added in another order)
@@ -427,7 +429,7 @@ func (b *metalBatch) attention(a gpuAttention) {
 		args := metal.Arg{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos),
 			a.scale(), uint32(chunk), uint32(splits))}
 		b.ds = append(b.ds, metal.Dispatch{
-			P:       b.m.ps["attention_split_f32"],
+			P:       b.m.ps["attention_split"+kv],
 			Args:    []metal.Arg{marg(a.q), marg(a.k), marg(a.v), marg(a.scratch), marg(a.mask), args},
 			Writes:  1 << 3,
 			Groups:  metal.Size{W: uint(a.heads), H: uint(a.n), D: uint(splits)},
@@ -444,7 +446,7 @@ func (b *metalBatch) attention(a gpuAttention) {
 	}
 	if a.n > attnSplitTokens && a.headDim == 128 && !metalAttnOnePass && !metalAttnTile { // prompts on the matrix units
 		b.ds = append(b.ds, metal.Dispatch{
-			P: b.m.ps["attention_flash_f32"],
+			P: b.m.ps["attention_flash"+kv],
 			Args: []metal.Arg{marg(a.q), marg(a.k), marg(a.v), marg(a.out), marg(a.mask),
 				{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos), a.scale(), uint32(a.n))}},
 			Writes:  1 << 3,
@@ -456,7 +458,7 @@ func (b *metalBatch) attention(a gpuAttention) {
 	if a.n > attnSplitTokens && a.headDim <= 128 && !metalAttnOnePass { // prompts; one-token steps keep the one-pass kernel
 		const qt = 16 // ATT_QT
 		b.ds = append(b.ds, metal.Dispatch{
-			P: b.m.ps["attention_tile_f32"],
+			P: b.m.ps["attention_tile"+kv],
 			Args: []metal.Arg{marg(a.q), marg(a.k), marg(a.v), marg(a.out), marg(a.mask),
 				{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos), a.scale(), uint32(a.n))}},
 			Writes:  1 << 3,
@@ -466,13 +468,24 @@ func (b *metalBatch) attention(a gpuAttention) {
 		return
 	}
 	b.ds = append(b.ds, metal.Dispatch{
-		P: b.m.ps["attention_f32"],
+		P: b.m.ps["attention"+kv],
 		Args: []metal.Arg{marg(a.q), marg(a.k), marg(a.v), marg(a.out), marg(a.scratch), marg(a.mask),
 			{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos), a.scale())}},
 		Writes:  1<<3 | 1<<4,
 		Groups:  metal.Size{W: uint(a.heads), H: uint(a.n), D: 1},
 		Threads: metal.Size{W: nt, H: 1, D: 1},
 		Shared:  4 * (a.headDim + nt),
+	})
+}
+
+func (b *metalBatch) storeKV16(k, v, kc, vc gpuRef, n, pos, kvd, ctxP int) {
+	b.wrote()
+	b.ds = append(b.ds, metal.Dispatch{
+		P:       b.m.ps["kv_store_f16"],
+		Args:    []metal.Arg{marg(k), marg(v), marg(kc), marg(vc), {Bytes: u32(uint32(kvd), uint32(ctxP), uint32(pos))}},
+		Writes:  1<<2 | 1<<3,
+		Groups:  metal.Size{W: uint((kvd + 255) / 256), H: uint(n), D: 1},
+		Threads: metal.Size{W: 256, H: 1, D: 1},
 	})
 }
 

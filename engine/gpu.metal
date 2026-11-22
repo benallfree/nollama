@@ -583,22 +583,43 @@ struct AttnArgs {
 	float scale;
 };
 
+// KV cache accessors for the attention kernels: key(j, d) and val(j, d) are channel d of KV head kvh at position j.
+// KVF32 is the f32 cache (keys transposed [kvHeads*headDim][ctxP], values by position [ctxP][kvd]); KVF16 is the
+// f16 cache in the CPU's compact layout (keys by position [ctxP][kvd], values by channel [kvd][ctxP]).
+struct KVF32 {
+	typedef float T;
+	device const float *k, *v;
+	uint ctxP, kvd, hd, kvh;
+	static constant constexpr bool byChannel = false; // values are stored by position
+	float key(uint j, uint d) const { return k[(ulong)(kvh * hd + d) * ctxP + j]; }
+	float4 key4(uint j, uint d) const { return float4(key(j, d), key(j, d + 1), key(j, d + 2), key(j, d + 3)); }
+	float val(uint j, uint d) const { return v[(ulong)j * kvd + kvh * hd + d]; }
+};
+struct KVF16 {
+	typedef half T;
+	device const half *k, *v;
+	uint ctxP, kvd, hd, kvh;
+	static constant constexpr bool byChannel = true; // values are stored by channel
+	float key(uint j, uint d) const { return k[(ulong)j * kvd + kvh * hd + d]; }
+	float4 key4(uint j, uint d) const { return float4(*(device const half4 *)(k + (ulong)j * kvd + kvh * hd + d)); } // d % 4 == 0
+	float val(uint j, uint d) const { return v[(ulong)(kvh * hd + d) * ctxP + j]; }
+};
+
 // attn_scores writes the scaled scores of positions [c0, c1) against the head's query qs into ss[j - c0], -INFINITY for
 // masked positions. Lanes take consecutive positions (coalesced key loads), simdgroups split the head's channels, and
 // red (nsg*32 floats) sums their parts: short dependent chains instead of one thread looping over every channel, which
 // is what short contexts need (the one-pass kernel). The split kernel's chunks keep a position per thread: measured
 // faster there.
-template <typename P>
-static inline void attn_scores(threadgroup const float *qs, device const float *kh, uint ctxP, uint hd, uint c0, uint c1,
+template <typename P, typename KV>
+static inline void attn_scores(threadgroup const float *qs, KV kv, uint hd, uint c0, uint c1,
                                uint2 m, float scale, P ss, threadgroup float *red, uint sg, uint nsg, uint lane) {
 	uint dper = (hd + nsg - 1) / nsg, d0 = sg * dper, d1 = min(hd, d0 + dper);
 	for (uint jb = c0; jb < c1; jb += 32) {
 		uint j = jb + lane;
 		float x = 0;
 		if (j < c1) {
-			device const float *kj = kh + j;
 			for (uint d = d0; d < d1; d++) {
-				x += qs[d] * kj[(ulong)d * ctxP];
+				x += qs[d] * kv.key(j, d);
 			}
 		}
 		red[sg * 32 + lane] = x;
@@ -614,9 +635,10 @@ static inline void attn_scores(threadgroup const float *qs, device const float *
 	}
 }
 
-kernel void attention_f32(device const float *q [[buffer(0)]],
-                          device const float *kT [[buffer(1)]],
-                          device const float *v [[buffer(2)]],
+template <typename KV>
+kernel void attention_kv(device const float *q [[buffer(0)]],
+                          device const typename KV::T *kT [[buffer(1)]],
+                          device const typename KV::T *v [[buffer(2)]],
                           device float *out [[buffer(3)]],
                           device float *sc [[buffer(4)]],
                           device const uint2 *mask [[buffer(5)]],
@@ -643,7 +665,8 @@ kernel void attention_f32(device const float *q [[buffer(0)]],
 	threadgroup_barrier(mem_flags::mem_threadgroup);
 
 	// scores and their max
-	attn_scores(qs, kT + (ulong)kvh * hd * a.ctxP, a.ctxP, hd, 0, ctx, m, a.scale, s, red, sg, nsg, lane);
+	KV kv{kT, v, a.ctxP, kvd, hd, kvh};
+	attn_scores(qs, kv, hd, 0, ctx, m, a.scale, s, red, sg, nsg, lane);
 	float mx = -INFINITY;
 	for (uint j = tid; j < ctx; j += nt) {
 		mx = max(mx, s[j]);
@@ -682,9 +705,8 @@ kernel void attention_f32(device const float *q [[buffer(0)]],
 	uint parts = nt / hd, d = tid % hd, part = tid / hd;
 	float o = 0;
 	if (part < parts) {
-		device const float *vh = v + kvh * hd + d;
 		for (uint j = part; j < ctx; j += parts) {
-			o += s[j] * vh[(ulong)j * kvd];
+			o += s[j] * kv.val(j, d);
 		}
 	}
 	red[tid] = o;
@@ -745,9 +767,10 @@ struct AttnSplitArgs {
 	uint splits;
 };
 
-kernel void attention_split_f32(device const float *q [[buffer(0)]],
-                                device const float *kT [[buffer(1)]],
-                                device const float *v [[buffer(2)]],
+template <typename KV>
+kernel void attention_split_kv(device const float *q [[buffer(0)]],
+                                device const typename KV::T *kT [[buffer(1)]],
+                                device const typename KV::T *v [[buffer(2)]],
                                 device float *part [[buffer(3)]],
                                 device const uint2 *mask [[buffer(4)]],
                                 constant AttnSplitArgs &a [[buffer(5)]],
@@ -777,14 +800,14 @@ kernel void attention_split_f32(device const float *q [[buffer(0)]],
 	}
 	threadgroup_barrier(mem_flags::mem_threadgroup);
 
-	device const float *kh = kT + (ulong)kvh * hd * a.ctxP;
+	KV kv{kT, v, a.ctxP, kvd, hd, kvh};
 	float mx = -INFINITY;
 	for (uint j = c0 + tid; j < c1; j += nt) {
 		float x = -INFINITY;
 		if (j < m.x || j >= m.y) {
 			x = 0;
-			for (uint d = 0; d < hd; d++) {
-				x += qs[d] * kh[(ulong)d * a.ctxP + j];
+			for (uint d = 0; d < hd; d += 4) { // headDim % 4 == 0
+				x += dot(*(threadgroup const float4 *)(qs + d), kv.key4(j, d));
 			}
 			x *= a.scale;
 		}
@@ -825,26 +848,41 @@ kernel void attention_split_f32(device const float *q [[buffer(0)]],
 	}
 	threadgroup_barrier(mem_flags::mem_threadgroup);
 
-	// values: simdgroup sg sums positions c0+sg, c0+sg+nsg, ...; lane covers channels lane, lane+32, ...
-	float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0}; // headDim <= 256
-	device const float *vh = v + kvh * hd;
-	for (uint j = c0 + sg; j < c1; j += nsg) {
-		float w = ss[j - c0];
-		device const float *vr = vh + (ulong)j * kvd;
-		for (uint i = 0, d = lane; d < hd; i++, d += 32) {
-			acc[i] += w * vr[d];
-		}
-	}
-	for (uint i = 0, d = lane; d < hd; i++, d += 32) {
-		red[sg * hd + d] = acc[i];
-	}
-	threadgroup_barrier(mem_flags::mem_threadgroup);
-	for (uint d = tid; d < hd; d += nt) {
+	if (KV::byChannel && nt % hd == 0) {
+		// values by channel: thread (d, part) walks channel d's row over positions c0+part, c0+part+parts, ...
+		uint parts = nt / hd, d = tid % hd, part = tid / hd;
 		float o = 0;
-		for (uint i = 0; i < nsg; i++) {
-			o += red[i * hd + d];
+		for (uint j = c0 + part; j < c1; j += parts) {
+			o += ss[j - c0] * kv.val(j, d);
 		}
-		P[2 + d] = o;
+		red[tid] = o;
+		threadgroup_barrier(mem_flags::mem_threadgroup);
+		if (tid < hd) {
+			for (uint i = 1; i < parts; i++) {
+				o += red[i * hd + tid];
+			}
+			P[2 + tid] = o;
+		}
+	} else {
+		// values by position: simdgroup sg sums positions c0+sg, c0+sg+nsg, ...; lane covers channels lane, lane+32, ...
+		float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0}; // headDim <= 256
+		for (uint j = c0 + sg; j < c1; j += nsg) {
+			float w = ss[j - c0];
+			for (uint i = 0, d = lane; d < hd; i++, d += 32) {
+				acc[i] += w * kv.val(j, d);
+			}
+		}
+		for (uint i = 0, d = lane; d < hd; i++, d += 32) {
+			red[sg * hd + d] = acc[i];
+		}
+		threadgroup_barrier(mem_flags::mem_threadgroup);
+		for (uint d = tid; d < hd; d += nt) {
+			float o = 0;
+			for (uint i = 0; i < nsg; i++) {
+				o += red[i * hd + d];
+			}
+			P[2 + d] = o;
+		}
 	}
 	if (tid == 0) {
 		P[0] = mx;
@@ -896,9 +934,10 @@ struct AttnTileArgs {
 	uint tokens;
 };
 
-kernel void attention_tile_f32(device const float *q [[buffer(0)]],
-                               device const float *kT [[buffer(1)]],
-                               device const float *v [[buffer(2)]],
+template <typename KV>
+kernel void attention_tile_kv(device const float *q [[buffer(0)]],
+                               device const typename KV::T *kT [[buffer(1)]],
+                               device const typename KV::T *v [[buffer(2)]],
                                device float *out [[buffer(3)]],
                                device const uint2 *mask [[buffer(4)]],
                                constant AttnTileArgs &a [[buffer(5)]],
@@ -920,16 +959,16 @@ kernel void attention_tile_f32(device const float *q [[buffer(0)]],
 	uint orow = tid / 16, ocol = tid % 16; // this thread's output: row orow, channels ocol + 16*i
 	float o[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 	uint ctxEnd = a.pos + t0 + nt;
-	device const float *kh = kT + (ulong)kvh * hd * a.ctxP;
+	KV kv{kT, v, a.ctxP, kvd, hd, kvh};
 	for (uint c0 = 0; c0 < ctxEnd; c0 += ATT_KC) {
 		threadgroup_barrier(mem_flags::mem_threadgroup);
 		for (uint i = tid; i < hd * ATT_KC; i += 256) {
 			uint d = i / ATT_KC, j = i % ATT_KC;
-			ks[d][j] = c0 + j < ctxEnd ? kh[(ulong)d * a.ctxP + c0 + j] : 0;
+			ks[d][j] = c0 + j < ctxEnd ? kv.key(c0 + j, d) : 0;
 		}
 		for (uint i = tid; i < ATT_KC * hd; i += 256) {
 			uint j = i / hd, d = i % hd;
-			vs[j][d] = c0 + j < ctxEnd ? v[(ulong)(c0 + j) * kvd + kvh * hd + d] : 0;
+			vs[j][d] = c0 + j < ctxEnd ? kv.val(c0 + j, d) : 0;
 		}
 		threadgroup_barrier(mem_flags::mem_threadgroup);
 		{ // scores: 256 = ATT_QT * ATT_KC, one per thread
@@ -995,9 +1034,10 @@ kernel void attention_tile_f32(device const float *q [[buffer(0)]],
 #define FA_QT 32
 #define FA_KC 16
 #define FA_HD 128
-kernel void attention_flash_f32(device const float *q [[buffer(0)]],
-                                device const float *kT [[buffer(1)]],
-                                device const float *v [[buffer(2)]],
+template <typename KV>
+kernel void attention_flash_kv(device const float *q [[buffer(0)]],
+                                device const typename KV::T *kT [[buffer(1)]],
+                                device const typename KV::T *v [[buffer(2)]],
                                 device float *out [[buffer(3)]],
                                 device const uint2 *mask [[buffer(4)]],
                                 constant AttnTileArgs &a [[buffer(5)]],
@@ -1034,15 +1074,15 @@ kernel void attention_flash_f32(device const float *q [[buffer(0)]],
 	uint2 m = mask[t0 + min(trow, nt - 1)];
 	float mrun = -INFINITY, lrun = 0;
 	uint ctxEnd = a.pos + t0 + nt;
-	device const float *kh = kT + (ulong)kvh * FA_HD * a.ctxP;
+	KV cache{kT, v, a.ctxP, kvd, FA_HD, kvh};
 	for (uint c0 = 0; c0 < ctxEnd; c0 += FA_KC) {
 		for (uint i = tid; i < FA_HD * FA_KC; i += 128) {
 			uint d = i / FA_KC, j = i % FA_KC;
-			ks[i] = c0 + j < ctxEnd ? kh[(ulong)d * a.ctxP + c0 + j] : 0;
+			ks[i] = c0 + j < ctxEnd ? cache.key(c0 + j, d) : 0;
 		}
 		for (uint i = tid; i < FA_KC * FA_HD; i += 128) {
 			uint j = i / FA_HD, d = i % FA_HD;
-			vs[i] = c0 + j < ctxEnd ? v[(ulong)(c0 + j) * kvd + kvh * FA_HD + d] : 0;
+			vs[i] = c0 + j < ctxEnd ? cache.val(c0 + j, d) : 0;
 		}
 		threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1116,4 +1156,30 @@ kernel void attention_flash_f32(device const float *q [[buffer(0)]],
 			out[((ulong)(t0 + t) * a.heads + h) * FA_HD + i % FA_HD] = st[i];
 		}
 	}
+}
+
+// Attention kernels for each KV cache type.
+template [[host_name("attention_f32")]] kernel decltype(attention_kv<KVF32>) attention_kv<KVF32>;
+template [[host_name("attention_f16")]] kernel decltype(attention_kv<KVF16>) attention_kv<KVF16>;
+template [[host_name("attention_split_f32")]] kernel decltype(attention_split_kv<KVF32>) attention_split_kv<KVF32>;
+template [[host_name("attention_split_f16")]] kernel decltype(attention_split_kv<KVF16>) attention_split_kv<KVF16>;
+template [[host_name("attention_tile_f32")]] kernel decltype(attention_tile_kv<KVF32>) attention_tile_kv<KVF32>;
+template [[host_name("attention_tile_f16")]] kernel decltype(attention_tile_kv<KVF16>) attention_tile_kv<KVF16>;
+template [[host_name("attention_flash_f32")]] kernel decltype(attention_flash_kv<KVF32>) attention_flash_kv<KVF32>;
+template [[host_name("attention_flash_f16")]] kernel decltype(attention_flash_kv<KVF16>) attention_flash_kv<KVF16>;
+
+// kv_store_f16 writes n tokens' keys and values ([n][kvd] floats) into a layer's f16 cache at positions pos..: keys
+// by position (kc[p*kvd + i]), values by channel (vc[i*ctxP + p]). Grid (kvd/256, tokens), 256 threads.
+kernel void kv_store_f16(device const float *k [[buffer(0)]],
+                         device const float *v [[buffer(1)]],
+                         device half *kc [[buffer(2)]],
+                         device half *vc [[buffer(3)]],
+                         constant KVStoreArgs &a [[buffer(4)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+	uint i = gid.x, t = gid.y;
+	if (i >= a.kvd) {
+		return;
+	}
+	kc[((ulong)a.pos + t) * a.kvd + i] = half(clamp(k[(ulong)t * a.kvd + i], -65504.f, 65504.f));
+	vc[(ulong)i * a.ctxP + a.pos + t] = half(clamp(v[(ulong)t * a.kvd + i], -65504.f, 65504.f));
 }

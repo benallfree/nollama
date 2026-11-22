@@ -40,7 +40,7 @@ var cudaKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "matvec_q6k_f32"
 	"matvec_q4k_pair", "matvec_q8_0_pair", "matvec_q6k_pair", "matvec_f16_pair",
 	"matmul_q8_0_f32", "matmul_q4k_f32", "matmul_q6k_f32", "matmul_f16_f32",
 	"matmul_q8_0_tc", "matmul_q4k_tc", "matmul_q6k_tc", "matmul_f16_tc", "rmsnorm_f32", "rope_neox_f32",
-	"swiglu_f32", "add_f32", "norm_rope_f32", "add_norm_f32", "copy_f32", "kv_store_f32", "attention_f32", "attention_flash_f32",
+	"swiglu_f32", "add_f32", "norm_rope_f32", "add_norm_f32", "copy_f32", "kv_store_f32", "kv_store_f16", "attention_f32", "attention_f16", "attention_split_f16", "attention_tile_f16", "attention_flash_f16", "attention_flash_f32",
 	"attention_split_f32", "attention_combine_f32", "attention_tile_f32"}
 
 // cudaBackend is the gpuBackend for NVIDIA GPUs, through the driver API (no toolkit needed).
@@ -93,6 +93,15 @@ func (c *cudaBackend) name() string {
 }
 func (c *cudaBackend) unified() bool     { return false }
 func (c *cudaBackend) halfPrompts() bool { return !c.det && !cudaPromptF32 }
+
+// supportsKV: the f16 kernels are built but not yet verified on NVIDIA hardware, so f16 caches stay on the CPU there.
+func (c *cudaBackend) supportsKV(t uint32) bool {
+	return t == typeF32 || t == typeF16 && !c.det && cudaF16KV
+}
+
+// cudaF16KV turns on the f16 KV cache on CUDA (off until checked on a card).
+var cudaF16KV = false
+
 func (c *cudaBackend) int8Prompts() bool { return c.mmaMod != nil && !cudaNoMMQ && !cudaPromptF32 }
 
 func (c *cudaBackend) supports(t uint32) bool {
@@ -407,6 +416,12 @@ func (b *cudaBatch) copy(dst, src gpuRef, n int) {
 	b.elementwise("copy_f32", n, carg(dst), carg(src))
 }
 
+func (b *cudaBatch) storeKV16(k, v, kc, vc gpuRef, n, pos, kvd, ctxP int) {
+	b.wrote()
+	b.launch("kv_store_f16", [3]uint32{uint32((kvd + 255) / 256), uint32(n), 1}, [3]uint32{256, 1, 1}, 0,
+		carg(k), carg(v), carg(kc), carg(vc), cuda.Arg{Bytes: u32(uint32(kvd), uint32(ctxP), uint32(pos))})
+}
+
 func (b *cudaBatch) storeKV(k, v, kc, vc gpuRef, n, pos, kvd, ctxP int) {
 	b.wrote()
 	b.launch("kv_store_f32", [3]uint32{uint32((kvd + 255) / 256), uint32(n), 1}, [3]uint32{256, 1, 1}, 0,
@@ -414,7 +429,8 @@ func (b *cudaBatch) storeKV(k, v, kc, vc gpuRef, n, pos, kvd, ctxP int) {
 }
 
 func (b *cudaBatch) attention(a gpuAttention) {
-	if a.kvType != typeF32 {
+	kv := map[uint32]string{typeF32: "_f32", typeF16: "_f16"}[a.kvType]
+	if kv == "" || kv != "_f32" && b.c.det {
 		panic(fmt.Sprintf("cuda: attention over a %s cache isn't supported", kvTypeName(a.kvType)))
 	}
 	b.wrote()
@@ -428,26 +444,26 @@ func (b *cudaBatch) attention(a gpuAttention) {
 	if chunk, splits, ok := a.split(); ok {
 		args := cuda.Arg{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos),
 			a.scale(), uint32(chunk), uint32(splits))}
-		b.launch("attention_split_f32", [3]uint32{uint32(a.heads), uint32(a.n), uint32(splits)}, [3]uint32{nt, 1, 1},
+		b.launch("attention_split"+kv, [3]uint32{uint32(a.heads), uint32(a.n), uint32(splits)}, [3]uint32{nt, 1, 1},
 			4*(a.headDim+chunk+nt/32*a.headDim), carg(a.q), carg(a.k), carg(a.v), carg(a.scratch), carg(a.mask), args)
 		b.launch("attention_combine_f32", [3]uint32{uint32(a.heads), uint32(a.n), 1},
 			[3]uint32{uint32((a.headDim + 31) &^ 31), 1, 1}, 0, carg(a.scratch), carg(a.out), args)
 		return
 	}
 	if a.n > attnSplitTokens && a.headDim == 128 && !cudaAttnOnePass && !cudaAttnTile { // prompts on the tensor cores
-		b.launch("attention_flash_f32", [3]uint32{uint32(a.heads), uint32((a.n + 63) / 64), 1}, [3]uint32{128, 1, 1}, 0,
+		b.launch("attention_flash"+kv, [3]uint32{uint32(a.heads), uint32((a.n + 63) / 64), 1}, [3]uint32{128, 1, 1}, 0,
 			carg(a.q), carg(a.k), carg(a.v), carg(a.out), carg(a.mask),
 			cuda.Arg{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos), a.scale(), uint32(a.n))})
 		return
 	}
 	if a.n > attnSplitTokens && a.headDim <= 128 && !cudaAttnOnePass { // prompts; one-token steps keep the one-pass kernel
 		const qt = 16 // ATT_QT
-		b.launch("attention_tile_f32", [3]uint32{uint32(a.heads), uint32((a.n + qt - 1) / qt), 1}, [3]uint32{256, 1, 1}, 0,
+		b.launch("attention_tile"+kv, [3]uint32{uint32(a.heads), uint32((a.n + qt - 1) / qt), 1}, [3]uint32{256, 1, 1}, 0,
 			carg(a.q), carg(a.k), carg(a.v), carg(a.out), carg(a.mask),
 			cuda.Arg{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos), a.scale(), uint32(a.n))})
 		return
 	}
-	b.launch("attention_f32", [3]uint32{uint32(a.heads), uint32(a.n), 1}, [3]uint32{nt, 1, 1}, 4*(a.headDim+nt),
+	b.launch("attention"+kv, [3]uint32{uint32(a.heads), uint32(a.n), 1}, [3]uint32{nt, 1, 1}, 4*(a.headDim+nt),
 		carg(a.q), carg(a.k), carg(a.v), carg(a.out), carg(a.scratch), carg(a.mask),
 		cuda.Arg{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos),
 			a.scale())})

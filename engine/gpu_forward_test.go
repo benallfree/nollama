@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"math"
 	"slices"
 	"testing"
@@ -190,7 +191,15 @@ func TestGPUScoreEmbed(t *testing.T) {
 // re-upload when a call doesn't continue the last) on this GPU, in lockstep with the unified path: prompt in two
 // batches, decode, then a rewind into the prompt (which forces the upload). Logits and caches must match.
 func TestGPUForwardDiscrete(t *testing.T) {
-	m, err := Load(testGGUF(t), LoadOptions{GPU: "off"})
+	for _, kv := range []string{KVCacheF32, KVCacheF16} {
+		t.Run(kv, func(t *testing.T) { testGPUForwardDiscrete(t, kv) })
+	}
+}
+
+func testGPUForwardDiscrete(t *testing.T, kvType string) {
+	cudaF16KV = true // tests check the f16 kernels on CUDA too (off in use until verified on a card)
+	defer func() { cudaF16KV = false }()
+	m, err := Load(testGGUF(t), LoadOptions{GPU: "off", KVCacheType: kvType})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,6 +251,13 @@ func TestGPUForwardDiscrete(t *testing.T) {
 			kd = max(kd, math.Abs(float64(su.kc[li][i]-sd.kc[li][i])), math.Abs(float64(su.vc[li][i]-sd.vc[li][i])))
 		}
 	}
+	if su.kv != nil { // the f16 cache: the same bytes
+		for li := range su.kv.k {
+			if !bytes.Equal(su.kv.k[li], sd.kv.k[li]) || !bytes.Equal(su.kv.v[li], sd.kv.v[li]) {
+				kd = math.Inf(1)
+			}
+		}
+	}
 	t.Logf("caches, unified vs discrete: max diff %.1e", kd)
 	if kd > 1e-4 {
 		t.Errorf("caches differ by %.2e", kd)
@@ -285,5 +301,51 @@ func TestGPUSplitAttention(t *testing.T) {
 	t.Logf("split vs one-pass attention: logits differ by %.1e of their spread", d)
 	if d > 1e-4 {
 		t.Fatalf("split attention is off by %.1e", d)
+	}
+}
+
+// TestGPUForwardF16KV checks the GPU on the f16 KV cache against the CPU on it: the same check as TestGPUForward
+// against the CPU's fast path (prompt in two batches, then decoding), so the cache layout, stores and every attention
+// kernel (prompt and one-token, one-pass and split) run on f16.
+func TestGPUForwardF16KV(t *testing.T) {
+	cudaF16KV = true // see testGPUForwardDiscrete
+	defer func() { cudaF16KV = false }()
+	m, err := Load(testGGUF(t), LoadOptions{GPU: "off", KVCacheType: KVCacheF16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	g, err := newGPUModel(m, false)
+	if err != nil {
+		skipGPU(t, err)
+	}
+	defer g.close()
+	ids := m.Tokenize(ChatPrompt([]Message{{Role: "user", Content: "Name three rivers in Europe and say which country each one flows through."}}))
+	sc, sg := m.newState(1024, 64), m.newState(1024, 64)
+	split := len(ids) * 2 / 3
+	m.forward(sc, ids, 0)
+	if err := g.forward(sg, ids[:split], 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.forward(sg, ids[split:], split); err != nil {
+		t.Fatal(err)
+	}
+	pos := len(ids)
+	for i := 0; i < 300; i++ { // past 256 positions: the split attention kernel
+		d := logitDiff(sc.logits, sg.logits)
+		a, b := argmax(sc.logits), argmax(sg.logits)
+		lo, hi := slices.Min(sc.logits), slices.Max(sc.logits)
+		tie := float64(sc.logits[a]-sc.logits[b]) <= 2*d*float64(hi-lo)
+		if i%50 == 0 || d > 5e-2 || a != b && !tie {
+			t.Logf("step %d (pos %d): logits differ by %.1e of their spread; top %d vs %d", i, pos, d, a, b)
+		}
+		if d > 5e-2 || a != b && !tie {
+			t.Fatalf("step %d: GPU disagrees", i)
+		}
+		m.forward(sc, []int{a}, pos)
+		if err := g.forward(sg, []int{a}, pos); err != nil {
+			t.Fatal(err)
+		}
+		pos++
 	}
 }

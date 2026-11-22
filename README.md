@@ -426,6 +426,9 @@ dominated by the weights either way. These are estimates until they're measured 
 The prompt cache and threads keep their copies at full precision, within their own budgets (`--prompt-cache-mb`,
 `LoadOptions.ThreadMemory`); the KV cache type sets the memory of the answers being written.
 
+On a GPU, `f32` and `f16` caches run on the GPU (`f32` only in deterministic mode); with `q8_0` or `q4_0` the model
+runs on the CPU for now.
+
 ```bash
 nollama serve --kv-cache-type q8_0
 ```
