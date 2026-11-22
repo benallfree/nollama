@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -44,6 +45,8 @@ var (
 	selCommit               = objc.RegisterName("commit")
 	selWaitUntilCompleted   = objc.RegisterName("waitUntilCompleted")
 	selError                = objc.RegisterName("error")
+	selGPUStartTime         = objc.RegisterName("GPUStartTime")
+	selGPUEndTime           = objc.RegisterName("GPUEndTime")
 	selName                 = objc.RegisterName("name")
 	selRelease              = objc.RegisterName("release")
 	selStringWithUTF8       = objc.RegisterName("stringWithUTF8String:")
@@ -132,6 +135,8 @@ type Device struct {
 	Name       string
 	Unified    bool
 	MaxWorking uint64 // recommended max working set, bytes
+	// LastGPU is how long the GPU took for the last Run, from its first command buffer's start to its last's end.
+	LastGPU time.Duration
 }
 
 // Open returns the system default GPU, or an error when there is none (or Metal can't load).
@@ -329,6 +334,8 @@ func (d *Device) Run(ds ...Dispatch) error {
 			}
 		}
 		cbs[len(cbs)-1].Send(selWaitUntilCompleted)
+		first, last := objc.Send[float64](cbs[0], selGPUStartTime), objc.Send[float64](cbs[len(cbs)-1], selGPUEndTime)
+		d.LastGPU = time.Duration((last - first) * float64(time.Second))
 		for _, cb := range cbs {
 			if err == nil {
 				err = nsError(cb.Send(selError))

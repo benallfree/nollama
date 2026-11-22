@@ -404,13 +404,13 @@ struct MatmulArgs {
 
 // dequant8 writes 8 consecutive weights of a row, starting at element k (a multiple of 8), to dst.
 // typ: 0 Q8_0, 1 Q4_K, 2 Q6_K, 3 F16.
-static inline void dequant8(device const uchar *row, uint k, threadgroup float *dst, const int typ) {
+template <typename T> static inline void dequant8(device const uchar *row, uint k, threadgroup T *dst, const int typ) {
 	if (typ == 0) {
 		device const uchar *blk = row + (k / 32) * 34;
 		float d = float(*(device const half *)blk);
 		device const char *qs = (device const char *)(blk + 2 + k % 32);
 		for (int i = 0; i < 8; i++) {
-			dst[i] = d * float(qs[i]);
+			dst[i] = T(d * float(qs[i]));
 		}
 	} else if (typ == 1) {
 		device const uchar *blk = row + (k / 256) * 144;
@@ -419,12 +419,12 @@ static inline void dequant8(device const uchar *row, uint k, threadgroup float *
 		float d = float(*(device const half *)blk) * sm.x, m = float(*(device const half *)(blk + 2)) * sm.y;
 		device const uchar *qs = blk + 16 + 32 * j + l;
 		for (int i = 0; i < 8; i++) {
-			dst[i] = d * float(hi ? qs[i] >> 4 : qs[i] & 0xF) - m;
+			dst[i] = T(d * float(hi ? qs[i] >> 4 : qs[i] & 0xF) - m);
 		}
 	} else if (typ == 3) {
 		device const half *p = (device const half *)row + k;
 		for (int i = 0; i < 8; i++) {
-			dst[i] = float(p[i]);
+			dst[i] = T(float(p[i]));
 		}
 	} else {
 		device const uchar *blk = row + (k / 256) * 210;
@@ -433,15 +433,18 @@ static inline void dequant8(device const uchar *row, uint k, threadgroup float *
 		float d = float(*(device const half *)(blk + 208)) * float(((device const char *)(blk + 192 + 8 * h))[l / 16 + 2 * quarter]);
 		uint shift = quarter >= 2 ? 4 : 0;
 		for (int i = 0; i < 8; i++) {
-			dst[i] = d * float(int(((ql[i] >> shift) & 0xF) | (((qh[i] >> (2 * quarter)) & 3) << 4)) - 32);
+			dst[i] = T(d * float(int(((ql[i] >> shift) & 0xF) | (((qh[i] >> (2 * quarter)) & 3) << 4)) - 32));
 		}
 	}
 }
 
+// T is the weight tile's type in threadgroup memory: float, or half (half the memory traffic; the dequantized
+// weights round to half, about 4e-5 of a row's magnitude).
+template <typename T>
 static inline void matmul_tile(device const uchar *w, device const float *x, device float *y, constant MatmulArgs &a,
                                threadgroup float *shm, uint2 tg, uint tid, uint sg, const int typ) {
-	threadgroup float *sw = shm;            // [64 rows][32 k]
-	threadgroup float *sx = shm + 64 * 32;  // [64 tokens][32 k]
+	threadgroup T *sw = (threadgroup T *)shm;    // [64 rows][32 k]
+	threadgroup float *sx = shm + 64 * 32;       // [64 tokens][32 k]
 	uint r0 = tg.x * 64, t0 = tg.y * 64;
 	uint sr = (sg % 2) * 32, st = (sg / 2) * 16; // this simdgroup's 32x16 sub-tile (8 simdgroups)
 
@@ -456,7 +459,7 @@ static inline void matmul_tile(device const uchar *w, device const float *x, dev
 	for (uint b = 0; b < a.nb; b++) {
 		{
 			uint r = r0 + lr;
-			threadgroup float *dst = sw + lr * 32 + lk;
+			threadgroup T *dst = sw + lr * 32 + lk;
 			if (r < a.rows) {
 				dequant8(w + (ulong)r * a.rowBytes, b * 32 + lk, dst, typ);
 			} else {
@@ -478,7 +481,8 @@ static inline void matmul_tile(device const uchar *w, device const float *x, dev
 		}
 		threadgroup_barrier(mem_flags::mem_threadgroup);
 		for (uint kk = 0; kk < 32; kk += 8) {
-			simdgroup_float8x8 ma[4], mb[2];
+			simdgroup_matrix<T, 8, 8> ma[4];
+			simdgroup_float8x8 mb[2];
 			for (int i = 0; i < 4; i++) {
 				simdgroup_load(ma[i], sw + (sr + 8 * i) * 32 + kk, 32);
 			}
@@ -514,7 +518,13 @@ static inline void matmul_tile(device const uchar *w, device const float *x, dev
 	                 device float *y [[buffer(2)]], constant MatmulArgs &a [[buffer(3)]],                        \
 	                 threadgroup float *shm [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]],       \
 	                 uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {     \
-		matmul_tile(w, x, y, a, shm, tg, tid, sg, typ);                                                          \
+		matmul_tile<float>(w, x, y, a, shm, tg, tid, sg, typ);                                                   \
+	}                                                                                                            \
+	kernel void name##_h(device const uchar *w [[buffer(0)]], device const float *x [[buffer(1)]],               \
+	                     device float *y [[buffer(2)]], constant MatmulArgs &a [[buffer(3)]],                    \
+	                     threadgroup float *shm [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]],   \
+	                     uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) { \
+		matmul_tile<half>(w, x, y, a, shm, tg, tid, sg, typ);                                                    \
 	}
 MATMUL_KERNEL(matmul_q8_0_f32, 0)
 MATMUL_KERNEL(matmul_q4k_f32, 1)

@@ -20,7 +20,7 @@ var metalDetSource string
 var metalDetKernels = []string{"rmsnorm_det", "swiglu_det", "quant_q8_0_det", "quant_q8_k_det", "matvec_q8_0_det", "matvec_q4k_det", "matmul_q8_0_det", "matvec1_q8_0_det", "attention_det"}
 
 // metalKernels are the kernels metalSource defines.
-var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "matmul_q4k_f32", "matmul_q6k_f32", "matvec_q6k_f32", "matvec_f16_f32", "matmul_f16_f32", "norm_rope_f32", "add_norm_f32", "attention_f32", "attention_tile_f32", "attention_split_f32", "attention_combine_f32", "kv_store_f32", "copy_f32"}
+var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "matmul_q4k_f32", "matmul_q6k_f32", "matmul_q8_0_f32_h", "matmul_q4k_f32_h", "matmul_q6k_f32_h", "matmul_f16_f32_h", "matvec_q6k_f32", "matvec_f16_f32", "matmul_f16_f32", "norm_rope_f32", "add_norm_f32", "attention_f32", "attention_tile_f32", "attention_split_f32", "attention_combine_f32", "kv_store_f32", "copy_f32"}
 
 // metalBackend is the gpuBackend for Apple GPUs (unified memory only).
 type metalBackend struct {
@@ -61,7 +61,7 @@ func (m *metalBackend) name() string {
 }
 func (m *metalBackend) unified() bool { return true }
 
-func (m *metalBackend) halfPrompts() bool { return false }
+func (m *metalBackend) halfPrompts() bool { return metalHalfTiles && !m.det }
 
 func (m *metalBackend) supports(t uint32) bool {
 	return t == typeQ4_K || t == typeQ8_0 || (t == typeQ6_K || t == typeF16) && !m.det // deterministic mode: no Q6_K/F16 kernels yet
@@ -177,6 +177,9 @@ func (b *metalBatch) matvec(w *weight, x, out gpuRef, n int) {
 	})
 }
 
+// metalHalfTiles keeps prompt matmuls' weight tiles in half precision.
+var metalHalfTiles = false
+
 // metalAttnOnePass uses the one-pass attention kernel instead of the tiled one (tests compare the two).
 var metalAttnOnePass = false
 
@@ -188,6 +191,9 @@ func (b *metalBatch) matmulTiled(w *weight, x, out gpuRef, n int) {
 	kernel := map[uint32]string{typeQ8_0: "matmul_q8_0_f32", typeQ4_K: "matmul_q4k_f32", typeQ6_K: "matmul_q6k_f32", typeF16: "matmul_f16_f32"}[w.typ]
 	if kernel == "" {
 		panic("metal: tiled matmul doesn't support " + typeName(w.typ))
+	}
+	if metalHalfTiles {
+		kernel += "_h"
 	}
 	b.ds = append(b.ds, metal.Dispatch{
 		P:       b.m.ps[kernel],

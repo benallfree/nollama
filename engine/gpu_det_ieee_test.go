@@ -38,7 +38,7 @@ kernel void probe(device const float *a [[buffer(0)]], device const float *b [[b
 func TestMetalIEEE(t *testing.T) {
 	d, err := metal.Open()
 	if err != nil {
-		t.Skip(err)
+		skipGPU(t, err)
 	}
 	defer d.Close()
 	ps, err := d.CompilePrecise(ieeeProbeSrc, "probe")

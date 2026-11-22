@@ -38,7 +38,7 @@ func TestGPUForward(t *testing.T) {
 	defer m.Close()
 	g, err := newGPUModel(m, false)
 	if err != nil {
-		t.Skip(err)
+		skipGPU(t, err)
 	}
 	defer g.close()
 	t.Logf("%s", g.b.name())
@@ -113,7 +113,7 @@ func TestGPUForwardSpeed(t *testing.T) {
 	defer m.Close()
 	g, err := newGPUModel(m, false)
 	if err != nil {
-		t.Skip(err)
+		skipGPU(t, err)
 	}
 	defer g.close()
 	prompt := make([]int, 512)
@@ -153,7 +153,7 @@ func TestGPUScoreEmbed(t *testing.T) {
 	defer m.Close()
 	g, err := newGPUModel(m, false)
 	if err != nil {
-		t.Skip(err)
+		skipGPU(t, err)
 	}
 	defer g.close()
 	ids := m.Tokenize("The quick brown fox jumps over the lazy dog.")
@@ -197,7 +197,7 @@ func TestGPUForwardDiscrete(t *testing.T) {
 	defer m.Close()
 	gu, err := newGPUModel(m, false)
 	if err != nil {
-		t.Skip(err)
+		skipGPU(t, err)
 	}
 	defer gu.close()
 	gpuForceDiscrete = true
@@ -257,7 +257,7 @@ func TestGPUSplitAttention(t *testing.T) {
 	defer m.Close()
 	g, err := newGPUModel(m, false)
 	if err != nil {
-		t.Skip(err)
+		skipGPU(t, err)
 	}
 	defer g.close()
 	prompt := make([]int, 600)

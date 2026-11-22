@@ -2,11 +2,13 @@ package engine
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
@@ -40,13 +42,16 @@ func getFloat(b []byte, i int) float32 {
 // testBackend opens the first GPU backend that works here (with no weights), or skips.
 func testBackend(t *testing.T) gpuBackend {
 	t.Helper()
+	var why []string
 	for _, open := range gpuOpeners {
-		if b, err := open(false); err == nil {
+		b, err := open(false)
+		if err == nil {
 			t.Cleanup(b.close)
 			return b
 		}
+		why = append(why, err.Error())
 	}
-	t.Skip("no GPU backend works here")
+	skipGPU(t, errors.New(strings.Join(why, "; ")))
 	return nil
 }
 
@@ -162,7 +167,7 @@ func openModelGPU(t *testing.T) (*Model, gpuBackend) {
 	t.Cleanup(func() { m.Close() })
 	b, err := openGPU(m.g, false)
 	if err != nil {
-		t.Skip(err)
+		skipGPU(t, err)
 	}
 	t.Cleanup(b.close)
 	return m, b
@@ -439,4 +444,14 @@ func promptTol(b gpuBackend, n int, f32, half float64) float64 {
 		return half
 	}
 	return f32
+}
+
+// skipGPU skips a test for want of a GPU, but fails it when a GPU is there and our kernels don't compile (which
+// would otherwise skip every GPU test without a word).
+func skipGPU(t *testing.T, err error) {
+	t.Helper()
+	if strings.Contains(err.Error(), "metal: compile") {
+		t.Fatal(err)
+	}
+	t.Skip(err)
 }
