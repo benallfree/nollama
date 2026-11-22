@@ -212,7 +212,11 @@ type mmSeg struct {
 // writing output row t at index (t-t0). Rows of all segments are split across
 // the pool in tiles; each tile walks tokens in the outer loop so the tile's
 // weights stay in L1 while activations stream.
-func (m *Model) matmul(p *pool, a *acts, t0 int, segs ...mmSeg) {
+func (m *Model) matmul(p *pool, a *acts, t0 int, segs ...mmSeg) { matmul(p, a, t0, segs...) }
+
+// matmul is Model.matmul without a model: the kernels need only the weights, the activations and the pool (Whisper
+// uses it too).
+func matmul(p *pool, a *acts, t0 int, segs ...mmSeg) {
 	type tileSeg struct {
 		dot   func([]byte, int) float32
 		dot4  func([]byte, int, *[4]float32)
