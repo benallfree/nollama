@@ -570,14 +570,15 @@ extern "C" __global__ void kv_store_f32(const float *k, const float *v, float *k
 struct AttnArgs {
 	uint heads, kvHeads, headDim, ctxP, pos;
 	float scale;
+	uint stageStart; // block KV caches: positions from here are in the stage (KVQ)
 };
 
 // KV cache accessors (see gpu.metal): KVF32 is the f32 cache (keys transposed, values by position), KVF16 the f16
 // cache in the CPU's compact layout (keys by position, values by channel).
 struct KVF32 {
 	typedef float T;
-	const float *k, *v;
-	uint ctxP, kvd, hd, kvh;
+	const float *k, *v, *stage;
+	uint ctxP, kvd, hd, kvh, stageStart;
 	static constexpr bool byChannel = false; // values are stored by position
 	__device__ __forceinline__ float key(uint j, uint d) const { return k[(size_t)(kvh * hd + d) * ctxP + j]; }
 	__device__ __forceinline__ float4 key4(uint j, uint d) const {
@@ -588,7 +589,8 @@ struct KVF32 {
 struct KVF16 {
 	typedef __half T;
 	const __half *k, *v;
-	uint ctxP, kvd, hd, kvh;
+	const float *stage;
+	uint ctxP, kvd, hd, kvh, stageStart;
 	static constexpr bool byChannel = true; // values are stored by channel
 	__device__ __forceinline__ float key(uint j, uint d) const { return __half2float(k[(size_t)j * kvd + kvh * hd + d]); }
 	__device__ __forceinline__ float4 key4(uint j, uint d) const { // d % 4 == 0: one 8-byte load
@@ -598,12 +600,50 @@ struct KVF16 {
 	}
 	__device__ __forceinline__ float val(uint j, uint d) const { return __half2float(v[(size_t)(kvh * hd + d) * ctxP + j]); }
 };
+// KVQ: a block cache (see gpu.metal): q8_0 keys by position, values by channel in blocks of 32 positions (VB 8: q8_0,
+// VB 4: q4_0), the newest block's values in stage ([kvd][32] floats) from stageStart.
+template <int VB>
+struct KVQ {
+	typedef unsigned char T;
+	const unsigned char *k, *v;
+	const float *stage;
+	uint ctxP, kvd, hd, kvh, stageStart;
+	static constexpr bool byChannel = true;
+	__device__ __forceinline__ const unsigned char *kblk(uint j, uint d) const {
+		return k + (size_t)j * (kvd / 32 * 34) + (kvh * hd + d) / 32 * 34; // hd % 32 == 0: no runtime division
+	}
+	__device__ __forceinline__ float key(uint j, uint d) const {
+		const unsigned char *b = kblk(j, d);
+		return f16(b) * (float)((const signed char *)b)[2 + d % 32];
+	}
+	__device__ __forceinline__ float4 key4(uint j, uint d) const { // d % 4 == 0; quants are 2-byte aligned
+		const unsigned char *b = kblk(j, d);
+		const char2 *q = (const char2 *)(b + 2 + d % 32);
+		char2 x = q[0], y = q[1];
+		float sc = f16(b);
+		return make_float4(sc * x.x, sc * x.y, sc * y.x, sc * y.y);
+	}
+	__device__ __forceinline__ float val(uint j, uint d) const {
+		uint ch = kvh * hd + d;
+		if (j >= stageStart) return stage[ch * 32 + j - stageStart];
+		const uint bb = VB == 8 ? 34 : 18;
+		const unsigned char *b = v + (size_t)ch * (ctxP / 32 * bb) + j / 32 * bb;
+		float sc = f16(b);
+		uint jj = j % 32;
+		if (VB == 8) return sc * (float)((const signed char *)b)[2 + jj];
+		uint q = b[2 + jj % 16];
+		return sc * ((float)(jj < 16 ? q & 0xF : q >> 4) - 8);
+	}
+};
+typedef KVQ<8> KVQ8;
+typedef KVQ<4> KVQ4;
+
 
 // One block (256 threads) per (query head, token); see attention_f32 in gpu.metal. Dynamic shared memory:
 // headDim + 256 floats.
 template <typename KV>
 __device__ __forceinline__ void attention_kv(const float *q, const typename KV::T *kT, const typename KV::T *v, float *out,
-                                             float *sc, const uint2 *mask, AttnArgs a) {
+                                             float *sc, const uint2 *mask, AttnArgs a, const float *stage) {
 	extern __shared__ float shm[];
 	uint h = blockIdx.x, t = blockIdx.y, tid = threadIdx.x, nt = blockDim.x;
 	uint hd = a.headDim, kvh = h / (a.heads / a.kvHeads), kvd = a.kvHeads * hd;
@@ -615,7 +655,7 @@ __device__ __forceinline__ void attention_kv(const float *q, const typename KV::
 	for (uint d = tid; d < hd; d += nt) qs[d] = qh[d];
 	__syncthreads();
 
-	KV kv{kT, v, a.ctxP, kvd, hd, kvh};
+	KV kv{kT, v, stage, a.ctxP, kvd, hd, kvh, a.stageStart};
 	float mx = -INFINITY;
 	for (uint j = tid; j < ctx; j += nt) {
 		float x = -INFINITY;
@@ -638,6 +678,15 @@ __device__ __forceinline__ void attention_kv(const float *q, const typename KV::
 	float inv = 1 / sum;
 	__syncthreads();
 
+	if (KV::byChannel) { // values by channel: a warp per channel, lanes over positions (see gpu.metal)
+		for (uint d = tid / 32; d < hd; d += nt / 32) {
+			float o = 0;
+			for (uint j = tid % 32; j < ctx; j += 32) o += s[j] * kv.val(j, d);
+			o = warp_sum(o);
+			if (tid % 32 == 0) out[((size_t)t * a.heads + h) * hd + d] = o * inv;
+		}
+		return;
+	}
 	uint parts = nt / hd, d = tid % hd, part = tid / hd;
 	float o = 0;
 	if (part < parts) {
@@ -663,11 +712,12 @@ struct AttnSplitArgs {
 	uint heads, kvHeads, headDim, ctxP, pos;
 	float scale;
 	uint chunk, splits;
+	uint stageStart;
 };
 
 template <typename KV>
 __device__ __forceinline__ void attention_split_kv(const float *q, const typename KV::T *kT, const typename KV::T *v,
-                                                   float *part, const uint2 *mask, AttnSplitArgs a) {
+                                                   float *part, const uint2 *mask, AttnSplitArgs a, const float *stage) {
 	extern __shared__ float shm[];
 	__shared__ float red[32];
 	uint h = blockIdx.x, t = blockIdx.y, sp = blockIdx.z, tid = threadIdx.x, nt = blockDim.x;
@@ -685,7 +735,7 @@ __device__ __forceinline__ void attention_split_kv(const float *q, const typenam
 	for (uint d = tid; d < hd; d += nt) qs[d] = qh[d];
 	__syncthreads();
 
-	KV kv{kT, v, a.ctxP, kvd, hd, kvh};
+	KV kv{kT, v, stage, a.ctxP, kvd, hd, kvh, a.stageStart};
 	float mx = -INFINITY;
 	for (uint j = c0 + tid; j < c1; j += nt) {
 		float x = -INFINITY;
@@ -715,15 +765,12 @@ __device__ __forceinline__ void attention_split_kv(const float *q, const typenam
 	sum = block_sum(sum, red);
 	__syncthreads();
 
-	if (KV::byChannel && nt % hd == 0) { // values by channel: thread (d, part) walks channel d's row (see gpu.metal)
-		uint parts = nt / hd, d = tid % hd, part = tid / hd;
-		float o = 0;
-		for (uint j = c0 + part; j < c1; j += parts) o += ss[j - c0] * kv.val(j, d);
-		vr[tid] = o;
-		__syncthreads();
-		if (tid < hd) {
-			for (uint i = 1; i < parts; i++) o += vr[i * hd + tid];
-			P[2 + tid] = o;
+	if (KV::byChannel) { // values by channel: a warp per channel, lanes over positions (see gpu.metal)
+		for (uint d = sg; d < hd; d += nsg) {
+			float o = 0;
+			for (uint j = c0 + lane; j < c1; j += 32) o += ss[j - c0] * kv.val(j, d);
+			o = warp_sum(o);
+			if (lane == 0) P[2 + d] = o;
 		}
 	} else {
 		float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0}; // headDim <= 256
@@ -774,11 +821,12 @@ struct AttnTileArgs {
 	uint heads, kvHeads, headDim, ctxP, pos;
 	float scale;
 	uint tokens;
+	uint stageStart;
 };
 
 template <typename KV>
 __device__ __forceinline__ void attention_tile_kv(const float *q, const typename KV::T *kT, const typename KV::T *v,
-                                                  float *out, const uint2 *mask, AttnTileArgs a) {
+                                                  float *out, const uint2 *mask, AttnTileArgs a, const float *stage) {
 	__shared__ float qs[ATT_QT][128], ks[128][ATT_KC + 1], vs[ATT_KC][128], ps[ATT_QT][ATT_KC + 1];
 	__shared__ float alpha[ATT_QT], lsum[ATT_QT], mrow[ATT_QT];
 	uint h = blockIdx.x, t0 = blockIdx.y * ATT_QT, tid = threadIdx.x;
@@ -796,7 +844,7 @@ __device__ __forceinline__ void attention_tile_kv(const float *q, const typename
 	uint orow = tid / 16, ocol = tid % 16;
 	float o[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 	uint ctxEnd = a.pos + t0 + nt; // the last token sees positions < ctxEnd
-	KV kv{kT, v, a.ctxP, kvd, hd, kvh};
+	KV kv{kT, v, stage, a.ctxP, kvd, hd, kvh, a.stageStart};
 	for (uint c0 = 0; c0 < ctxEnd; c0 += ATT_KC) {
 		__syncthreads(); // previous chunk done with ks/vs/ps
 		for (uint i = tid; i < hd * ATT_KC; i += 256) {
@@ -872,7 +920,7 @@ __device__ __forceinline__ void attention_tile_kv(const float *q, const typename
 #define FA_OLD (64 + 4)    // half an output tile [16][64] floats
 template <typename KV>
 __device__ __forceinline__ void attention_flash_kv(const float *q, const typename KV::T *kT, const typename KV::T *v,
-                                                   float *out, const uint2 *mask, AttnTileArgs a) {
+                                                   float *out, const uint2 *mask, AttnTileArgs a, const float *stage) {
 	using namespace nvcuda;
 	// kv: keys then values for the chunk; before the loop, the block's queries. scr: each warp's scores, then its
 	// probabilities (after them), then half its output tile.
@@ -906,7 +954,7 @@ __device__ __forceinline__ void attention_flash_kv(const float *q, const typenam
 #pragma unroll
 		for (int i = 0; i < 32; i++) o[g][i] = 0;
 	uint ctxEnd = a.pos + t0 + nt;
-	KV cache{kT, v, a.ctxP, kvd, FA_HD, kvh};
+	KV cache{kT, v, stage, a.ctxP, kvd, FA_HD, kvh, a.stageStart};
 	for (uint c0 = 0; c0 < ctxEnd; c0 += FA_KC) {
 		for (uint i = tid; i < FA_HD * FA_KC; i += 128) {
 			uint d = i / FA_KC, j = i % FA_KC;
@@ -994,23 +1042,25 @@ __device__ __forceinline__ void attention_flash_kv(const float *q, const typenam
 // Attention kernels for each KV cache type.
 #define ATTN_KERNELS(sfx, KV)                                                                                          \
 	extern "C" __global__ void attention##sfx(const float *q, const KV::T *kT, const KV::T *v, float *out, float *sc,  \
-	                                          const uint2 *mask, AttnArgs a) {                                        \
-		attention_kv<KV>(q, kT, v, out, sc, mask, a);                                                              \
+	                                          const uint2 *mask, AttnArgs a, const float *stage) {                                    \
+		attention_kv<KV>(q, kT, v, out, sc, mask, a, stage);                                                              \
 	}                                                                                                              \
 	extern "C" __global__ void attention_split##sfx(const float *q, const KV::T *kT, const KV::T *v, float *part,      \
-	                                                const uint2 *mask, AttnSplitArgs a) {                             \
-		attention_split_kv<KV>(q, kT, v, part, mask, a);                                                           \
+	                                                const uint2 *mask, AttnSplitArgs a, const float *stage) {                          \
+		attention_split_kv<KV>(q, kT, v, part, mask, a, stage);                                                           \
 	}                                                                                                              \
 	extern "C" __global__ void attention_tile##sfx(const float *q, const KV::T *kT, const KV::T *v, float *out,        \
-	                                               const uint2 *mask, AttnTileArgs a) {                               \
-		attention_tile_kv<KV>(q, kT, v, out, mask, a);                                                             \
+	                                               const uint2 *mask, AttnTileArgs a, const float *stage) {                           \
+		attention_tile_kv<KV>(q, kT, v, out, mask, a, stage);                                                             \
 	}                                                                                                              \
 	extern "C" __global__ void __launch_bounds__(128) attention_flash##sfx(const float *q, const KV::T *kT, const KV::T *v, \
-	                                                                     float *out, const uint2 *mask, AttnTileArgs a) { \
-		attention_flash_kv<KV>(q, kT, v, out, mask, a);                                                            \
+	                                                                     float *out, const uint2 *mask, AttnTileArgs a, const float *stage) { \
+		attention_flash_kv<KV>(q, kT, v, out, mask, a, stage);                                                            \
 	}
 ATTN_KERNELS(_f32, KVF32)
 ATTN_KERNELS(_f16, KVF16)
+ATTN_KERNELS(_q8, KVQ8)
+ATTN_KERNELS(_q4, KVQ4)
 
 // kv_store_f16: keys by position (kc[p*kvd + i]), values by channel (vc[i*ctxP + p]), as halves (see gpu.metal).
 extern "C" __global__ void kv_store_f16(const float *k, const float *v, __half *kc, __half *vc, KVStoreArgs a) {
@@ -1018,4 +1068,83 @@ extern "C" __global__ void kv_store_f16(const float *k, const float *v, __half *
 	if (i >= a.kvd) return;
 	kc[((size_t)a.pos + t) * a.kvd + i] = __float2half(fminf(fmaxf(k[(size_t)t * a.kvd + i], -65504.f), 65504.f));
 	vc[(size_t)i * a.ctxP + a.pos + t] = __float2half(fminf(fmaxf(v[(size_t)t * a.kvd + i], -65504.f), 65504.f));
+}
+
+// Block KV cache stores (see gpu.metal's kv_store_qk and kv_store_qv).
+struct KVQStoreArgs {
+	uint kvd, ctxP, pos, n, oldStageBlk, vb;
+};
+
+// One warp per 32 keys (a q8_0 block). Grid: n*kvd/32 warps, 8 per block.
+extern "C" __global__ void kv_store_qk(const float *k, unsigned char *kc, KVQStoreArgs a) {
+	uint item = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32, nbk = a.kvd / 32;
+	if (item >= a.n * nbk) return;
+	uint t = item / nbk, bi = item % nbk;
+	float x = k[(size_t)t * a.kvd + bi * 32 + lane], m = fabsf(x);
+#pragma unroll
+	for (int o = 16; o > 0; o /= 2) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+	float d = m / 127, id = d != 0 ? 1 / d : 0;
+	unsigned char *b = kc + ((size_t)a.pos + t) * (nbk * 34) + bi * 34;
+	if (lane == 0) *(__half *)b = __float2half(d);
+	((signed char *)b)[2 + lane] = (signed char)__float2int_rn(x * id);
+}
+
+__device__ __forceinline__ void quant_block(float x, unsigned char *b, uint vb, uint lane) {
+	float amax = fabsf(x);
+#pragma unroll
+	for (int o = 16; o > 0; o /= 2) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+	if (vb == 8) {
+		float d = amax / 127, id = d != 0 ? 1 / d : 0;
+		if (lane == 0) *(__half *)b = __float2half(d);
+		((signed char *)b)[2 + lane] = (signed char)__float2int_rn(x * id);
+		return;
+	}
+	uint first = __ffs(__ballot_sync(0xffffffff, fabsf(x) == amax)) - 1; // the first lane holding it
+	float mx = __shfl_sync(0xffffffff, x, first);
+	float d = mx / -8, id = d != 0 ? 1 / d : 0;
+	int q = min(15, max(0, (int)(x * id + 8.5f)));
+	int hi = __shfl_down_sync(0xffffffff, q, 16);
+	if (lane == 0) *(__half *)b = __float2half(d);
+	if (lane < 16) b[2 + lane] = (unsigned char)(q | (hi << 4));
+}
+
+// One warp per channel, walking the blocks this call touches in order. Grid: kvd warps, 8 per block.
+extern "C" __global__ void kv_store_qv(const float *v, unsigned char *vc, float *stage, KVQStoreArgs a) {
+	uint ch = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32;
+	if (ch >= a.kvd) return;
+	uint bb = a.vb == 8 ? 34 : 18, end = a.pos + a.n;
+	unsigned char *row = vc + (size_t)ch * (a.ctxP / 32 * bb);
+	for (uint blk = a.pos / 32; blk * 32 < end; blk++) {
+		uint p = blk * 32 + lane;
+		float x = 0;
+		if (p < a.pos) {
+			if (blk == a.oldStageBlk) {
+				x = stage[ch * 32 + lane];
+			} else {
+				const unsigned char *b = row + blk * bb;
+				float sc = f16(b);
+				if (a.vb == 8) {
+					x = sc * (float)((const signed char *)b)[2 + lane];
+				} else {
+					uint q = b[2 + lane % 16];
+					x = sc * ((float)(lane < 16 ? q & 0xF : q >> 4) - 8);
+				}
+			}
+		} else if (p < end) {
+			x = v[(size_t)(p - a.pos) * a.kvd + ch];
+		}
+		if (blk * 32 + 31 < end) quant_block(x, row + blk * bb, a.vb, lane);
+		if ((blk + 1) * 32 >= end) stage[ch * 32 + lane] = x;
+	}
+}
+
+// copy_rows_u8: dst[r*len + c] = src[r*stride + off + c] (bytes).
+struct RowsArgs {
+	uint rows, stride, off, len;
+};
+extern "C" __global__ void copy_rows_u8(const unsigned char *src, unsigned char *dst, RowsArgs a) {
+	uint i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= a.rows * a.len) return;
+	uint r = i / a.len, c = i % a.len;
+	dst[i] = src[(size_t)r * a.stride + a.off + c];
 }

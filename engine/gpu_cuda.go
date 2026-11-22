@@ -40,7 +40,7 @@ var cudaKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "matvec_q6k_f32"
 	"matvec_q4k_pair", "matvec_q8_0_pair", "matvec_q6k_pair", "matvec_f16_pair",
 	"matmul_q8_0_f32", "matmul_q4k_f32", "matmul_q6k_f32", "matmul_f16_f32",
 	"matmul_q8_0_tc", "matmul_q4k_tc", "matmul_q6k_tc", "matmul_f16_tc", "rmsnorm_f32", "rope_neox_f32",
-	"swiglu_f32", "add_f32", "norm_rope_f32", "add_norm_f32", "copy_f32", "kv_store_f32", "kv_store_f16", "attention_f32", "attention_f16", "attention_split_f16", "attention_tile_f16", "attention_flash_f16", "attention_flash_f32",
+	"swiglu_f32", "add_f32", "norm_rope_f32", "add_norm_f32", "copy_f32", "kv_store_f32", "kv_store_f16", "attention_f32", "attention_f16", "attention_split_f16", "attention_tile_f16", "attention_flash_f16", "attention_q8", "attention_q4", "attention_split_q8", "attention_split_q4", "attention_tile_q8", "attention_tile_q4", "attention_flash_q8", "attention_flash_q4", "kv_store_qk", "kv_store_qv", "copy_rows_u8", "attention_flash_f32",
 	"attention_split_f32", "attention_combine_f32", "attention_tile_f32"}
 
 // cudaBackend is the gpuBackend for NVIDIA GPUs, through the driver API (no toolkit needed).
@@ -95,7 +95,12 @@ func (c *cudaBackend) unified() bool     { return false }
 func (c *cudaBackend) halfPrompts() bool { return !c.det && !cudaPromptF32 }
 
 // supportsKV: f32, and f16 outside deterministic mode (checked on an NVIDIA A16).
-func (c *cudaBackend) supportsKV(t uint32) bool { return t == typeF32 || t == typeF16 && !c.det }
+func (c *cudaBackend) supportsKV(t uint32) bool {
+	return t == typeF32 || t == typeF16 && !c.det || (t == typeQ8_0 || t == typeQ4_0) && !c.det && cudaBlockKV
+}
+
+// cudaBlockKV turns on the q8_0 and q4_0 KV caches on CUDA (off until checked on a card; tests turn it on).
+var cudaBlockKV = false
 
 func (c *cudaBackend) int8Prompts() bool { return c.mmaMod != nil && !cudaNoMMQ && !cudaPromptF32 }
 
@@ -412,6 +417,23 @@ func (b *cudaBatch) copy(dst, src gpuRef, n int) {
 	b.elementwise("copy_f32", n, carg(dst), carg(src))
 }
 
+func (b *cudaBatch) storeKVQ(k, v, kc, vc, stage gpuRef, n, pos, kvd, ctxP, oldStageBlk int, vtyp uint32) {
+	b.wrote()
+	vb := uint32(8)
+	if vtyp == typeQ4_0 {
+		vb = 4
+	}
+	args := cuda.Arg{Bytes: u32(uint32(kvd), uint32(ctxP), uint32(pos), uint32(n), uint32(oldStageBlk), vb)}
+	b.launch("kv_store_qk", [3]uint32{uint32((n*kvd/32 + 7) / 8), 1, 1}, [3]uint32{256, 1, 1}, 0, carg(k), carg(kc), args)
+	b.launch("kv_store_qv", [3]uint32{uint32((kvd + 7) / 8), 1, 1}, [3]uint32{256, 1, 1}, 0, carg(v), carg(vc), carg(stage), args)
+}
+
+func (b *cudaBatch) packRows(src, dst gpuRef, rows, stride, off, length int) {
+	b.wrote()
+	b.launch("copy_rows_u8", [3]uint32{uint32((rows*length + 255) / 256), 1, 1}, [3]uint32{256, 1, 1}, 0,
+		carg(src), carg(dst), cuda.Arg{Bytes: u32(uint32(rows), uint32(stride), uint32(off), uint32(length))})
+}
+
 func (b *cudaBatch) storeKV16(k, v, kc, vc gpuRef, n, pos, kvd, ctxP int) {
 	b.wrote()
 	b.launch("kv_store_f16", [3]uint32{uint32((kvd + 255) / 256), uint32(n), 1}, [3]uint32{256, 1, 1}, 0,
@@ -425,10 +447,15 @@ func (b *cudaBatch) storeKV(k, v, kc, vc gpuRef, n, pos, kvd, ctxP int) {
 }
 
 func (b *cudaBatch) attention(a gpuAttention) {
-	kv := map[uint32]string{typeF32: "_f32", typeF16: "_f16"}[a.kvType]
+	kv := map[uint32]string{typeF32: "_f32", typeF16: "_f16", typeQ8_0: "_q8", typeQ4_0: "_q4"}[a.kvType]
 	if kv == "" || kv != "_f32" && b.c.det {
 		panic(fmt.Sprintf("cuda: attention over a %s cache isn't supported", kvTypeName(a.kvType)))
 	}
+	stage := carg(a.k) // block caches' stage (unused by the others)
+	if a.stage.buf != nil {
+		stage = carg(a.stage)
+	}
+	ss := uint32(a.stageStart)
 	b.wrote()
 	if b.c.det { // the CPU's order: one pass per (token, head), no split (its partial sums would be added in another order)
 		b.launch("attention_det", [3]uint32{uint32(a.heads), uint32(a.n), 1}, [3]uint32{128, 1, 1}, 4*(a.headDim+4),
@@ -439,9 +466,9 @@ func (b *cudaBatch) attention(a gpuAttention) {
 	const nt = 256
 	if chunk, splits, ok := a.split(); ok {
 		args := cuda.Arg{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos),
-			a.scale(), uint32(chunk), uint32(splits))}
+			a.scale(), uint32(chunk), uint32(splits), ss)}
 		b.launch("attention_split"+kv, [3]uint32{uint32(a.heads), uint32(a.n), uint32(splits)}, [3]uint32{nt, 1, 1},
-			4*(a.headDim+chunk+nt/32*a.headDim), carg(a.q), carg(a.k), carg(a.v), carg(a.scratch), carg(a.mask), args)
+			4*(a.headDim+chunk+nt/32*a.headDim), carg(a.q), carg(a.k), carg(a.v), carg(a.scratch), carg(a.mask), args, stage)
 		b.launch("attention_combine_f32", [3]uint32{uint32(a.heads), uint32(a.n), 1},
 			[3]uint32{uint32((a.headDim + 31) &^ 31), 1, 1}, 0, carg(a.scratch), carg(a.out), args)
 		return
@@ -449,18 +476,18 @@ func (b *cudaBatch) attention(a gpuAttention) {
 	if a.n > attnSplitTokens && a.headDim == 128 && !cudaAttnOnePass && !cudaAttnTile { // prompts on the tensor cores
 		b.launch("attention_flash"+kv, [3]uint32{uint32(a.heads), uint32((a.n + 63) / 64), 1}, [3]uint32{128, 1, 1}, 0,
 			carg(a.q), carg(a.k), carg(a.v), carg(a.out), carg(a.mask),
-			cuda.Arg{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos), a.scale(), uint32(a.n))})
+			cuda.Arg{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos), a.scale(), uint32(a.n), ss)}, stage)
 		return
 	}
 	if a.n > attnSplitTokens && a.headDim <= 128 && !cudaAttnOnePass { // prompts; one-token steps keep the one-pass kernel
 		const qt = 16 // ATT_QT
 		b.launch("attention_tile"+kv, [3]uint32{uint32(a.heads), uint32((a.n + qt - 1) / qt), 1}, [3]uint32{256, 1, 1}, 0,
 			carg(a.q), carg(a.k), carg(a.v), carg(a.out), carg(a.mask),
-			cuda.Arg{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos), a.scale(), uint32(a.n))})
+			cuda.Arg{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos), a.scale(), uint32(a.n), ss)}, stage)
 		return
 	}
 	b.launch("attention"+kv, [3]uint32{uint32(a.heads), uint32(a.n), 1}, [3]uint32{nt, 1, 1}, 4*(a.headDim+nt),
 		carg(a.q), carg(a.k), carg(a.v), carg(a.out), carg(a.scratch), carg(a.mask),
 		cuda.Arg{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos),
-			a.scale())})
+			a.scale(), ss)}, stage)
 }

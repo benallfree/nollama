@@ -84,22 +84,30 @@ type gpuBatch interface {
 	// storeKV16 writes them into a layer's f16 cache in the compact layout: keys by position (kc[p*kvd + i]), values
 	// by channel (vc[i*ctxP + p]), as halves.
 	storeKV16(k, v, kc, vc gpuRef, n, pos, kvd, ctxP int)
+	// storeKVQ writes them into a layer's block cache (q8_0 keys; vtyp q8_0 or q4_0 values) as the CPU's storeKey and
+	// storeValue do: keys quantized in their position rows, values into their channel rows' blocks, the newest block
+	// at full precision in stage ([kvd][32]). oldStageBlk is the block the stage held before.
+	storeKVQ(k, v, kc, vc, stage gpuRef, n, pos, kvd, ctxP, oldStageBlk int, vtyp uint32)
+	// packRows copies bytes [off, off+length) of rows rows (stride bytes apart) of src into dst, contiguous.
+	packRows(src, dst gpuRef, rows, stride, off, length int)
 	attention(a gpuAttention)
 	submit() error
 }
 
 // gpuAttention is one layer's causal attention for n tokens at positions pos..pos+n-1.
 type gpuAttention struct {
-	q, out  gpuRef // [n][heads][headDim]
-	k, v    gpuRef // the layer's cache, in kvType's layout
-	scratch gpuRef // n*heads*ctxP floats
-	mask    gpuRef // n pairs of uint32: positions [lo, hi) token t must not see (packed sequences)
-	kvType  uint32 // typeF32, or typeF16 (the compact layout: keys [ctxP][kvd], values [kvd][ctxP])
-	n, pos  int
-	heads   int
-	kvHeads int
-	headDim int
-	ctxP    int // cache rows, a multiple of 16
+	q, out     gpuRef // [n][heads][headDim]
+	k, v       gpuRef // the layer's cache, in kvType's layout
+	scratch    gpuRef // n*heads*ctxP floats
+	mask       gpuRef // n pairs of uint32: positions [lo, hi) token t must not see (packed sequences)
+	kvType     uint32 // typeF32, or typeF16, typeQ8_0, typeQ4_0 (the compact layouts: kvcache.go)
+	stage      gpuRef // block caches: the newest block's values ([kvd][32] floats), positions from stageStart
+	stageStart int
+	n, pos     int
+	heads      int
+	kvHeads    int
+	headDim    int
+	ctxP       int // cache rows, a multiple of 16
 }
 
 // gpuOpeners are the backends to try, in order of preference. det asks for the deterministic kernels: the CPU's

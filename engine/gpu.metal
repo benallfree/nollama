@@ -581,6 +581,7 @@ struct AttnArgs {
 	uint ctxP;
 	uint pos;
 	float scale;
+	uint stageStart; // block KV caches: positions from here are in the stage (KVQ)
 };
 
 // KV cache accessors for the attention kernels: key(j, d) and val(j, d) are channel d of KV head kvh at position j.
@@ -588,8 +589,8 @@ struct AttnArgs {
 // f16 cache in the CPU's compact layout (keys by position [ctxP][kvd], values by channel [kvd][ctxP]).
 struct KVF32 {
 	typedef float T;
-	device const float *k, *v;
-	uint ctxP, kvd, hd, kvh;
+	device const float *k, *v, *stage;
+	uint ctxP, kvd, hd, kvh, stageStart;
 	static constant constexpr bool byChannel = false; // values are stored by position
 	float key(uint j, uint d) const { return k[(ulong)(kvh * hd + d) * ctxP + j]; }
 	float4 key4(uint j, uint d) const { return float4(key(j, d), key(j, d + 1), key(j, d + 2), key(j, d + 3)); }
@@ -598,12 +599,54 @@ struct KVF32 {
 struct KVF16 {
 	typedef half T;
 	device const half *k, *v;
-	uint ctxP, kvd, hd, kvh;
+	device const float *stage;
+	uint ctxP, kvd, hd, kvh, stageStart;
 	static constant constexpr bool byChannel = true; // values are stored by channel
 	float key(uint j, uint d) const { return k[(ulong)j * kvd + kvh * hd + d]; }
 	float4 key4(uint j, uint d) const { return float4(*(device const half4 *)(k + (ulong)j * kvd + kvh * hd + d)); } // d % 4 == 0
 	float val(uint j, uint d) const { return v[(ulong)(kvh * hd + d) * ctxP + j]; }
 };
+// KVQ is a block cache in the CPU's compact layout (kvcache.go): keys by position, each KV head's headDim numbers in
+// q8_0 blocks of 32; values by channel, positions in blocks of 32 (VB 8: q8_0, 34 bytes; VB 4: q4_0, 18 bytes); the
+// newest block's values at full precision in stage ([kvd][32] floats, positions from stageStart).
+template <int VB>
+struct KVQ {
+	typedef uchar T;
+	device const uchar *k, *v;
+	device const float *stage;
+	uint ctxP, kvd, hd, kvh, stageStart;
+	static constant constexpr bool byChannel = true;
+	// a position's row is kvd/32 blocks (hd is a multiple of 32): no runtime division per key
+	device const uchar *kblk(uint j, uint d) const { return k + (ulong)j * (kvd / 32 * 34) + (kvh * hd + d) / 32 * 34; }
+	float key(uint j, uint d) const {
+		device const uchar *b = kblk(j, d);
+		return float(*(device const half *)b) * float(((device const char *)b)[2 + d % 32]);
+	}
+	float4 key4(uint j, uint d) const { // d % 4 == 0; quants are 2-byte aligned
+		device const uchar *b = kblk(j, d);
+		device const char2 *q = (device const char2 *)(b + 2 + d % 32);
+		char2 x = q[0], y = q[1];
+		return float(*(device const half *)b) * float4(x.x, x.y, y.x, y.y);
+	}
+	float val(uint j, uint d) const {
+		uint ch = kvh * hd + d;
+		if (j >= stageStart) {
+			return stage[ch * 32 + j - stageStart];
+		}
+		const uint bb = VB == 8 ? 34 : 18;
+		device const uchar *b = v + (ulong)ch * (ctxP / 32 * bb) + j / 32 * bb;
+		float sc = float(*(device const half *)b);
+		uint jj = j % 32;
+		if (VB == 8) {
+			return sc * float(((device const char *)b)[2 + jj]);
+		}
+		uint q = b[2 + jj % 16];
+		return sc * (float(jj < 16 ? q & 0xF : q >> 4) - 8);
+	}
+};
+typedef KVQ<8> KVQ8;
+typedef KVQ<4> KVQ4;
+
 
 // attn_scores writes the scaled scores of positions [c0, c1) against the head's query qs into ss[j - c0], -INFINITY for
 // masked positions. Lanes take consecutive positions (coalesced key loads), simdgroups split the head's channels, and
@@ -643,6 +686,7 @@ kernel void attention_kv(device const float *q [[buffer(0)]],
                           device float *sc [[buffer(4)]],
                           device const uint2 *mask [[buffer(5)]],
                           constant AttnArgs &a [[buffer(6)]],
+                          device const float *stage [[buffer(7)]],
                           threadgroup float *shm [[threadgroup(0)]],
                           uint2 tg [[threadgroup_position_in_grid]],
                           uint tid [[thread_index_in_threadgroup]],
@@ -665,7 +709,7 @@ kernel void attention_kv(device const float *q [[buffer(0)]],
 	threadgroup_barrier(mem_flags::mem_threadgroup);
 
 	// scores and their max
-	KV kv{kT, v, a.ctxP, kvd, hd, kvh};
+	KV kv{kT, v, stage, a.ctxP, kvd, hd, kvh, a.stageStart};
 	attn_scores(qs, kv, hd, 0, ctx, m, a.scale, s, red, sg, nsg, lane);
 	float mx = -INFINITY;
 	for (uint j = tid; j < ctx; j += nt) {
@@ -701,6 +745,19 @@ kernel void attention_kv(device const float *q [[buffer(0)]],
 	float inv = 1 / sum;
 	threadgroup_barrier(mem_flags::mem_threadgroup);
 
+	if (KV::byChannel) { // values by channel: a simdgroup per channel, lanes over positions (as the split kernel)
+		for (uint d = sg; d < hd; d += nsg) {
+			float o = 0;
+			for (uint j = lane; j < ctx; j += 32) {
+				o += s[j] * kv.val(j, d);
+			}
+			o = simd_sum(o);
+			if (lane == 0) {
+				out[((ulong)t * a.heads + h) * hd + d] = o * inv;
+			}
+		}
+		return;
+	}
 	// weighted sum of values: thread (d, part) sums positions part, part+parts, ... for channel d
 	uint parts = nt / hd, d = tid % hd, part = tid / hd;
 	float o = 0;
@@ -765,6 +822,7 @@ struct AttnSplitArgs {
 	float scale;
 	uint chunk;
 	uint splits;
+	uint stageStart; // block KV caches: positions from here are in the stage (KVQ)
 };
 
 template <typename KV>
@@ -774,6 +832,7 @@ kernel void attention_split_kv(device const float *q [[buffer(0)]],
                                 device float *part [[buffer(3)]],
                                 device const uint2 *mask [[buffer(4)]],
                                 constant AttnSplitArgs &a [[buffer(5)]],
+                                device const float *stage [[buffer(6)]],
                                 threadgroup float *shm [[threadgroup(0)]],
                                 uint3 tg [[threadgroup_position_in_grid]],
                                 uint tid [[thread_index_in_threadgroup]],
@@ -800,7 +859,7 @@ kernel void attention_split_kv(device const float *q [[buffer(0)]],
 	}
 	threadgroup_barrier(mem_flags::mem_threadgroup);
 
-	KV kv{kT, v, a.ctxP, kvd, hd, kvh};
+	KV kv{kT, v, stage, a.ctxP, kvd, hd, kvh, a.stageStart};
 	float mx = -INFINITY;
 	for (uint j = c0 + tid; j < c1; j += nt) {
 		float x = -INFINITY;
@@ -848,20 +907,19 @@ kernel void attention_split_kv(device const float *q [[buffer(0)]],
 	}
 	threadgroup_barrier(mem_flags::mem_threadgroup);
 
-	if (KV::byChannel && nt % hd == 0) {
-		// values by channel: thread (d, part) walks channel d's row over positions c0+part, c0+part+parts, ...
-		uint parts = nt / hd, d = tid % hd, part = tid / hd;
-		float o = 0;
-		for (uint j = c0 + part; j < c1; j += parts) {
-			o += ss[j - c0] * kv.val(j, d);
-		}
-		red[tid] = o;
-		threadgroup_barrier(mem_flags::mem_threadgroup);
-		if (tid < hd) {
-			for (uint i = 1; i < parts; i++) {
-				o += red[i * hd + tid];
+	if (KV::byChannel) {
+		// values by channel: simdgroup sg takes channels sg, sg+nsg, ...; its lanes walk the channel's row (consecutive
+		// positions, coalesced: one block per step for block caches), and simd_sum adds them. Lanes over channels
+		// instead read 32 rows per step, several times slower over a long context.
+		for (uint d = sg; d < hd; d += nsg) {
+			float o = 0;
+			for (uint j = c0 + lane; j < c1; j += 32) {
+				o += ss[j - c0] * kv.val(j, d);
 			}
-			P[2 + tid] = o;
+			o = simd_sum(o);
+			if (lane == 0) {
+				P[2 + d] = o;
+			}
 		}
 	} else {
 		// values by position: simdgroup sg sums positions c0+sg, c0+sg+nsg, ...; lane covers channels lane, lane+32, ...
@@ -932,6 +990,7 @@ struct AttnTileArgs {
 	uint pos;
 	float scale;
 	uint tokens;
+	uint stageStart; // block KV caches: positions from here are in the stage (KVQ)
 };
 
 template <typename KV>
@@ -941,6 +1000,7 @@ kernel void attention_tile_kv(device const float *q [[buffer(0)]],
                                device float *out [[buffer(3)]],
                                device const uint2 *mask [[buffer(4)]],
                                constant AttnTileArgs &a [[buffer(5)]],
+                               device const float *stage [[buffer(6)]],
                                uint2 tg [[threadgroup_position_in_grid]],
                                uint tid [[thread_index_in_threadgroup]]) {
 	threadgroup float qs[ATT_QT][128], ks[128][ATT_KC + 1], vs[ATT_KC][128], ps[ATT_QT][ATT_KC + 1];
@@ -959,7 +1019,7 @@ kernel void attention_tile_kv(device const float *q [[buffer(0)]],
 	uint orow = tid / 16, ocol = tid % 16; // this thread's output: row orow, channels ocol + 16*i
 	float o[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 	uint ctxEnd = a.pos + t0 + nt;
-	KV kv{kT, v, a.ctxP, kvd, hd, kvh};
+	KV kv{kT, v, stage, a.ctxP, kvd, hd, kvh, a.stageStart};
 	for (uint c0 = 0; c0 < ctxEnd; c0 += ATT_KC) {
 		threadgroup_barrier(mem_flags::mem_threadgroup);
 		for (uint i = tid; i < hd * ATT_KC; i += 256) {
@@ -1041,6 +1101,7 @@ kernel void attention_flash_kv(device const float *q [[buffer(0)]],
                                 device float *out [[buffer(3)]],
                                 device const uint2 *mask [[buffer(4)]],
                                 constant AttnTileArgs &a [[buffer(5)]],
+                               device const float *stage [[buffer(6)]],
                                 uint2 tg [[threadgroup_position_in_grid]],
                                 uint tid [[thread_index_in_threadgroup]],
                                 uint sg [[simdgroup_index_in_threadgroup]],
@@ -1074,7 +1135,7 @@ kernel void attention_flash_kv(device const float *q [[buffer(0)]],
 	uint2 m = mask[t0 + min(trow, nt - 1)];
 	float mrun = -INFINITY, lrun = 0;
 	uint ctxEnd = a.pos + t0 + nt;
-	KV cache{kT, v, a.ctxP, kvd, FA_HD, kvh};
+	KV cache{kT, v, stage, a.ctxP, kvd, FA_HD, kvh, a.stageStart};
 	for (uint c0 = 0; c0 < ctxEnd; c0 += FA_KC) {
 		for (uint i = tid; i < FA_HD * FA_KC; i += 128) {
 			uint d = i / FA_KC, j = i % FA_KC;
@@ -1167,6 +1228,14 @@ template [[host_name("attention_tile_f32")]] kernel decltype(attention_tile_kv<K
 template [[host_name("attention_tile_f16")]] kernel decltype(attention_tile_kv<KVF16>) attention_tile_kv<KVF16>;
 template [[host_name("attention_flash_f32")]] kernel decltype(attention_flash_kv<KVF32>) attention_flash_kv<KVF32>;
 template [[host_name("attention_flash_f16")]] kernel decltype(attention_flash_kv<KVF16>) attention_flash_kv<KVF16>;
+template [[host_name("attention_q8")]] kernel decltype(attention_kv<KVQ8>) attention_kv<KVQ8>;
+template [[host_name("attention_q4")]] kernel decltype(attention_kv<KVQ4>) attention_kv<KVQ4>;
+template [[host_name("attention_split_q8")]] kernel decltype(attention_split_kv<KVQ8>) attention_split_kv<KVQ8>;
+template [[host_name("attention_split_q4")]] kernel decltype(attention_split_kv<KVQ4>) attention_split_kv<KVQ4>;
+template [[host_name("attention_tile_q8")]] kernel decltype(attention_tile_kv<KVQ8>) attention_tile_kv<KVQ8>;
+template [[host_name("attention_tile_q4")]] kernel decltype(attention_tile_kv<KVQ4>) attention_tile_kv<KVQ4>;
+template [[host_name("attention_flash_q8")]] kernel decltype(attention_flash_kv<KVQ8>) attention_flash_kv<KVQ8>;
+template [[host_name("attention_flash_q4")]] kernel decltype(attention_flash_kv<KVQ4>) attention_flash_kv<KVQ4>;
 
 // kv_store_f16 writes n tokens' keys and values ([n][kvd] floats) into a layer's f16 cache at positions pos..: keys
 // by position (kc[p*kvd + i]), values by channel (vc[i*ctxP + p]). Grid (kvd/256, tokens), 256 threads.
@@ -1182,4 +1251,119 @@ kernel void kv_store_f16(device const float *k [[buffer(0)]],
 	}
 	kc[((ulong)a.pos + t) * a.kvd + i] = half(clamp(k[(ulong)t * a.kvd + i], -65504.f, 65504.f));
 	vc[(ulong)i * a.ctxP + a.pos + t] = half(clamp(v[(ulong)t * a.kvd + i], -65504.f, 65504.f));
+}
+
+// Block KV caches (q8_0 keys; q8_0 or q4_0 values): kv_store_qk quantizes n tokens' keys into their position rows,
+// kv_store_qv puts their values into the channel rows' blocks and the stage, as the CPU's storeKey/storeValue do.
+struct KVQStoreArgs {
+	uint kvd;
+	uint ctxP;
+	uint pos;
+	uint n;
+	uint oldStageBlk; // the block the stage held before this call
+	uint vb;          // 8: q8_0 values, 4: q4_0
+};
+
+// One simdgroup per 32 keys (a q8_0 block): d = max|x|/127, quants rounded half to even. Grid: n*kvd/32 simdgroups,
+// 8 per threadgroup.
+kernel void kv_store_qk(device const float *k [[buffer(0)]],
+                        device uchar *kc [[buffer(1)]],
+                        constant KVQStoreArgs &a [[buffer(2)]],
+                        uint tg [[threadgroup_position_in_grid]],
+                        uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+	uint item = tg * 8 + sg, nbk = a.kvd / 32;
+	if (item >= a.n * nbk) {
+		return;
+	}
+	uint t = item / nbk, bi = item % nbk;
+	float x = k[(ulong)t * a.kvd + bi * 32 + lane];
+	float d = simd_max(abs(x)) / 127, id = d != 0 ? 1 / d : 0;
+	device uchar *b = kc + ((ulong)a.pos + t) * (nbk * 34) + bi * 34;
+	if (lane == 0) {
+		*(device half *)b = half(d);
+	}
+	((device char *)b)[2 + lane] = char(rint(x * id));
+}
+
+// quant_block quantizes the 32 values held one per lane into block b (q8_0, or q4_0 as ggml: the scale is the value
+// of largest magnitude over -8, the first such value as the CPU's loop finds it).
+static inline void quant_block(float x, device uchar *b, uint vb, uint lane) {
+	if (vb == 8) {
+		float d = simd_max(abs(x)) / 127, id = d != 0 ? 1 / d : 0;
+		if (lane == 0) {
+			*(device half *)b = half(d);
+		}
+		((device char *)b)[2 + lane] = char(rint(x * id));
+		return;
+	}
+	float amax = simd_max(abs(x));
+	uint first = simd_min(abs(x) == amax ? lane : 32u);
+	float mx = simd_shuffle(x, first);
+	float d = mx / -8, id = d != 0 ? 1 / d : 0;
+	int q = clamp(int(x * id + 8.5f), 0, 15);
+	int hi = simd_shuffle_down(q, 16);
+	if (lane == 0) {
+		*(device half *)b = half(d);
+	}
+	if (lane < 16) {
+		b[2 + lane] = uchar(q | (hi << 4));
+	}
+}
+
+// One simdgroup per channel, walking the blocks this call touches in order (so the old stage is read before the new
+// one is written): lane j holds position blk*32+j, from the stage or the quantized block (positions before pos), or the
+// new values. Full blocks are quantized; the last block's values go to the stage. Grid: kvd simdgroups, 8 per
+// threadgroup.
+kernel void kv_store_qv(device const float *v [[buffer(0)]],
+                        device uchar *vc [[buffer(1)]],
+                        device float *stage [[buffer(2)]],
+                        constant KVQStoreArgs &a [[buffer(3)]],
+                        uint tg [[threadgroup_position_in_grid]],
+                        uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+	uint ch = tg * 8 + sg;
+	if (ch >= a.kvd) {
+		return;
+	}
+	uint bb = a.vb == 8 ? 34 : 18, end = a.pos + a.n;
+	device uchar *row = vc + (ulong)ch * (a.ctxP / 32 * bb);
+	for (uint blk = a.pos / 32; blk * 32 < end; blk++) {
+		uint p = blk * 32 + lane;
+		float x = 0;
+		if (p < a.pos) { // earlier positions of the first block
+			if (blk == a.oldStageBlk) {
+				x = stage[ch * 32 + lane];
+			} else { // a rewind into a block that was already quantized
+				device const uchar *b = row + blk * bb;
+				float sc = float(*(device const half *)b);
+				if (a.vb == 8) {
+					x = sc * float(((device const char *)b)[2 + lane]);
+				} else {
+					uint q = b[2 + lane % 16];
+					x = sc * (float(lane < 16 ? q & 0xF : q >> 4) - 8);
+				}
+			}
+		} else if (p < end) {
+			x = v[(ulong)(p - a.pos) * a.kvd + ch];
+		}
+		if (blk * 32 + 31 < end) {
+			quant_block(x, row + blk * bb, a.vb, lane);
+		}
+		if ((blk + 1) * 32 >= end) { // the newest block: the stage
+			stage[ch * 32 + lane] = x;
+		}
+	}
+}
+
+// copy_rows_u8: dst[r*len + c] = src[r*stride + off + c] for rows a.x, stride a.y, off a.z, len a.w (bytes).
+kernel void copy_rows_u8(device const uchar *src [[buffer(0)]],
+                         device uchar *dst [[buffer(1)]],
+                         constant uint4 &a [[buffer(2)]],
+                         uint i [[thread_position_in_grid]]) {
+	if (i >= a.x * a.w) {
+		return;
+	}
+	uint r = i / a.w, c = i % a.w;
+	dst[i] = src[(ulong)r * a.y + a.z + c];
 }

@@ -17,9 +17,8 @@ import (
 // device too: each call copies its new keys and values back into kc/vc (one small read per layer), and a call that
 // doesn't continue where the state's last one ended (a restored prefix, a rewind) uploads kc/vc first.
 //
-// KV caches: f32, and f16 in the CPU's compact layout (keys by position, values by channel: kvcache.go), whose
-// buffers are shared the same way. The block caches (q8_0, q4_0) aren't supported yet; models using them run on the
-// CPU.
+// KV caches: f32, and the compact ones (f16, q8_0, q4_0) in the CPU's layout (keys by position, values by channel:
+// kvcache.go), whose buffers, block caches' stage included, are shared the same way.
 type gpuModel struct {
 	m        *Model
 	b        gpuBackend
@@ -30,7 +29,7 @@ type gpuModel struct {
 	kNorm    []gpuRef
 	outNorm  gpuRef
 	shared   bool   // the KV cache is the GPU's memory (unified memory)
-	kvTyp    uint32 // typeF32 or typeF16
+	kvTyp    uint32 // typeF32, typeF16, typeQ8_0 or typeQ4_0
 	det      bool   // deterministic kernels: the CPU's steps one by one, no fused cache writes
 
 	mu     sync.Mutex
@@ -41,8 +40,8 @@ var errGPUUnsupported = errors.New("engine: not supported on the GPU yet")
 
 // newGPUModel opens a GPU for m, or explains why m can't run on one.
 func newGPUModel(m *Model, det bool) (*gpuModel, error) {
-	if m.kvTyp != typeF32 && (m.kvTyp != typeF16 || det) {
-		return nil, fmt.Errorf("engine: GPU needs the f32 or f16 KV cache (f32 in deterministic mode), not %s", kvTypeName(m.kvTyp))
+	if m.kvTyp != typeF32 && det {
+		return nil, fmt.Errorf("engine: deterministic mode on the GPU needs the f32 KV cache, not %s", kvTypeName(m.kvTyp))
 	}
 	b, err := openGPU(m.g, det)
 	if err != nil {
@@ -116,7 +115,9 @@ type gpuState struct {
 	scratch, logits, act       gpuRef // act: deterministic backends' quantized activations
 	allLogits                  gpuRef // maxN*vocab, allocated on the first Score
 	kc, vc                     []gpuRef
-	kStage, vStage             gpuRef // discrete GPUs: this call's new keys and values, per layer [kvd][n] and [n][kvd]
+	kStage, vStage             gpuRef   // discrete GPUs: this call's new keys and values, per layer [kvd][n] and [n][kvd]
+	st                         []gpuRef // block caches: each layer's stage, [kvd][32] floats
+	qPack                      gpuRef   // block caches on discrete GPUs: the value blocks a call completed, per layer
 	maxN, ctxP, attnChunk      int
 	lastEnd                    int // discrete GPUs: where the last call ended (-1: the device cache is stale)
 }
@@ -169,7 +170,30 @@ func (g *gpuModel) stateFor(s *state) (*gpuState, error) {
 			}
 		}
 	}
-	if s.kv != nil { // the f16 cache: byte rows, mapped like the f32 one
+	if s.kv != nil { // compact caches: byte rows (and the block caches' stage), mapped like the f32 cache
+		if s.kv.stage != nil {
+			if !g.shared {
+				var err error
+				if gs.qPack, err = alloc(len(g.m.layers) * kvd * qPackBlocks(n) * kvBytes(s.kv.vtyp, 32) / 4); err != nil {
+					gs.release()
+					return nil, err
+				}
+			}
+			for li := range g.m.layers {
+				r, err := alloc(kvd * 32)
+				if err != nil {
+					gs.release()
+					return nil, err
+				}
+				if g.shared {
+					mem := g.b.mapped(r.buf)
+					f := unsafe.Slice((*float32)(unsafe.Pointer(unsafe.SliceData(mem))), kvd*32)
+					copy(f, s.kv.stage[li])
+					s.kv.stage[li] = f
+				}
+				gs.st = append(gs.st, r)
+			}
+		}
 		for li := range g.m.layers {
 			for _, c := range []struct {
 				refs *[]gpuRef
@@ -248,6 +272,9 @@ func (g *gpuModel) close() {
 			for li := range s.kv.k {
 				s.kv.k[li] = append([]byte(nil), s.kv.k[li]...)
 				s.kv.v[li] = append([]byte(nil), s.kv.v[li]...)
+				if s.kv.stage != nil {
+					s.kv.stage[li] = append([]float32(nil), s.kv.stage[li]...)
+				}
 			}
 		}
 		gs.release()
@@ -259,7 +286,7 @@ func (g *gpuModel) close() {
 
 // forward is Model.forward on the GPU: it runs tokens at positions pos.. and fills s.logits for the last one.
 func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
-	if (s.kv != nil) != (g.kvTyp == typeF16) {
+	if (s.kv != nil) != (g.kvTyp != typeF32) {
 		return errGPUUnsupported
 	}
 	gs, err := g.stateFor(s)
@@ -306,12 +333,17 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 	b.write(gs.cs, floatBytes(cs))
 	b.write(gs.sn, floatBytes(sn))
 	b.write(gs.mask, mask)
-	f16 := s.kv != nil
+	blk := s.kv != nil && s.kv.stage != nil // a block cache (q8_0, q4_0)
+	f16 := s.kv != nil && !blk
 	if !g.shared && pos != gs.lastEnd && pos > 0 { // the device cache may not match kc/vc: upload positions < pos
 		for li := range m.layers {
-			if f16 {
-				b.write(gs.kc[li], s.kv.k[li][:pos*kvd*2])
+			if s.kv != nil {
+				kb := pos * hp.kvHeads * s.kv.keyRow
+				b.write(gs.kc[li], s.kv.k[li][:kb])
 				b.write(gs.vc[li], s.kv.v[li])
+				if blk {
+					b.write(gs.st[li], floatBytes(s.kv.stage[li]))
+				}
 				continue
 			}
 			b.write(gs.kc[li], floatBytes(s.kc[li]))
@@ -326,14 +358,28 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 			bt.rmsnorm(gs.x, g.attnNorm[li], gs.an, n, dim, hp.eps)
 		}
 		v := gs.v
-		if !g.det && !f16 { // values straight into the cache (its layout is [pos][kvd]), keys by their normRope
+		if !g.det && s.kv == nil { // values straight into the cache (its layout is [pos][kvd]), keys by their normRope
 			v = gs.vc[li].at(4 * pos * kvd)
 		}
 		bt.matmul(l.wq, gs.an, gs.q, n, gs.act)
 		bt.matmul(l.wk, gs.an, gs.k, n, gs.act)
 		bt.matmul(l.wv, gs.an, v, n, gs.act)
 		bt.normRope(gs.q, g.qNorm[li], gs.cs, gs.sn, n, hp.heads, hd, hp.eps)
+		var stage gpuRef
+		stageStart := 0
 		switch {
+		case blk: // keys quantized by position, values into their channel's blocks or the stage
+			bt.normRope(gs.k, g.kNorm[li], gs.cs, gs.sn, n, hp.kvHeads, hd, hp.eps)
+			old := s.kv.stageBlk[li]
+			s.kv.stageBlk[li] = (pos + n - 1) / 32 // as the CPU's storeValue leaves it
+			bt.storeKVQ(gs.k, v, gs.kc[li], gs.vc[li], gs.st[li], n, pos, kvd, gs.ctxP, old, s.kv.vtyp)
+			stage, stageStart = gs.st[li], 32*s.kv.stageBlk[li]
+			if !g.shared { // the value blocks this call completed, packed for one read
+				bb := kvBytes(s.kv.vtyp, 32)
+				if b0, nb := pos/32, (pos+n)/32-pos/32; nb > 0 {
+					bt.packRows(gs.vc[li], gs.qPack.at(li*kvd*qPackBlocks(gs.maxN)*bb), kvd, s.kv.vRow, b0*bb, nb*bb)
+				}
+			}
 		case f16: // keys by position, values by channel, as halves
 			bt.normRope(gs.k, g.kNorm[li], gs.cs, gs.sn, n, hp.kvHeads, hd, hp.eps)
 			bt.storeKV16(gs.k, v, gs.kc[li], gs.vc[li], n, pos, kvd, gs.ctxP)
@@ -347,7 +393,7 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 			// values by channel, [kvd][n] halves, so the CPU copies them into the cache a row at a time (the keys
 			// are already contiguous in the device cache)
 			bt.storeKV16(gs.k, v, gs.kStage.at(2*li*n*kvd), gs.vStage.at(2*li*n*kvd), n, 0, kvd, n)
-		} else if !g.shared {
+		} else if !g.shared && !blk {
 			// keys transposed, [kvd][n], so the CPU copies them into kc a row at a time
 			bt.storeKV(gs.k, v, gs.kStage.at(4*li*n*kvd), gs.vStage.at(4*li*n*kvd), n, 0, kvd, n)
 		}
@@ -355,7 +401,7 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 			c := min(gs.attnChunk, n-t0)
 			bt.attention(gpuAttention{
 				q: gs.q.at(4 * t0 * qd), out: gs.att.at(4 * t0 * qd), k: gs.kc[li], v: gs.vc[li],
-				scratch: gs.scratch, mask: gs.mask.at(8 * t0), kvType: g.kvTyp,
+				scratch: gs.scratch, mask: gs.mask.at(8 * t0), kvType: g.kvTyp, stage: stage, stageStart: stageStart,
 				n: c, pos: pos + t0, heads: hp.heads, kvHeads: hp.kvHeads, headDim: hd, ctxP: gs.ctxP,
 			})
 		}
@@ -371,7 +417,27 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 	}
 	last := gs.x.at(4 * (n - 1) * dim)
 	defer func() {
-		if !g.shared && f16 { // bring the cache up to date with the keys and values this call wrote
+		if !g.shared && blk { // bring the cache up to date: keys, the value blocks completed, the stages
+			bb := kvBytes(s.kv.vtyp, 32)
+			b0, nb := pos/32, (pos+n)/32-pos/32
+			var pack []byte
+			if nb > 0 {
+				pack = make([]byte, len(m.layers)*kvd*qPackBlocks(gs.maxN)*bb)
+				b.read(gs.qPack, pack)
+			}
+			kr := hp.kvHeads * s.kv.keyRow
+			for li := range m.layers {
+				b.read(gs.kc[li].at(pos*kr), s.kv.k[li][pos*kr:(pos+n)*kr])
+				g.readFloats(gs.st[li], s.kv.stage[li])
+				if nb > 0 {
+					pl := pack[li*kvd*qPackBlocks(gs.maxN)*bb:]
+					for ch := 0; ch < kvd; ch++ {
+						copy(s.kv.v[li][ch*s.kv.vRow+b0*bb:ch*s.kv.vRow+(b0+nb)*bb], pl[ch*nb*bb:(ch+1)*nb*bb])
+					}
+				}
+			}
+			gs.lastEnd = pos + n
+		} else if !g.shared && f16 { // bring the cache up to date with the keys and values this call wrote
 			nl := len(m.layers)
 			vs := make([]byte, nl*n*kvd*2)
 			b.read(gs.vStage, vs)
@@ -439,3 +505,6 @@ func (g *gpuModel) readFloats(src gpuRef, dst []float32) {
 func floatBytes(x []float32) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(x))), 4*len(x))
 }
+
+// qPackBlocks bounds the value blocks a call of up to n tokens completes.
+func qPackBlocks(n int) int { return n/32 + 1 }

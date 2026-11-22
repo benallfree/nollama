@@ -191,12 +191,14 @@ func TestGPUScoreEmbed(t *testing.T) {
 // re-upload when a call doesn't continue the last) on this GPU, in lockstep with the unified path: prompt in two
 // batches, decode, then a rewind into the prompt (which forces the upload). Logits and caches must match.
 func TestGPUForwardDiscrete(t *testing.T) {
-	for _, kv := range []string{KVCacheF32, KVCacheF16} {
+	for _, kv := range KVCacheTypes {
 		t.Run(kv, func(t *testing.T) { testGPUForwardDiscrete(t, kv) })
 	}
 }
 
 func testGPUForwardDiscrete(t *testing.T, kvType string) {
+	cudaBlockKV = true // tests check the block caches on CUDA too (off in use until verified on a card)
+	defer func() { cudaBlockKV = false }()
 	m, err := Load(testGGUF(t), LoadOptions{GPU: "off", KVCacheType: kvType})
 	if err != nil {
 		t.Fatal(err)
@@ -249,9 +251,12 @@ func testGPUForwardDiscrete(t *testing.T, kvType string) {
 			kd = max(kd, math.Abs(float64(su.kc[li][i]-sd.kc[li][i])), math.Abs(float64(su.vc[li][i]-sd.vc[li][i])))
 		}
 	}
-	if su.kv != nil { // the f16 cache: the same bytes
+	if su.kv != nil { // compact caches: the same bytes, stages and stage blocks
 		for li := range su.kv.k {
 			if !bytes.Equal(su.kv.k[li], sd.kv.k[li]) || !bytes.Equal(su.kv.v[li], sd.kv.v[li]) {
+				kd = math.Inf(1)
+			}
+			if su.kv.stage != nil && (!slices.Equal(su.kv.stage[li], sd.kv.stage[li]) || su.kv.stageBlk[li] != sd.kv.stageBlk[li]) {
 				kd = math.Inf(1)
 			}
 		}
@@ -302,11 +307,20 @@ func TestGPUSplitAttention(t *testing.T) {
 	}
 }
 
-// TestGPUForwardF16KV checks the GPU on the f16 KV cache against the CPU on it: the same check as TestGPUForward
-// against the CPU's fast path (prompt in two batches, then decoding), so the cache layout, stores and every attention
-// kernel (prompt and one-token, one-pass and split) run on f16.
-func TestGPUForwardF16KV(t *testing.T) {
-	m, err := Load(testGGUF(t), LoadOptions{GPU: "off", KVCacheType: KVCacheF16})
+// TestGPUForwardCompactKV checks the GPU on each compact KV cache against the CPU on it: the same check as
+// TestGPUForward against the CPU's fast path (prompt in two batches, then decoding past many 32-position blocks and
+// 256 positions), so the cache layouts, stores and every attention kernel (prompt and one-token, one-pass and split)
+// run on f16, q8_0 and q4_0.
+func TestGPUForwardCompactKV(t *testing.T) {
+	cudaBlockKV = true
+	defer func() { cudaBlockKV = false }()
+	for _, kv := range []string{KVCacheF16, KVCacheQ8_0, KVCacheQ4_0} {
+		t.Run(kv, func(t *testing.T) { testGPUForwardCompactKV(t, kv) })
+	}
+}
+
+func testGPUForwardCompactKV(t *testing.T, kvType string) {
+	m, err := Load(testGGUF(t), LoadOptions{GPU: "off", KVCacheType: kvType})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,16 +340,23 @@ func TestGPUForwardF16KV(t *testing.T) {
 	if err := g.forward(sg, ids[split:], split); err != nil {
 		t.Fatal(err)
 	}
+	// Block caches drift more: the CPU also quantizes queries and attention weights to 8 bits, and keys rounded from
+	// slightly different floats can land a step apart. Measured against an f32 cache, the GPU on q8_0/q4_0 is as close
+	// as the CPU (worst 0.085-0.12 of the spread for both), and the two differ by at most about 0.09.
+	tol := 5e-2
+	if kvType != KVCacheF16 {
+		tol = 1.5e-1
+	}
 	pos := len(ids)
 	for i := 0; i < 300; i++ { // past 256 positions: the split attention kernel
 		d := logitDiff(sc.logits, sg.logits)
 		a, b := argmax(sc.logits), argmax(sg.logits)
 		lo, hi := slices.Min(sc.logits), slices.Max(sc.logits)
 		tie := float64(sc.logits[a]-sc.logits[b]) <= 2*d*float64(hi-lo)
-		if i%50 == 0 || d > 5e-2 || a != b && !tie {
+		if i%50 == 0 || d > tol || a != b && !tie {
 			t.Logf("step %d (pos %d): logits differ by %.1e of their spread; top %d vs %d", i, pos, d, a, b)
 		}
-		if d > 5e-2 || a != b && !tie {
+		if d > tol || a != b && !tie {
 			t.Fatalf("step %d: GPU disagrees", i)
 		}
 		m.forward(sc, []int{a}, pos)
