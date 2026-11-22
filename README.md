@@ -7,10 +7,10 @@ programs to install, update and keep running. nollama is an inference engine wri
 speaks Ollama's API and OpenAI's. Ship it as one binary, or compile it into your own Go program. Your end users install
 nothing else: no Ollama, no Python, no cgo.
 
-> nollama is alpha. Today it runs Qwen3 models on the CPU, with hand-tuned assembly for ARM64 and x86-64: good for small
-> models doing short, focused jobs, such as labeling a ticket, pulling JSON out of an email or summarizing a record.
-> It also calls tools and makes embeddings (with Qwen3-Embedding). GPU support, more model families and images aren't
-> there yet.
+> nollama is alpha. Today it runs Qwen3 models on the CPU, with hand-tuned assembly for ARM64 and x86-64, and on the
+> GPU (Metal on Apple Silicon, CUDA on NVIDIA): good for small models doing short, focused jobs, such as labeling a
+> ticket, pulling JSON out of an email or summarizing a record. It also calls tools and makes embeddings (with
+> Qwen3-Embedding). More model families and images aren't there yet.
 
 ## Install
 
@@ -318,8 +318,9 @@ Deterministic mode runs on the GPU too, on Macs (Metal) and NVIDIA cards (CUDA),
 what the CPU computes, bit for bit (Q8_0 and Q4_K weights; `TestDeterministic` compares them). They follow the same
 reference order with IEEE float32 arithmetic, and the reference flushes subnormals in rmsnorm, SwiGLU and the softmax
 as Apple GPUs do. Qwen3-1.7B gives the same logits on an M1 Max and on an Intel server with an NVIDIA A16. With
-Qwen3-1.7B, an M1 Max writes about 40 to 50 tokens/s and reads prompts at about 860 tokens/s, roughly half the speed of
-its default GPU kernels; an A16 writes about 31 tokens/s (its default kernels: 39) and reads about 550 tokens/s.
+Qwen3-1.7B, an M1 Max writes about 40 to 50 tokens/s and reads prompts at about 860 tokens/s, less than half the speed
+of its default GPU kernels; an A16 writes about 31 tokens/s (its default kernels: about 60) and reads about 550
+tokens/s.
 
 ## Test without a model
 
@@ -393,6 +394,28 @@ Either way, a model inside the program resolves like any other: `models.Resolve`
 `bundled:<name>` or `embedded:<name>`, and `engine.Load(src.Path, …)` opens it, so code written for downloaded models
 needs no change, and models not built in still download as usual. `engine.LoadBytes` takes any GGUF already in
 memory, and `engine.LoadRange` one at an offset inside any file.
+
+## Run it on a GPU
+
+nollama runs the model on a GPU when it finds one that works, with no toolkit or driver add-ons to install:
+
+- **Macs with Apple Silicon**: Metal. The GPU reads the memory-mapped model file in place, so loading costs nothing
+  extra.
+- **NVIDIA cards** (compute capability 7.5 and newer: T4, RTX 20xx and later, A10, A16, A100, L4, L40S, H100) on Linux
+  and Windows: CUDA, through the NVIDIA driver alone (`libcuda.so.1` or `nvcuda.dll`). The driver compiles nollama's
+  kernels for the card when the model loads. The model has to fit in the card's memory. On compute 8.0 and newer, prompts
+  with Q4_K weights use the int8 tensor cores.
+
+It takes models whose weights are all Q8_0, Q4_K, Q6_K or F16 (Ollama's Q8_0 and Q4_K_M files are), with the `f32` KV
+cache, or `f16` on Metal (see [Long contexts](#long-contexts-a-smaller-kv-cache)). When something doesn't fit, such as
+another weight type, a `q8_0` cache or a model larger than the card, the whole model runs on the CPU, and the server's
+log says why when it loads it: `loaded qwen3-1.7b in 120ms (CPU, ...; no GPU: ...)`. `--gpu off` (or `NOLLAMA_GPU=off`,
+or `engine.LoadOptions.GPU = "off"`) keeps it on the CPU; `engine.Model.Info().GPU` names the GPU in use.
+
+The GPU's default kernels sum in a different order than the CPU, so their logits differ slightly (up to about 1% of
+the logits' spread, like the CPU's own fast path); `--deterministic` gives the CPU's results bit for bit on the GPU too
+(see [The same numbers on every machine](#the-same-numbers-on-every-machine)). How fast it is:
+[On a GPU](#on-a-gpu).
 
 ## Long contexts: a smaller KV cache
 
@@ -479,9 +502,29 @@ What that means:
 - **Loading** is near instant (the file is memory-mapped), and memory use is a little lower.
 - On a small server it depends on the CPU: see [On small cloud servers](#on-small-cloud-servers).
 
-Today, if your users have a GPU and are happy to install Ollama, Ollama is faster.
+On the same machine, nollama on the GPU writes at 85 to 100% of Ollama's GPU speed and reads prompts at 40 to 60% of
+it: see [On a GPU](#on-a-gpu).
 
 Run them yourself with `go run ./engine/cmd/bench bench` (it needs Ollama running, for the comparison).
+
+### On a GPU
+
+Provisional, measured on 2026-11-21 and 22 with qwen3-1.7b (and 4b on the A16), nollama and Ollama on the same machine
+and the same GGUF files, 128 tokens written, nollama's `f32` KV cache unless noted. "Short" is a 29 to 35-token
+prompt, "long" a 590-token one (654 tokens for Ollama, whose template adds some). Writing speed is after the short
+prompt, then after the long one.
+
+| Machine | Model | nollama: reading short / long | nollama: writing | Ollama: reading long | Ollama: writing |
+|---|---|---|---|---|---|
+| Apple M1 Max (Metal), idle GPU | 1.7b Q8_0 | 620 / 1,370 tok/s | 105 to 111 / 93 to 99 tok/s | 2,416 tok/s | 111 tok/s |
+| Apple M1 Max (Metal), idle GPU | 1.7b Q4_K_M | 610 / 1,300 tok/s | 120 to 128 / 112 tok/s (`f16` cache: 130 to 136 short) | 2,174 tok/s | 134 to 144 tok/s |
+| NVIDIA A16 (CUDA), Vultr `vcg-a16-6c-60g-16vram` | 1.7b Q8_0 | 690 / 1,340 tok/s | 63 / 60 tok/s | 3,224 tok/s | 68 to 70 tok/s |
+| NVIDIA A16 (CUDA), Vultr `vcg-a16-6c-60g-16vram` | 1.7b Q4_K_M | 960 / 1,550 tok/s | 80 / 75 tok/s | 3,036 tok/s | 83 to 85 tok/s |
+| NVIDIA A16 (CUDA), Vultr `vcg-a16-6c-60g-16vram` | 4b Q4_K_M | 477 / 733 tok/s | 38 / 34 tok/s | 1,290 tok/s | 40 to 41 tok/s |
+
+Writing runs at 85 to 100% of Ollama's GPU speed. Reading prompts is the gap: 40 to 60% of Ollama's, so a long prompt
+takes about twice as long before the first word. `go run ./engine/cmd/bench run -gguf FILE -gpu auto -prompt long`
+measures one model; `-kv f16` picks the cache.
 
 ### On small cloud servers
 
@@ -673,8 +716,8 @@ and not, `response_format` (`json_object`, `json_schema`), `max_tokens`/`max_com
 
 nollama's own: `/api/classify` (label probabilities, above).
 
-Not yet: GPUs, model families other than Qwen3, tool calls, images, `/api/create`, thinking mode
-(Qwen3's thinking is always off), and several models loaded at once (nollama holds one and swaps on demand).
+Not yet: model families other than Qwen3, images, `/api/create`, thinking mode (Qwen3's thinking is always off),
+`q8_0` and `q4_0` KV caches on the GPU, and several models loaded at once (nollama holds one and swaps on demand).
 
 ## Security
 
