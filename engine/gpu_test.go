@@ -345,7 +345,7 @@ func TestGPUElementwise(t *testing.T) {
 // The second case is a short batch over a long context, which runs split attention.
 func TestGPUAttention(t *testing.T) {
 	b := testBackend(t)
-	for _, c := range []struct{ pos, n int }{{37, 5}, {700, 3}, {90, 45}} {
+	for _, c := range []struct{ pos, n int }{{37, 5}, {700, 3}, {90, 45}, {0, 100}, {13, 70}} {
 		t.Run(fmt.Sprintf("pos=%d,n=%d", c.pos, c.n), func(t *testing.T) { testGPUAttention(t, b, c.pos, c.n) })
 	}
 }
