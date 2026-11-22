@@ -64,6 +64,20 @@ __device__ __forceinline__ void scale_min_k4(int j, const uchar *q, float *sc, f
 	}
 }
 
+// scale_min_k4r is scale_min_k4 on the scale bytes held in h.y, h.z, h.w (a Q4_K block's first 16 bytes).
+__device__ __forceinline__ void scale_min_k4r(uint j, uint4 h, float *sc, float *mn) {
+	uint w[3] = {h.y, h.z, h.w};
+#define SCB(k) ((w[(k) / 4] >> (8 * ((k) % 4))) & 0xFF)
+	if (j < 4) {
+		*sc = SCB(j) & 63;
+		*mn = SCB(j + 4) & 63;
+	} else {
+		*sc = (SCB(j + 4) & 0xF) | ((SCB(j - 4) >> 6) << 4);
+		*mn = (SCB(j + 4) >> 4) | ((SCB(j) >> 6) << 4);
+	}
+#undef SCB
+}
+
 // MV_ROWS: rows per warp in the matvecs. Each lane loads its slice of the activations once per block and uses it
 // for every row: re-reading the activations per row, not the weights, limits a one-row-per-warp kernel.
 #define MV_ROWS 8
@@ -91,9 +105,11 @@ extern "C" __global__ void matvec_q4k_f32(const uchar *w, const float *x, float 
 #pragma unroll
 		for (int r = 0; r < MV_ROWS; r++) {
 			const uchar *blk = w + (size_t)min(r0 + r, a.rows - 1) * a.rowBytes + b * 144;
-			float d = f16(blk), dmin = f16(blk + 2), sc1, m1, sc2, m2;
-			scale_min_k4(2 * j, blk + 4, &sc1, &m1);
-			scale_min_k4(2 * j + 1, blk + 4, &sc2, &m2);
+			uint4 hd = *(const uint4 *)blk; // d, dmin, scales[12]: one 16-byte load (blocks are 16-aligned)
+			float2 dm = __half22float2(*(const __half2 *)&hd.x);
+			float d = dm.x, dmin = dm.y, sc1, m1, sc2, m2;
+			scale_min_k4r(2 * j, hd, &sc1, &m1);
+			scale_min_k4r(2 * j + 1, hd, &sc2, &m2);
 			uint4 q = *(const uint4 *)(blk + 16 + off);
 			uint qv[4] = {q.x, q.y, q.z, q.w};
 			float s1 = 0, s2 = 0;

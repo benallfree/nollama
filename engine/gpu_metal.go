@@ -20,7 +20,7 @@ var metalDetSource string
 var metalDetKernels = []string{"rmsnorm_det", "swiglu_det", "quant_q8_0_det", "quant_q8_k_det", "matvec_q8_0_det", "matvec_q4k_det", "matmul_q8_0_det", "matvec1_q8_0_det", "attention_det"}
 
 // metalKernels are the kernels metalSource defines.
-var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "matmul_q4k_f32", "matmul_q6k_f32", "matvec_q6k_f32", "matvec_f16_f32", "matmul_f16_f32", "norm_rope_f32", "add_norm_f32", "attention_f32", "attention_split_f32", "attention_combine_f32", "kv_store_f32", "copy_f32"}
+var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "matmul_q4k_f32", "matmul_q6k_f32", "matvec_q6k_f32", "matvec_f16_f32", "matmul_f16_f32", "norm_rope_f32", "add_norm_f32", "attention_f32", "attention_tile_f32", "attention_split_f32", "attention_combine_f32", "kv_store_f32", "copy_f32"}
 
 // metalBackend is the gpuBackend for Apple GPUs (unified memory only).
 type metalBackend struct {
@@ -177,6 +177,9 @@ func (b *metalBatch) matvec(w *weight, x, out gpuRef, n int) {
 	})
 }
 
+// metalAttnOnePass uses the one-pass attention kernel instead of the tiled one (tests compare the two).
+var metalAttnOnePass = false
+
 // mvRows is MV_ROWS in gpu.metal: rows per simdgroup in the matvecs.
 const mvRows = 8
 
@@ -189,9 +192,9 @@ func (b *metalBatch) matmulTiled(w *weight, x, out gpuRef, n int) {
 	b.ds = append(b.ds, metal.Dispatch{
 		P:       b.m.ps[kernel],
 		Args:    []metal.Arg{b.weightArg(w), marg(x), marg(out), {Bytes: u32(uint32(w.rows), uint32(w.cols/32), uint32(w.rowBytes), uint32(w.cols), uint32(n))}},
-		Groups:  metal.Size{W: uint((w.rows + 31) / 32), H: uint((n + 31) / 32), D: 1},
-		Threads: metal.Size{W: 128, H: 1, D: 1},
-		Shared:  2 * 1024 * 4,
+		Groups:  metal.Size{W: uint((w.rows + 63) / 64), H: uint((n + 63) / 64), D: 1},
+		Threads: metal.Size{W: 256, H: 1, D: 1},
+		Shared:  64 * 64 * 4, // the two 64x32 input tiles, then the 64x64 output tile
 	})
 }
 
@@ -377,6 +380,17 @@ func (b *metalBatch) attention(a gpuAttention) {
 			Args:    []metal.Arg{marg(a.scratch), marg(a.out), args},
 			Groups:  metal.Size{W: uint(a.heads), H: uint(a.n), D: 1},
 			Threads: metal.Size{W: uint((a.headDim + 31) &^ 31), H: 1, D: 1},
+		})
+		return
+	}
+	if a.n > attnSplitTokens && a.headDim <= 128 && !metalAttnOnePass { // prompts; one-token steps keep the one-pass kernel
+		const qt = 16 // ATT_QT
+		b.ds = append(b.ds, metal.Dispatch{
+			P: b.m.ps["attention_tile_f32"],
+			Args: []metal.Arg{marg(a.q), marg(a.k), marg(a.v), marg(a.out), marg(a.mask),
+				{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos), a.scale(), uint32(a.n))}},
+			Groups:  metal.Size{W: uint(a.heads), H: uint((a.n + qt - 1) / qt), D: 1},
+			Threads: metal.Size{W: 256, H: 1, D: 1},
 		})
 		return
 	}

@@ -10,6 +10,17 @@ static inline uchar2 scale_min_k4(int j, device const uchar *q) {
 	return uchar2((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4), (q[j + 4] >> 4) | ((q[j] >> 6) << 4));
 }
 
+// scale_min_k4r is scale_min_k4 on the scale bytes held in h.yzw (a Q4_K block's first 16 bytes).
+static inline float2 scale_min_k4r(uint j, uint4 h) {
+	uint sc[3] = {h.y, h.z, h.w};
+#define SCB(k) ((sc[(k) / 4] >> (8 * ((k) % 4))) & 0xFF)
+	if (j < 4) {
+		return float2(SCB(j) & 63, SCB(j + 4) & 63);
+	}
+	return float2((SCB(j + 4) & 0xF) | ((SCB(j - 4) >> 6) << 4), (SCB(j + 4) >> 4) | ((SCB(j) >> 6) << 4));
+#undef SCB
+}
+
 struct MatvecArgs {
 	uint rows;     // output rows
 	uint nb;       // 256-element blocks per row
@@ -54,10 +65,11 @@ kernel void matvec_q4k_f32(device const uchar *w [[buffer(0)]],
 #pragma unroll
 		for (int r = 0; r < MV_ROWS; r++) { // rows past the end repeat the last row (not written)
 			device const uchar *blk = w + (ulong)min(r0 + r, a.rows - 1) * a.rowBytes + b * 144;
-			float d = float(*(device const half *)blk);
-			float dmin = float(*(device const half *)(blk + 2));
-			uchar2 sm1 = scale_min_k4(2 * j, blk + 4);
-			uchar2 sm2 = scale_min_k4(2 * j + 1, blk + 4);
+			uint4 hd = *(device const uint4 *)blk; // d, dmin, scales[12]: one 16-byte load (blocks are 16-aligned)
+			float2 dm = float2(as_type<half2>(hd.x));
+			float d = dm.x, dmin = dm.y;
+			float2 sm1 = scale_min_k4r(2 * j, hd);
+			float2 sm2 = scale_min_k4r(2 * j + 1, hd);
 			uint4 q = *(device const uint4 *)(blk + 16 + off);
 			float s1 = 0, s2 = 0;
 			for (int i = 0; i < 4; i++) {
@@ -378,10 +390,10 @@ kernel void add_f32(device float *x [[buffer(0)]],
 #include <metal_simdgroup_matrix>
 
 // matmul_q8_0_f32: y[t*rows + r] = dot(W row r, x[t]) for a batch of tokens (prompt reading).
-// Each threadgroup computes a 32-row x 32-token tile with 4 simdgroups (16x16 each, as 2x2 8x8
+// Each threadgroup computes a 64-row x 64-token tile with 8 simdgroups (32x16 each, as 4x2 8x8
 // simdgroup matrices). The K loop steps one Q8_0 block (32) at a time: weights are dequantized and
 // activations copied into threadgroup memory, then multiplied with simdgroup_multiply_accumulate.
-// Grid: (rows/32, ceil(tokens/32)). a.nb counts 32-element steps (any weight type: dequant8); a.rows here is also the y stride.
+// Grid: (rows/64, ceil(tokens/64)). a.nb counts 32-element steps (any weight type: dequant8); a.rows here is also the y stride.
 struct MatmulArgs {
 	uint rows;
 	uint nb;
@@ -428,18 +440,18 @@ static inline void dequant8(device const uchar *row, uint k, threadgroup float *
 
 static inline void matmul_tile(device const uchar *w, device const float *x, device float *y, constant MatmulArgs &a,
                                threadgroup float *shm, uint2 tg, uint tid, uint sg, const int typ) {
-	threadgroup float *sw = shm;        // [32 rows][32 k]
-	threadgroup float *sx = shm + 1024; // [32 tokens][32 k]
-	uint r0 = tg.x * 32, t0 = tg.y * 32;
-	uint sr = (sg / 2) * 16, st = (sg % 2) * 16; // this simdgroup's sub-tile
+	threadgroup float *sw = shm;            // [64 rows][32 k]
+	threadgroup float *sx = shm + 64 * 32;  // [64 tokens][32 k]
+	uint r0 = tg.x * 64, t0 = tg.y * 64;
+	uint sr = (sg % 2) * 32, st = (sg / 2) * 16; // this simdgroup's 32x16 sub-tile (8 simdgroups)
 
-	simdgroup_float8x8 c[2][2];
-	for (int i = 0; i < 2; i++) {
+	simdgroup_float8x8 c[4][2];
+	for (int i = 0; i < 4; i++) {
 		for (int j = 0; j < 2; j++) {
 			c[i][j] = simdgroup_float8x8(0);
 		}
 	}
-	// 128 threads: thread tid loads 8 consecutive k of row/token tid/4.
+	// 256 threads: thread tid loads 8 consecutive k of row/token tid/4.
 	uint lr = tid / 4, lk = (tid % 4) * 8;
 	for (uint b = 0; b < a.nb; b++) {
 		{
@@ -455,10 +467,9 @@ static inline void matmul_tile(device const uchar *w, device const float *x, dev
 			uint t = t0 + lr;
 			threadgroup float *dx = sx + lr * 32 + lk;
 			if (t < a.tokens) {
-				device const float *src = x + (ulong)t * a.cols + b * 32 + lk;
-				for (int i = 0; i < 8; i++) {
-					dx[i] = src[i];
-				}
+				device const float4 *src = (device const float4 *)(x + (ulong)t * a.cols + b * 32 + lk);
+				((threadgroup float4 *)dx)[0] = src[0];
+				((threadgroup float4 *)dx)[1] = src[1];
 			} else {
 				for (int i = 0; i < 8; i++) {
 					dx[i] = 0;
@@ -467,12 +478,14 @@ static inline void matmul_tile(device const uchar *w, device const float *x, dev
 		}
 		threadgroup_barrier(mem_flags::mem_threadgroup);
 		for (uint kk = 0; kk < 32; kk += 8) {
-			simdgroup_float8x8 ma[2], mb[2];
-			for (int i = 0; i < 2; i++) {
+			simdgroup_float8x8 ma[4], mb[2];
+			for (int i = 0; i < 4; i++) {
 				simdgroup_load(ma[i], sw + (sr + 8 * i) * 32 + kk, 32);
-				simdgroup_load(mb[i], sx + (st + 8 * i) * 32 + kk, 32, ulong2(0, 0), true); // X^T: [k][token]
 			}
-			for (int i = 0; i < 2; i++) {
+			for (int j = 0; j < 2; j++) {
+				simdgroup_load(mb[j], sx + (st + 8 * j) * 32 + kk, 32, ulong2(0, 0), true); // X^T: [k][token]
+			}
+			for (int i = 0; i < 4; i++) {
 				for (int j = 0; j < 2; j++) {
 					simdgroup_multiply_accumulate(c[i][j], ma[i], mb[j], c[i][j]);
 				}
@@ -480,16 +493,16 @@ static inline void matmul_tile(device const uchar *w, device const float *x, dev
 		}
 		threadgroup_barrier(mem_flags::mem_threadgroup);
 	}
-	// c[i][j] is [rows][tokens]; stage the 32x32 tile transposed ([token][row]) and write in bounds.
-	threadgroup float *out = shm; // reuse: [32 tokens][32 rows]
-	for (int i = 0; i < 2; i++) {
+	// c[i][j] is [rows][tokens]; stage the 64x64 tile transposed ([token][row]) and write in bounds.
+	threadgroup float *out = shm; // reuse: [64 tokens][64 rows]
+	for (int i = 0; i < 4; i++) {
 		for (int j = 0; j < 2; j++) {
-			simdgroup_store(c[i][j], out + (st + 8 * j) * 32 + sr + 8 * i, 32, ulong2(0, 0), true);
+			simdgroup_store(c[i][j], out + (st + 8 * j) * 64 + sr + 8 * i, 64, ulong2(0, 0), true);
 		}
 	}
 	threadgroup_barrier(mem_flags::mem_threadgroup);
-	for (uint i = tid; i < 1024; i += 128) {
-		uint t = t0 + i / 32, r = r0 + i % 32;
+	for (uint i = tid; i < 64 * 64; i += 256) {
+		uint t = t0 + i / 64, r = r0 + i % 64;
 		if (t < a.tokens && r < a.rows) {
 			y[(ulong)t * a.rows + r] = out[i];
 		}
@@ -795,4 +808,111 @@ kernel void attention_combine_f32(device const float *part [[buffer(0)]],
 		}
 	}
 	out[((ulong)t * a.heads + h) * hd + tid] = num / den;
+}
+
+// attention_tile_f32: causal attention for prompts, tiled ("flash attention", f32). A threadgroup of 256 threads
+// takes one query head and ATT_QT consecutive tokens and walks the keys in chunks of ATT_KC positions, staging each
+// chunk's keys and values in threadgroup memory once for all its tokens, with an online softmax. Same layouts as
+// attention_f32 (no scratch); headDim <= 128. Grid (heads, ceil(tokens/ATT_QT)).
+#define ATT_QT 16
+#define ATT_KC 16
+struct AttnTileArgs {
+	uint heads;
+	uint kvHeads;
+	uint headDim;
+	uint ctxP;
+	uint pos;
+	float scale;
+	uint tokens;
+};
+
+kernel void attention_tile_f32(device const float *q [[buffer(0)]],
+                               device const float *kT [[buffer(1)]],
+                               device const float *v [[buffer(2)]],
+                               device float *out [[buffer(3)]],
+                               device const uint2 *mask [[buffer(4)]],
+                               constant AttnTileArgs &a [[buffer(5)]],
+                               uint2 tg [[threadgroup_position_in_grid]],
+                               uint tid [[thread_index_in_threadgroup]]) {
+	threadgroup float qs[ATT_QT][128], ks[128][ATT_KC + 1], vs[ATT_KC][128], ps[ATT_QT][ATT_KC + 1];
+	threadgroup float alpha[ATT_QT], lsum[ATT_QT], mrow[ATT_QT];
+	uint h = tg.x, t0 = tg.y * ATT_QT;
+	uint hd = a.headDim, kvh = h / (a.heads / a.kvHeads), kvd = a.kvHeads * hd;
+	uint nt = min((uint)ATT_QT, a.tokens - t0);
+	for (uint i = tid; i < ATT_QT * hd; i += 256) {
+		uint t = i / hd, d = i % hd;
+		qs[t][d] = t < nt ? q[((ulong)(t0 + t) * a.heads + h) * hd + d] * a.scale : 0;
+	}
+	if (tid < ATT_QT) {
+		mrow[tid] = -INFINITY;
+		lsum[tid] = 0;
+	}
+	uint orow = tid / 16, ocol = tid % 16; // this thread's output: row orow, channels ocol + 16*i
+	float o[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+	uint ctxEnd = a.pos + t0 + nt;
+	device const float *kh = kT + (ulong)kvh * hd * a.ctxP;
+	for (uint c0 = 0; c0 < ctxEnd; c0 += ATT_KC) {
+		threadgroup_barrier(mem_flags::mem_threadgroup);
+		for (uint i = tid; i < hd * ATT_KC; i += 256) {
+			uint d = i / ATT_KC, j = i % ATT_KC;
+			ks[d][j] = c0 + j < ctxEnd ? kh[(ulong)d * a.ctxP + c0 + j] : 0;
+		}
+		for (uint i = tid; i < ATT_KC * hd; i += 256) {
+			uint j = i / hd, d = i % hd;
+			vs[j][d] = c0 + j < ctxEnd ? v[(ulong)(c0 + j) * kvd + kvh * hd + d] : 0;
+		}
+		threadgroup_barrier(mem_flags::mem_threadgroup);
+		{ // scores: 256 = ATT_QT * ATT_KC, one per thread
+			uint t = tid / ATT_KC, j = tid % ATT_KC, p = c0 + j;
+			uint2 m = mask[t0 + min(t, nt - 1)];
+			float s = -INFINITY;
+			if (t < nt && p <= a.pos + t0 + t && (p < m.x || p >= m.y)) {
+				s = 0;
+				for (uint d = 0; d < hd; d++) {
+					s += qs[t][d] * ks[d][j];
+				}
+			}
+			ps[t][j] = s;
+		}
+		threadgroup_barrier(mem_flags::mem_threadgroup);
+		if (tid < ATT_QT) { // online softmax, one thread per token
+			float mx = mrow[tid];
+			for (int j = 0; j < ATT_KC; j++) {
+				mx = max(mx, ps[tid][j]);
+			}
+			float al = mx == -INFINITY ? 1 : exp(mrow[tid] - mx), l = lsum[tid] * al;
+			for (int j = 0; j < ATT_KC; j++) {
+				float e = mx == -INFINITY ? 0 : exp(ps[tid][j] - mx);
+				ps[tid][j] = e;
+				l += e;
+			}
+			alpha[tid] = al;
+			mrow[tid] = mx;
+			lsum[tid] = l;
+		}
+		threadgroup_barrier(mem_flags::mem_threadgroup);
+		float al = alpha[orow];
+		for (int i = 0; i < 8; i++) {
+			o[i] *= al;
+		}
+		for (int j = 0; j < ATT_KC; j++) {
+			float pj = ps[orow][j];
+			for (int i = 0; i < 8; i++) {
+				uint d = ocol + 16 * i;
+				if (d < hd) {
+					o[i] += pj * vs[j][d];
+				}
+			}
+		}
+	}
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+	if (orow < nt) {
+		float inv = 1 / lsum[orow];
+		for (int i = 0; i < 8; i++) {
+			uint d = ocol + 16 * i;
+			if (d < hd) {
+				out[((ulong)(t0 + orow) * a.heads + h) * hd + d] = o[i] * inv;
+			}
+		}
+	}
 }

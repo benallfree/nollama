@@ -347,7 +347,7 @@ func (b *cudaBatch) attention(a gpuAttention) {
 			[3]uint32{uint32((a.headDim + 31) &^ 31), 1, 1}, 0, carg(a.scratch), carg(a.out), args)
 		return
 	}
-	if a.headDim <= 128 && !cudaAttnOnePass {
+	if a.n > attnSplitTokens && a.headDim <= 128 && !cudaAttnOnePass { // prompts; one-token steps keep the one-pass kernel
 		const qt = 16 // ATT_QT
 		b.launch("attention_tile_f32", [3]uint32{uint32(a.heads), uint32((a.n + qt - 1) / qt), 1}, [3]uint32{256, 1, 1}, 0,
 			carg(a.q), carg(a.k), carg(a.v), carg(a.out), carg(a.mask),
