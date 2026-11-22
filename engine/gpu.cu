@@ -323,29 +323,38 @@ template <int typ> __device__ __forceinline__ void dequant8h(const uchar *row, u
 			dst[2 * i] = __float2half(d * (signed char)(u & 0xFF));
 			dst[2 * i + 1] = __float2half(d * (signed char)(u >> 8));
 		}
-	} else if (typ == 1) {
+	} else if (typ == 1) { // the header as one 16-byte load, the scales from register masks
 		const uchar *blk = row + (k / 256) * 144;
 		uint e = k % 256, j = e / 64, hi = (e % 64) / 32;
-		float sc, mn;
-		scale_min_k4(2 * j + hi, blk + 4, &sc, &mn);
-		float d = f16(blk) * sc, m = f16(blk + 2) * mn;
-		uint2 q = *(const uint2 *)(blk + 16 + 32 * j + e % 32); // 8-byte aligned
-		uint qv[2] = {q.x, q.y};
+		uint4 hd = *(const uint4 *)blk;
+		float4 sm = scale_min_k4x2(2 * j, hd);
+		float2 dm = __half22float2(*(const __half2 *)&hd.x);
+		float d = dm.x * (hi ? sm.y : sm.x), m = dm.y * (hi ? sm.w : sm.z);
+		uint2 q = *(const uint2 *)(blk + 16 + 32 * j + e % 32);
+		uint qv[2] = {hi ? (q.x >> 4) & 0x0F0F0F0F : q.x & 0x0F0F0F0F, hi ? (q.y >> 4) & 0x0F0F0F0F : q.y & 0x0F0F0F0F};
+		__half2 out[4];
 #pragma unroll
-		for (int i = 0; i < 8; i++) {
-			uint v = (qv[i / 4] >> (8 * (i % 4) + 4 * hi)) & 0xF;
-			dst[i] = __float2half(d * v - m);
+		for (int i = 0; i < 4; i++) {
+			uint v = qv[i / 2] >> (16 * (i % 2));
+			out[i] = __floats2half2_rn(d * (v & 0xFF) - m, d * ((v >> 8) & 0xFF) - m);
 		}
+		*(uint4 *)dst = *(uint4 *)out;
 	} else if (typ == 2) {
 		const uchar *blk = row + (k / 256) * 210;
 		uint e = k % 256, h = e / 128, quarter = (e % 128) / 32, l = e % 32;
-		const uchar *ql = blk + 64 * h + l + (quarter & 1) * 32, *qh = blk + 128 + 32 * h + l;
+		const ushort *ql = (const ushort *)(blk + 64 * h + l + (quarter & 1) * 32); // blocks are 2-byte aligned
+		const ushort *qh = (const ushort *)(blk + 128 + 32 * h + l);
 		float d = f16(blk + 208) * ((const signed char *)(blk + 192 + 8 * h))[l / 16 + 2 * quarter];
 		uint shift = quarter >= 2 ? 4 : 0;
+		__half2 out[4];
 #pragma unroll
-		for (int i = 0; i < 8; i++) {
-			dst[i] = __float2half(d * (float)((int)(((ql[i] >> shift) & 0xF) | (((qh[i] >> (2 * quarter)) & 3) << 4)) - 32));
+		for (int i = 0; i < 2; i++) { // four quants at a time
+			uint lo = ql[2 * i] | ((uint)ql[2 * i + 1] << 16), hb = qh[2 * i] | ((uint)qh[2 * i + 1] << 16);
+			uint v = ((lo >> shift) & 0x0F0F0F0F) | (((hb >> (2 * quarter)) & 0x03030303) << 4);
+			out[2 * i] = __floats2half2_rn(d * ((int)(v & 0xFF) - 32), d * ((int)((v >> 8) & 0xFF) - 32));
+			out[2 * i + 1] = __floats2half2_rn(d * ((int)((v >> 16) & 0xFF) - 32), d * ((int)(v >> 24) - 32));
 		}
+		*(uint4 *)dst = *(uint4 *)out;
 	} else {
 		*(uint4 *)dst = *(const uint4 *)(row + 2 * k);
 	}
@@ -353,8 +362,9 @@ template <int typ> __device__ __forceinline__ void dequant8h(const uchar *row, u
 
 // Tensor-core version of matmul_tile: weights dequantized and activations rounded to half in shared memory,
 // multiplied with WMMA 16x16x16 into f32 accumulators (compute 7.0+). A block computes 128 rows x 64 tokens with 8
-// warps; warp w owns rows 32*(w%4).. and tokens 32*(w/4).. (2x2 tiles of 16x16). K steps by 64. Grid (rows/128,
-// tokens/64); a.cols is the K length.
+// warps; warp w owns rows 32*(w%4).. and tokens 32*(w/4).. (2x2 tiles of 16x16). K steps by 64, the next step's weights
+// and activations read from global memory into registers while this step's MMAs run. Grid (rows/128, tokens/64);
+// a.cols is the K length.
 #define TC_K 64
 #define TC_LD (TC_K + 8) // keeps fragment rows 16-byte aligned and spreads banks
 template <int typ> __device__ void matmul_tile_tc(const uchar *w, const float *x, float *y, MatmulArgs a) {
@@ -373,34 +383,47 @@ template <int typ> __device__ void matmul_tile_tc(const uchar *w, const float *x
 	for (int i = 0; i < 2; i++)
 #pragma unroll
 		for (int j = 0; j < 2; j++) wmma::fill_fragment(c[i][j], 0.0f);
-	for (uint k0 = 0; k0 < a.cols; k0 += TC_K) {
+	uint4 pw[4], px[2];
+	auto fetch = [&](uint k0) {
 #pragma unroll
-		for (int g = 0; g < 4; g++) { // weights: 128 rows x 64 k, 8 per thread per group
+		for (int g = 0; g < 4; g++) {
 			uint it = tid + 256 * g, l = it / 8, e = (it % 8) * 8;
 			uint r = r0 + l;
-			half *dst = sw + l * TC_LD + e;
 			if (r < a.rows) {
-				dequant8h<typ>(w + (size_t)r * a.rowBytes, k0 + e, dst);
+				dequant8h<typ>(w + (size_t)r * a.rowBytes, k0 + e, (half *)&pw[g]);
 			} else {
-				*(uint4 *)dst = make_uint4(0, 0, 0, 0);
+				pw[g] = make_uint4(0, 0, 0, 0);
 			}
 		}
 #pragma unroll
-		for (int g = 0; g < 2; g++) { // activations: 64 tokens x 64 k
+		for (int g = 0; g < 2; g++) {
 			uint it = tid + 256 * g, l = it / 8, e = (it % 8) * 8;
 			uint t = t0 + l;
-			half *dst = sx + l * TC_LD + e;
 			if (t < a.tokens) {
 				const float4 *src = (const float4 *)(x + (size_t)t * a.cols + k0 + e);
 				float4 p = src[0], q = src[1];
-				__half2 h[4] = {__floats2half2_rn(p.x, p.y), __floats2half2_rn(p.z, p.w), __floats2half2_rn(q.x, q.y),
-				                __floats2half2_rn(q.z, q.w)};
-				*(uint4 *)dst = *(uint4 *)h;
+				__half2 hh[4] = {__floats2half2_rn(p.x, p.y), __floats2half2_rn(p.z, p.w), __floats2half2_rn(q.x, q.y),
+				                 __floats2half2_rn(q.z, q.w)};
+				px[g] = *(uint4 *)hh;
 			} else {
-				*(uint4 *)dst = make_uint4(0, 0, 0, 0);
+				px[g] = make_uint4(0, 0, 0, 0);
 			}
 		}
+	};
+	fetch(0);
+	for (uint k0 = 0; k0 < a.cols; k0 += TC_K) {
+#pragma unroll
+		for (int g = 0; g < 4; g++) {
+			uint it = tid + 256 * g;
+			*(uint4 *)(sw + (it / 8) * TC_LD + (it % 8) * 8) = pw[g];
+		}
+#pragma unroll
+		for (int g = 0; g < 2; g++) {
+			uint it = tid + 256 * g;
+			*(uint4 *)(sx + (it / 8) * TC_LD + (it % 8) * 8) = px[g];
+		}
 		__syncthreads();
+		if (k0 + TC_K < a.cols) fetch(k0 + TC_K);
 #pragma unroll
 		for (int kk = 0; kk < TC_K; kk += 16) {
 			wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa[2];
@@ -428,6 +451,7 @@ template <int typ> __device__ void matmul_tile_tc(const uchar *w, const float *x
 		if (t0 + tt < a.tokens && r0 + rr < a.rows) y[(size_t)(t0 + tt) * a.rows + r0 + rr] = so[tt * 132 + rr];
 	}
 }
+
 
 extern "C" __global__ void matmul_q8_0_tc(const uchar *w, const float *x, float *y, MatmulArgs a) { matmul_tile_tc<0>(w, x, y, a); }
 extern "C" __global__ void matmul_q4k_tc(const uchar *w, const float *x, float *y, MatmulArgs a) { matmul_tile_tc<1>(w, x, y, a); }
@@ -787,5 +811,139 @@ extern "C" __global__ void attention_tile_f32(const float *q, const float *kT, c
 			uint d = ocol + 16 * i;
 			if (d < hd) out[((size_t)(t0 + orow) * a.heads + h) * hd + d] = o[i] * inv;
 		}
+	}
+}
+
+// attention_flash_f32: prompt attention on the tensor cores (headDim 128; see attention_flash_f32 in gpu.metal). A
+// block of 4 warps takes 64 tokens of one head; warp w owns tokens 16w.. and keeps their pre-scaled queries as 8 half
+// WMMA fragments. Per 32-position chunk: S = Q K^T (half inputs, f32 sums) to the warp's scratch, an online softmax
+// over S's rows (two lanes per row, each owning half the row's output channels in registers), P V in two 64-channel
+// halves through the scratch, merged as o = o*alpha + PV. Loads stage through shared memory with bounds checks.
+// Grid (heads, tokens/64), 128 threads.
+#define FA_QT 64
+#define FA_KC 32
+#define FA_HD 128
+#define FA_KLD (FA_KC + 8) // keys [128][FA_KC] in halves
+#define FA_VLD (FA_HD + 8) // values [FA_KC][128] and queries [64][128] in halves
+#define FA_SLD (FA_KC + 4) // scores [16][FA_KC] floats
+#define FA_PLD (FA_KC + 8) // probabilities [16][FA_KC] halves
+#define FA_OLD (64 + 4)    // half an output tile [16][64] floats
+extern "C" __global__ void __launch_bounds__(128) attention_flash_f32(const float *q, const float *kT, const float *v,
+                                                                      float *out, const uint2 *mask, AttnTileArgs a) {
+	using namespace nvcuda;
+	// kv: keys then values for the chunk; before the loop, the block's queries. scr: each warp's scores, then its
+	// probabilities (after them), then half its output tile.
+	__shared__ __align__(32) uchar kv[FA_HD * FA_KLD * 2 + FA_KC * FA_VLD * 2];
+	__shared__ __align__(32) uchar scr[4][16 * FA_OLD * 4];
+	half *ks = (half *)kv, *vs = ks + FA_HD * FA_KLD, *qs = (half *)kv;
+	uint tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+	uint h = blockIdx.x, t0 = blockIdx.y * FA_QT;
+	uint kvh = h / (a.heads / a.kvHeads), kvd = a.kvHeads * FA_HD;
+	uint nt = min((uint)FA_QT, a.tokens - t0);
+	for (uint i = tid; i < FA_QT * FA_HD; i += 128) {
+		uint t = i / FA_HD, d = i % FA_HD;
+		qs[t * FA_VLD + d] = __float2half(t < nt ? q[((size_t)(t0 + t) * a.heads + h) * FA_HD + d] * a.scale : 0.f);
+	}
+	__syncthreads();
+	wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf[8];
+#pragma unroll
+	for (int k = 0; k < 8; k++) wmma::load_matrix_sync(qf[k], qs + warp * 16 * FA_VLD + k * 16, FA_VLD);
+	__syncthreads();
+
+	float *ss = (float *)scr[warp], *so = (float *)scr[warp];
+	half *ps = (half *)(scr[warp] + 16 * FA_SLD * 4);
+	uint r = lane / 2, hc = lane % 2; // this lane's row of the warp's 16, and which half of its columns
+	uint trow = warp * 16 + r;
+	bool valid = trow < nt;
+	uint tpos = a.pos + t0 + trow;
+	uint2 m = mask[t0 + min(trow, nt - 1)];
+	float mrun = -INFINITY, lrun = 0, o[2][32];
+#pragma unroll
+	for (int g = 0; g < 2; g++)
+#pragma unroll
+		for (int i = 0; i < 32; i++) o[g][i] = 0;
+	uint ctxEnd = a.pos + t0 + nt;
+	const float *kh = kT + (size_t)kvh * FA_HD * a.ctxP;
+	for (uint c0 = 0; c0 < ctxEnd; c0 += FA_KC) {
+		for (uint i = tid; i < FA_HD * FA_KC; i += 128) {
+			uint d = i / FA_KC, j = i % FA_KC;
+			ks[d * FA_KLD + j] = __float2half(c0 + j < ctxEnd ? kh[(size_t)d * a.ctxP + c0 + j] : 0.f);
+		}
+		for (uint i = tid; i < FA_KC * FA_HD; i += 128) {
+			uint j = i / FA_HD, d = i % FA_HD;
+			vs[j * FA_VLD + d] = __float2half(c0 + j < ctxEnd ? v[(size_t)(c0 + j) * kvd + kvh * FA_HD + d] : 0.f);
+		}
+		__syncthreads();
+
+		wmma::fragment<wmma::accumulator, 16, 16, 16, float> s[2];
+		wmma::fill_fragment(s[0], 0.f);
+		wmma::fill_fragment(s[1], 0.f);
+#pragma unroll
+		for (int k = 0; k < 8; k++) {
+			wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> kf;
+#pragma unroll
+			for (int j = 0; j < 2; j++) {
+				wmma::load_matrix_sync(kf, ks + k * 16 * FA_KLD + j * 16, FA_KLD);
+				wmma::mma_sync(s[j], qf[k], kf, s[j]);
+			}
+		}
+		wmma::store_matrix_sync(ss, s[0], FA_SLD, wmma::mem_row_major);
+		wmma::store_matrix_sync(ss + 16, s[1], FA_SLD, wmma::mem_row_major);
+		__syncwarp();
+
+		float sv[16], mx = -INFINITY;
+#pragma unroll
+		for (int i = 0; i < 16; i++) {
+			uint col = hc * 16 + i, p = c0 + col;
+			bool ok = valid && p <= tpos && (p < m.x || p >= m.y);
+			sv[i] = ok ? ss[r * FA_SLD + col] : -INFINITY;
+			mx = fmaxf(mx, sv[i]);
+		}
+		mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 1));
+		float mnew = fmaxf(mrun, mx);
+		float al = mnew == -INFINITY ? 1.f : __expf(mrun - mnew), ls = 0;
+#pragma unroll
+		for (int i = 0; i < 16; i++) {
+			float e = mnew == -INFINITY ? 0.f : __expf(sv[i] - mnew);
+			ps[r * FA_PLD + hc * 16 + i] = __float2half(e);
+			ls += e;
+		}
+		ls += __shfl_xor_sync(0xffffffff, ls, 1);
+		lrun = lrun * al + ls;
+		mrun = mnew;
+		__syncwarp();
+
+		wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf[2];
+		wmma::load_matrix_sync(pf[0], ps, FA_PLD);
+		wmma::load_matrix_sync(pf[1], ps + 16, FA_PLD);
+		__syncwarp(); // the scratch is reused for the output halves below
+#pragma unroll
+		for (int g = 0; g < 2; g++) {
+			wmma::fragment<wmma::accumulator, 16, 16, 16, float> pv[4];
+#pragma unroll
+			for (int n = 0; n < 4; n++) {
+				wmma::fill_fragment(pv[n], 0.f);
+#pragma unroll
+				for (int k = 0; k < 2; k++) {
+					wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> vf;
+					wmma::load_matrix_sync(vf, vs + k * 16 * FA_VLD + g * 64 + n * 16, FA_VLD);
+					wmma::mma_sync(pv[n], pf[k], vf, pv[n]);
+				}
+				wmma::store_matrix_sync(so + n * 16, pv[n], FA_OLD, wmma::mem_row_major);
+			}
+			__syncwarp();
+#pragma unroll
+			for (int i = 0; i < 32; i++) o[g][i] = o[g][i] * al + so[r * FA_OLD + hc * 32 + i];
+			__syncwarp();
+		}
+		__syncthreads();
+	}
+	if (valid) {
+		float inv = lrun > 0 ? 1 / lrun : 0;
+		float *dst = out + ((size_t)(t0 + trow) * a.heads + h) * FA_HD;
+#pragma unroll
+		for (int g = 0; g < 2; g++)
+#pragma unroll
+			for (int i = 0; i < 32; i++) dst[g * 64 + hc * 32 + i] = o[g][i] * inv;
 	}
 }

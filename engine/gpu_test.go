@@ -412,7 +412,8 @@ func testGPUAttention(t *testing.T, b gpuBackend, pos, n int) {
 				}
 			}
 		}
-		maxRelDiff(t, fmt.Sprintf("attention, masked=%v", masked), download(b, ob, len(want)), want, 1e-5)
+		// half-precision prompt backends also run prompt attention on half inputs (f32 sums)
+		maxRelDiff(t, fmt.Sprintf("attention, masked=%v", masked), download(b, ob, len(want)), want, promptTol(b, n, 1e-5, 4e-3))
 	}
 }
 

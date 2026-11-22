@@ -29,7 +29,7 @@ var cudaKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "matvec_q6k_f32"
 	"matvec_q4k_pair", "matvec_q8_0_pair", "matvec_q6k_pair", "matvec_f16_pair",
 	"matmul_q8_0_f32", "matmul_q4k_f32", "matmul_q6k_f32", "matmul_f16_f32",
 	"matmul_q8_0_tc", "matmul_q4k_tc", "matmul_q6k_tc", "matmul_f16_tc", "rmsnorm_f32", "rope_neox_f32",
-	"swiglu_f32", "add_f32", "norm_rope_f32", "add_norm_f32", "copy_f32", "kv_store_f32", "attention_f32",
+	"swiglu_f32", "add_f32", "norm_rope_f32", "add_norm_f32", "copy_f32", "kv_store_f32", "attention_f32", "attention_flash_f32",
 	"attention_split_f32", "attention_combine_f32", "attention_tile_f32"}
 
 // cudaBackend is the gpuBackend for NVIDIA GPUs, through the driver API (no toolkit needed).
@@ -185,11 +185,11 @@ func (b *cudaBatch) matmul(w *weight, x, out gpuRef, n int, act gpuRef) {
 		panic("cuda: matmul doesn't support " + typeName(w.typ))
 	}
 	if n >= matmulTiledMin {
-		tiled, rowsPer := k.tc, 128
+		tiled, rowsPer, tokensPer := k.tc, 128, 64
 		if cudaPromptF32 || w.cols%64 != 0 {
-			tiled, rowsPer = k.tiled, 64
+			tiled, rowsPer, tokensPer = k.tiled, 64, 64
 		}
-		b.launch(tiled, [3]uint32{uint32((w.rows + rowsPer - 1) / rowsPer), uint32((n + 63) / 64), 1}, [3]uint32{256, 1, 1}, 0,
+		b.launch(tiled, [3]uint32{uint32((w.rows + rowsPer - 1) / rowsPer), uint32((n + tokensPer - 1) / tokensPer), 1}, [3]uint32{256, 1, 1}, 0,
 			b.weightArg(w), carg(x), carg(out), cuda.Arg{Bytes: u32(uint32(w.rows), uint32(w.cols/32), uint32(w.rowBytes), uint32(w.cols), uint32(n))})
 		return
 	}
@@ -211,6 +211,9 @@ var cudaMatmuls = map[uint32]struct {
 
 // cudaAttnOnePass uses the one-pass attention kernel instead of the tiled one (tests compare the two).
 var cudaAttnOnePass = false
+
+// cudaAttnTile uses the scalar tiled prompt kernel instead of the tensor-core one (other head sizes use it anyway).
+var cudaAttnTile = false
 
 // cudaPromptF32 runs prompts with the plain f32 kernels instead of the tensor cores (tests compare the two).
 var cudaPromptF32 = false
@@ -374,6 +377,12 @@ func (b *cudaBatch) attention(a gpuAttention) {
 			4*(a.headDim+chunk+nt/32*a.headDim), carg(a.q), carg(a.k), carg(a.v), carg(a.scratch), carg(a.mask), args)
 		b.launch("attention_combine_f32", [3]uint32{uint32(a.heads), uint32(a.n), 1},
 			[3]uint32{uint32((a.headDim + 31) &^ 31), 1, 1}, 0, carg(a.scratch), carg(a.out), args)
+		return
+	}
+	if a.n > attnSplitTokens && a.headDim == 128 && !cudaAttnOnePass && !cudaAttnTile { // prompts on the tensor cores
+		b.launch("attention_flash_f32", [3]uint32{uint32(a.heads), uint32((a.n + 63) / 64), 1}, [3]uint32{128, 1, 1}, 0,
+			carg(a.q), carg(a.k), carg(a.v), carg(a.out), carg(a.mask),
+			cuda.Arg{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos), a.scale(), uint32(a.n))})
 		return
 	}
 	if a.n > attnSplitTokens && a.headDim <= 128 && !cudaAttnOnePass { // prompts; one-token steps keep the one-pass kernel
