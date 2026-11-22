@@ -20,7 +20,7 @@ var metalDetSource string
 var metalDetKernels = []string{"rmsnorm_det", "swiglu_det", "quant_q8_0_det", "quant_q8_k_det", "matvec_q8_0_det", "matvec_q4k_det", "matmul_q8_0_det", "matvec1_q8_0_det", "attention_det"}
 
 // metalKernels are the kernels metalSource defines.
-var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "matmul_q4k_f32", "matmul_q6k_f32", "matmul_q8_0_f32_h", "matmul_q4k_f32_h", "matmul_q6k_f32_h", "matmul_f16_f32_h", "matvec_q6k_f32", "matvec_f16_f32", "matmul_f16_f32", "norm_rope_f32", "add_norm_f32", "attention_f32", "attention_tile_f32", "attention_split_f32", "attention_combine_f32", "kv_store_f32", "copy_f32"}
+var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "matmul_q4k_f32", "matmul_q6k_f32", "matvec_q6k_f32", "matvec_f16_f32", "matmul_f16_f32", "norm_rope_f32", "add_norm_f32", "attention_f32", "attention_tile_f32", "attention_split_f32", "attention_combine_f32", "kv_store_f32", "copy_f32"}
 
 // metalBackend is the gpuBackend for Apple GPUs (unified memory only).
 type metalBackend struct {
@@ -61,7 +61,7 @@ func (m *metalBackend) name() string {
 }
 func (m *metalBackend) unified() bool { return true }
 
-func (m *metalBackend) halfPrompts() bool { return metalHalfTiles && !m.det }
+func (m *metalBackend) halfPrompts() bool { return false }
 
 func (m *metalBackend) supports(t uint32) bool {
 	return t == typeQ4_K || t == typeQ8_0 || (t == typeQ6_K || t == typeF16) && !m.det // deterministic mode: no Q6_K/F16 kernels yet
@@ -172,13 +172,11 @@ func (b *metalBatch) matvec(w *weight, x, out gpuRef, n int) {
 	b.ds = append(b.ds, metal.Dispatch{
 		P:       b.m.ps[kernel],
 		Args:    []metal.Arg{b.weightArg(w), marg(x), marg(out), {Bytes: u32(uint32(w.rows), uint32(nb), uint32(w.rowBytes), uint32(w.cols))}},
+		Writes:  1 << 2,
 		Groups:  metal.Size{W: uint((w.rows + nsg*rows - 1) / (nsg * rows)), H: uint(n), D: 1},
 		Threads: metal.Size{W: 32 * nsg, H: 1, D: 1},
 	})
 }
-
-// metalHalfTiles keeps prompt matmuls' weight tiles in half precision.
-var metalHalfTiles = false
 
 // metalAttnOnePass uses the one-pass attention kernel instead of the tiled one (tests compare the two).
 var metalAttnOnePass = false
@@ -192,12 +190,10 @@ func (b *metalBatch) matmulTiled(w *weight, x, out gpuRef, n int) {
 	if kernel == "" {
 		panic("metal: tiled matmul doesn't support " + typeName(w.typ))
 	}
-	if metalHalfTiles {
-		kernel += "_h"
-	}
 	b.ds = append(b.ds, metal.Dispatch{
 		P:       b.m.ps[kernel],
 		Args:    []metal.Arg{b.weightArg(w), marg(x), marg(out), {Bytes: u32(uint32(w.rows), uint32(w.cols/32), uint32(w.rowBytes), uint32(w.cols), uint32(n))}},
+		Writes:  1 << 2,
 		Groups:  metal.Size{W: uint((w.rows + 63) / 64), H: uint((n + 63) / 64), D: 1},
 		Threads: metal.Size{W: 256, H: 1, D: 1},
 		Shared:  64 * 64 * 4, // the two 64x32 input tiles, then the 64x64 output tile
@@ -227,6 +223,7 @@ func (b *metalBatch) matmulDet(w *weight, x, out gpuRef, n int, act gpuRef) {
 		b.ds = append(b.ds, metal.Dispatch{
 			P:       b.m.ps[quant],
 			Args:    []metal.Arg{marg(x), marg(act), {Bytes: u32(uint32(n * nb))}},
+			Writes:  1 << 1,
 			Groups:  metal.Size{W: uint((n*nb + nsg - 1) / nsg), H: 1, D: 1},
 			Threads: metal.Size{W: 32 * nsg, H: 1, D: 1},
 		})
@@ -240,6 +237,7 @@ func (b *metalBatch) matmulDet(w *weight, x, out gpuRef, n int, act gpuRef) {
 		b.ds = append(b.ds, metal.Dispatch{
 			P:       b.m.ps["matmul_q8_0_det"],
 			Args:    []metal.Arg{b.weightArg(w), marg(act), marg(out), args},
+			Writes:  1 << 2,
 			Groups:  metal.Size{W: uint((w.rows + 31) / 32), H: uint((n + 31) / 32), D: 1},
 			Threads: metal.Size{W: 128, H: 1, D: 1},
 			Shared:  4 * (3072 + 64),
@@ -250,6 +248,7 @@ func (b *metalBatch) matmulDet(w *weight, x, out gpuRef, n int, act gpuRef) {
 		b.ds = append(b.ds, metal.Dispatch{
 			P:       b.m.ps["matvec1_q8_0_det"],
 			Args:    []metal.Arg{b.weightArg(w), marg(act), marg(out), args},
+			Writes:  1 << 2,
 			Groups:  metal.Size{W: uint((w.rows + nsg - 1) / nsg), H: 1, D: 1},
 			Threads: metal.Size{W: 32 * nsg, H: 1, D: 1},
 			Shared:  nsg * 2 * nb * 4,
@@ -259,6 +258,7 @@ func (b *metalBatch) matmulDet(w *weight, x, out gpuRef, n int, act gpuRef) {
 	b.ds = append(b.ds, metal.Dispatch{
 		P:       b.m.ps[kernel],
 		Args:    []metal.Arg{b.weightArg(w), marg(act), marg(out), args},
+		Writes:  1 << 2,
 		Groups:  metal.Size{W: uint((w.rows + nsg - 1) / nsg), H: uint((n + detT - 1) / detT), D: 1},
 		Threads: metal.Size{W: 32 * nsg, H: 1, D: 1},
 		Shared:  nsg * 64 * min(detT, n) * 4,
@@ -271,6 +271,7 @@ func (b *metalBatch) rmsnorm(x, w, out gpuRef, rows, n int, eps float64) {
 		b.ds = append(b.ds, metal.Dispatch{
 			P:       b.m.ps["rmsnorm_det"],
 			Args:    []metal.Arg{marg(x), marg(w), marg(out), {Bytes: u32(uint32(n), math.Float32bits(float32(eps)))}},
+			Writes:  1 << 2,
 			Groups:  metal.Size{W: uint(rows), H: 1, D: 1},
 			Threads: metal.Size{W: 32, H: 1, D: 1},
 		})
@@ -281,6 +282,7 @@ func (b *metalBatch) rmsnorm(x, w, out gpuRef, rows, n int, eps float64) {
 	b.ds = append(b.ds, metal.Dispatch{
 		P:       p,
 		Args:    []metal.Arg{marg(x), marg(w), marg(out), {Bytes: u32(uint32(n), math.Float32bits(float32(eps)))}},
+		Writes:  1 << 2,
 		Groups:  metal.Size{W: uint(rows), H: 1, D: 1},
 		Threads: metal.Size{W: uint(nt), H: 1, D: 1},
 		Shared:  32 * 4,
@@ -294,6 +296,7 @@ func (b *metalBatch) rope(x, cs, sn gpuRef, tokens, heads, headDim int) {
 	b.ds = append(b.ds, metal.Dispatch{
 		P:       b.m.ps["rope_neox_f32"],
 		Args:    []metal.Arg{marg(x), marg(cs), marg(sn), {Bytes: u32(uint32(heads), uint32(headDim))}},
+		Writes:  1 << 0,
 		Groups:  metal.Size{W: uint((half + tw - 1) / tw), H: uint(heads), D: uint(tokens)},
 		Threads: metal.Size{W: uint(tw), H: 1, D: 1},
 	})
@@ -309,6 +312,7 @@ func (b *metalBatch) normRope(x, w, cs, sn gpuRef, tokens, heads, headDim int, e
 	b.ds = append(b.ds, metal.Dispatch{
 		P:       b.m.ps["norm_rope_f32"],
 		Args:    []metal.Arg{marg(x), marg(w), marg(cs), marg(sn), {Bytes: u32(uint32(heads), uint32(headDim), math.Float32bits(float32(eps)))}},
+		Writes:  1 << 0,
 		Groups:  metal.Size{W: uint(tokens * heads), H: 1, D: 1},
 		Threads: metal.Size{W: uint(headDim / 2), H: 1, D: 1},
 		Shared:  32 * 4,
@@ -326,17 +330,19 @@ func (b *metalBatch) addNorm(x, y, w, out gpuRef, rows, n int, eps float64) {
 	b.ds = append(b.ds, metal.Dispatch{
 		P:       p,
 		Args:    []metal.Arg{marg(x), marg(y), marg(w), marg(out), {Bytes: u32(uint32(n), math.Float32bits(float32(eps)))}},
+		Writes:  1<<0 | 1<<3,
 		Groups:  metal.Size{W: uint(rows), H: 1, D: 1},
 		Threads: metal.Size{W: uint(min(p.MaxThreads, 1024, (n+31)&^31)), H: 1, D: 1},
 		Shared:  32 * 4,
 	})
 }
 
-// elementwise is a 1-D dispatch over n elements.
-func (b *metalBatch) elementwise(kernel string, n int, args ...metal.Arg) {
+// elementwise is a 1-D dispatch over n elements; writes marks the args it writes (metal.Dispatch.Writes).
+func (b *metalBatch) elementwise(kernel string, n int, writes uint32, args ...metal.Arg) {
 	b.wrote()
 	b.ds = append(b.ds, metal.Dispatch{
 		P:       b.m.ps[kernel],
+		Writes:  writes,
 		Args:    append(args, metal.Arg{Bytes: u32(uint32(n))}),
 		Groups:  metal.Size{W: uint((n + 255) / 256), H: 1, D: 1},
 		Threads: metal.Size{W: 256, H: 1, D: 1},
@@ -345,15 +351,17 @@ func (b *metalBatch) elementwise(kernel string, n int, args ...metal.Arg) {
 
 func (b *metalBatch) swiglu(gate, up, out gpuRef, n int) {
 	if b.m.det {
-		b.elementwise("swiglu_det", n, marg(gate), marg(up), marg(out))
+		b.elementwise("swiglu_det", n, 1<<2, marg(gate), marg(up), marg(out))
 		return
 	}
-	b.elementwise("swiglu_f32", n, marg(gate), marg(up), marg(out))
+	b.elementwise("swiglu_f32", n, 1<<2, marg(gate), marg(up), marg(out))
 }
 
-func (b *metalBatch) add(x, y gpuRef, n int) { b.elementwise("add_f32", n, marg(x), marg(y)) }
+func (b *metalBatch) add(x, y gpuRef, n int) { b.elementwise("add_f32", n, 1<<0, marg(x), marg(y)) }
 
-func (b *metalBatch) copy(dst, src gpuRef, n int) { b.elementwise("copy_f32", n, marg(dst), marg(src)) }
+func (b *metalBatch) copy(dst, src gpuRef, n int) {
+	b.elementwise("copy_f32", n, 1<<0, marg(dst), marg(src))
+}
 
 func (b *metalBatch) attention(a gpuAttention) {
 	b.wrote()
@@ -365,6 +373,7 @@ func (b *metalBatch) attention(a gpuAttention) {
 			P: b.m.ps["attention_det"],
 			Args: []metal.Arg{marg(a.q), marg(a.k), marg(a.v), marg(a.out), marg(a.scratch), marg(a.mask),
 				{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos), a.scale())}},
+			Writes:  1<<3 | 1<<4,
 			Groups:  metal.Size{W: uint(a.heads), H: uint(a.n), D: 1},
 			Threads: metal.Size{W: 128, H: 1, D: 1},
 			Shared:  4 * (a.headDim + 4),
@@ -378,12 +387,14 @@ func (b *metalBatch) attention(a gpuAttention) {
 		b.ds = append(b.ds, metal.Dispatch{
 			P:       b.m.ps["attention_split_f32"],
 			Args:    []metal.Arg{marg(a.q), marg(a.k), marg(a.v), marg(a.scratch), marg(a.mask), args},
+			Writes:  1 << 3,
 			Groups:  metal.Size{W: uint(a.heads), H: uint(a.n), D: uint(splits)},
 			Threads: metal.Size{W: nt, H: 1, D: 1},
 			Shared:  4 * (a.headDim + chunk + nt/32*a.headDim),
 		}, metal.Dispatch{
 			P:       b.m.ps["attention_combine_f32"],
 			Args:    []metal.Arg{marg(a.scratch), marg(a.out), args},
+			Writes:  1 << 1,
 			Groups:  metal.Size{W: uint(a.heads), H: uint(a.n), D: 1},
 			Threads: metal.Size{W: uint((a.headDim + 31) &^ 31), H: 1, D: 1},
 		})
@@ -395,6 +406,7 @@ func (b *metalBatch) attention(a gpuAttention) {
 			P: b.m.ps["attention_tile_f32"],
 			Args: []metal.Arg{marg(a.q), marg(a.k), marg(a.v), marg(a.out), marg(a.mask),
 				{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos), a.scale(), uint32(a.n))}},
+			Writes:  1 << 3,
 			Groups:  metal.Size{W: uint(a.heads), H: uint((a.n + qt - 1) / qt), D: 1},
 			Threads: metal.Size{W: 256, H: 1, D: 1},
 		})
@@ -404,6 +416,7 @@ func (b *metalBatch) attention(a gpuAttention) {
 		P: b.m.ps["attention_f32"],
 		Args: []metal.Arg{marg(a.q), marg(a.k), marg(a.v), marg(a.out), marg(a.scratch), marg(a.mask),
 			{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos), a.scale())}},
+		Writes:  1<<3 | 1<<4,
 		Groups:  metal.Size{W: uint(a.heads), H: uint(a.n), D: 1},
 		Threads: metal.Size{W: nt, H: 1, D: 1},
 		Shared:  4 * (a.headDim + nt),
@@ -415,6 +428,7 @@ func (b *metalBatch) storeKV(k, v, kc, vc gpuRef, n, pos, kvd, ctxP int) {
 	b.ds = append(b.ds, metal.Dispatch{
 		P:       b.m.ps["kv_store_f32"],
 		Args:    []metal.Arg{marg(k), marg(v), marg(kc), marg(vc), {Bytes: u32(uint32(kvd), uint32(ctxP), uint32(pos))}},
+		Writes:  1<<2 | 1<<3,
 		Groups:  metal.Size{W: uint((kvd + 255) / 256), H: uint(n), D: 1},
 		Threads: metal.Size{W: 256, H: 1, D: 1},
 	})

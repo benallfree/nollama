@@ -36,6 +36,8 @@ var (
 	selLength               = objc.RegisterName("length")
 	selCommandBuffer        = objc.RegisterName("commandBuffer")
 	selComputeEncoder       = objc.RegisterName("computeCommandEncoder")
+	selComputeEncoderType   = objc.RegisterName("computeCommandEncoderWithDispatchType:")
+	selMemoryBarrier        = objc.RegisterName("memoryBarrierWithScope:")
 	selSetPipeline          = objc.RegisterName("setComputePipelineState:")
 	selSetBuffer            = objc.RegisterName("setBuffer:offset:atIndex:")
 	selSetBytes             = objc.RegisterName("setBytes:length:atIndex:")
@@ -299,6 +301,9 @@ type Dispatch struct {
 	Groups  Size // threadgroups in the grid
 	Threads Size // threads per threadgroup
 	Shared  int  // threadgroup memory bytes at index 0
+	// Writes has bit i set for each Args[i] buffer the kernel writes; 0 means it may write any of them. Run puts a
+	// barrier before a dispatch only when it touches a buffer written since the last one (or writes one read).
+	Writes uint32
 }
 
 // Run encodes the dispatches in order into one command buffer, commits it and waits.
@@ -311,8 +316,32 @@ func (d *Device) Run(ds ...Dispatch) error {
 		var cbs []objc.ID
 		for start := 0; start < len(ds) || start == 0; start += runChunk {
 			cb := d.queue.Send(selCommandBuffer)
-			enc := cb.Send(selComputeEncoder)
+			// A concurrent encoder: dispatches may overlap unless a barrier separates them (a serial encoder
+			// waits for each dispatch to finish before starting the next, which costs microseconds each).
+			enc := cb.Send(selComputeEncoderType, uint(1)) // MTLDispatchTypeConcurrent
+			written, read := map[*Buffer]bool{}, map[*Buffer]bool{}
 			for _, x := range ds[start:min(start+runChunk, len(ds))] {
+				writes := func(i int) bool { return x.Writes == 0 || x.Writes&(1<<i) != 0 }
+				barrier := false
+				for i, a := range x.Args {
+					if a.Buf != nil && (written[a.Buf] || writes(i) && read[a.Buf]) {
+						barrier = true
+					}
+				}
+				if barrier {
+					enc.Send(selMemoryBarrier, uint(1)) // MTLBarrierScopeBuffers
+					clear(written)
+					clear(read)
+				}
+				for i, a := range x.Args {
+					if a.Buf != nil {
+						if writes(i) {
+							written[a.Buf] = true
+						} else {
+							read[a.Buf] = true
+						}
+					}
+				}
 				enc.Send(selSetPipeline, x.P.ps)
 				for i, a := range x.Args {
 					if a.Buf != nil {
