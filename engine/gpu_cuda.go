@@ -94,13 +94,8 @@ func (c *cudaBackend) name() string {
 func (c *cudaBackend) unified() bool     { return false }
 func (c *cudaBackend) halfPrompts() bool { return !c.det && !cudaPromptF32 }
 
-// supportsKV: the f16 kernels are built but not yet verified on NVIDIA hardware, so f16 caches stay on the CPU there.
-func (c *cudaBackend) supportsKV(t uint32) bool {
-	return t == typeF32 || t == typeF16 && !c.det && cudaF16KV
-}
-
-// cudaF16KV turns on the f16 KV cache on CUDA (off until checked on a card).
-var cudaF16KV = false
+// supportsKV: f32, and f16 outside deterministic mode (checked on an NVIDIA A16).
+func (c *cudaBackend) supportsKV(t uint32) bool { return t == typeF32 || t == typeF16 && !c.det }
 
 func (c *cudaBackend) int8Prompts() bool { return c.mmaMod != nil && !cudaNoMMQ && !cudaPromptF32 }
 
@@ -242,8 +237,9 @@ func (b *cudaBatch) matmul(w *weight, x, out gpuRef, n int, act gpuRef) {
 // act (once for matmuls sharing it), then multiplied with the weights' quants. It reports false to leave the matmul
 // to the half-precision kernels.
 func (b *cudaBatch) mmq(w *weight, x, out gpuRef, n int, act gpuRef) bool {
-	kernel := map[uint32]string{typeQ4_K: "matmul_q4k_mmq"}[w.typ] // Q8_0 measured no faster on an A16
-	qbytes := n * w.cols                                           // int8 quants, then a (scale, scaled sum) pair per 32
+	// Q8_0 measured no faster this way on an A16; Q6_K (16-element scales, so k16 MMAs) slower.
+	kernel := map[uint32]string{typeQ4_K: "matmul_q4k_mmq"}[w.typ]
+	qbytes := n * w.cols // int8 quants, then a (scale, scaled sum) pair per 32
 	if b.c.mmaMod == nil || cudaNoMMQ || cudaPromptF32 || kernel == "" || w.cols%128 != 0 || act.buf == nil ||
 		act.buf.size()-act.off < qbytes+qbytes/32*8 {
 		return false

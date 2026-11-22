@@ -407,7 +407,7 @@ nollama runs the model on a GPU when it finds one that works, with no toolkit or
   with Q4_K weights use the int8 tensor cores.
 
 It takes models whose weights are all Q8_0, Q4_K, Q6_K or F16 (Ollama's Q8_0 and Q4_K_M files are), with the `f32` KV
-cache, or `f16` on Metal (see [Long contexts](#long-contexts-a-smaller-kv-cache)). When something doesn't fit, such as
+cache or `f16` (see [Long contexts](#long-contexts-a-smaller-kv-cache)). When something doesn't fit, such as
 another weight type, a `q8_0` cache or a model larger than the card, the whole model runs on the CPU, and the server's
 log says why when it loads it: `loaded qwen3-1.7b in 120ms (CPU, ...; no GPU: ...)`. `--gpu off` (or `NOLLAMA_GPU=off`,
 or `engine.LoadOptions.GPU = "off"`) keeps it on the CPU; `engine.Model.Info().GPU` names the GPU in use.
@@ -450,7 +450,8 @@ The prompt cache and threads keep their copies at full precision, within their o
 `LoadOptions.ThreadMemory`); the KV cache type sets the memory of the answers being written.
 
 On a GPU, `f32` and `f16` caches run on the GPU (`f32` only in deterministic mode); with `q8_0` or `q4_0` the model
-runs on the CPU for now.
+runs on the CPU for now. On an M1 Max `f16` also writes a little faster than `f32`; on an NVIDIA A16 it is 2 to 10%
+slower (more so at longer contexts).
 
 ```bash
 nollama serve --kv-cache-type q8_0

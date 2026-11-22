@@ -197,8 +197,6 @@ func TestGPUForwardDiscrete(t *testing.T) {
 }
 
 func testGPUForwardDiscrete(t *testing.T, kvType string) {
-	cudaF16KV = true // tests check the f16 kernels on CUDA too (off in use until verified on a card)
-	defer func() { cudaF16KV = false }()
 	m, err := Load(testGGUF(t), LoadOptions{GPU: "off", KVCacheType: kvType})
 	if err != nil {
 		t.Fatal(err)
@@ -308,8 +306,6 @@ func TestGPUSplitAttention(t *testing.T) {
 // against the CPU's fast path (prompt in two batches, then decoding), so the cache layout, stores and every attention
 // kernel (prompt and one-token, one-pass and split) run on f16.
 func TestGPUForwardF16KV(t *testing.T) {
-	cudaF16KV = true // see testGPUForwardDiscrete
-	defer func() { cudaF16KV = false }()
 	m, err := Load(testGGUF(t), LoadOptions{GPU: "off", KVCacheType: KVCacheF16})
 	if err != nil {
 		t.Fatal(err)
