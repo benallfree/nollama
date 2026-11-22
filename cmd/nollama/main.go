@@ -118,7 +118,7 @@ func cmdServe(args []string) error {
 	threads := fs.Int("threads", envInt("NOLLAMA_THREADS"), "CPU threads, shared by every answer and model (0: the CPUs Go uses, up to 8)")
 	maxMem := fs.String("max-memory", os.Getenv("NOLLAMA_MAX_MEMORY"), "memory budget for the model, answers and caches, such as 3GB or 800MB (empty or 0: no limit)")
 	lowPrio := fs.Bool("low-priority", envBool("NOLLAMA_LOW_PRIORITY"), "run the engine's threads at a lower OS priority, so other programs win the CPU")
-	det := fs.Bool("deterministic", envBool("NOLLAMA_DETERMINISTIC"), "the same logits, bit for bit, on any CPU or Mac GPU, thread count and batch size")
+	det := fs.Bool("deterministic", envBool("NOLLAMA_DETERMINISTIC"), "the same logits, bit for bit, on any CPU or GPU (Metal, CUDA), thread count and batch size")
 	parallel := fs.Int("parallel", 1, "answers written at once; the rest wait their turn")
 	ka := 5 * time.Minute
 	if v := os.Getenv("NOLLAMA_KEEP_ALIVE"); v != "" {
@@ -369,7 +369,7 @@ func cmdRun(args []string) error {
 	verbose := fs.Bool("verbose", false, "print token counts and speed after each answer")
 	kvType := kvCacheFlag(fs)
 	gpu := gpuFlag(fs)
-	det := fs.Bool("deterministic", false, "the same logits, bit for bit, on any CPU or Mac GPU")
+	det := fs.Bool("deterministic", false, "the same logits, bit for bit, on any CPU or GPU (Metal, CUDA)")
 	draftName := fs.String("draft", "", "a small model with the same tokenizer that guesses tokens to check, e.g. qwen3-0.6b")
 	draftTokens := fs.Int("draft-tokens", 0, "tokens the draft guesses at a time (0: the engine's default)")
 	fs.Parse(args)

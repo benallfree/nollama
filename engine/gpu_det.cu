@@ -243,13 +243,14 @@ extern "C" __global__ void matvec1_q8_0_det(const uchar *w, const uchar *x, floa
 	int *tsum = (int *)(td + a.nb);
 	const uchar *row = w + (size_t)r * a.rowBytes;
 	uint e = (lane % 8) * 4, grp = lane / 8;
-	for (uint b = grp; b < a.nb; b += 4) {
+	for (uint b0 = 0; b0 < a.nb; b0 += 4) { // every lane runs every iteration: the shuffles need the whole warp
+		uint b = b0 + grp;
 		const uchar *ab = x + (size_t)b * 36;
-		int s = __dp4a(i32at2(row + b * 34 + 2 + e), *(const int *)(ab + 4 + e), 0);
+		int s = b < a.nb ? __dp4a(i32at2(row + b * 34 + 2 + e), *(const int *)(ab + 4 + e), 0) : 0;
 		s += __shfl_xor_sync(0xffffffff, s, 1);
 		s += __shfl_xor_sync(0xffffffff, s, 2);
 		s += __shfl_xor_sync(0xffffffff, s, 4);
-		if (lane % 8 == 0) {
+		if (lane % 8 == 0 && b < a.nb) {
 			tsum[b] = s;
 			td[b] = f16(row + b * 34) * *(const float *)ab;
 		}

@@ -314,11 +314,12 @@ refuses what would break exactness: a compact KV cache, and continuing from half
 must agree exactly, for example a compressor driven by the model's probabilities. It costs little: the log-softmax over
 the vocabulary is about 1.5x slower, the rest runs the same kernels.
 
-On a Mac, deterministic mode runs on the GPU with kernels that compute exactly what the CPU computes, bit for bit
-(Q8_0 and Q4_K weights; `TestDeterministic` compares them). They follow the same reference order, are compiled with
-fast math off, and the reference flushes subnormals in rmsnorm, SwiGLU and the softmax as GPUs do. On an M1 Max with
-Qwen3-1.7B they write about 40 to 50 tokens/s and read prompts at about 860 tokens/s: roughly half the speed of the
-default GPU kernels, and twice to four times the CPU's. Elsewhere (NVIDIA included) deterministic mode uses the CPU.
+Deterministic mode runs on the GPU too, on Macs (Metal) and NVIDIA cards (CUDA), with kernels that compute exactly
+what the CPU computes, bit for bit (Q8_0 and Q4_K weights; `TestDeterministic` compares them). They follow the same
+reference order with IEEE float32 arithmetic, and the reference flushes subnormals in rmsnorm, SwiGLU and the softmax
+as Apple GPUs do. Qwen3-1.7B gives the same logits on an M1 Max and on an Intel server with an NVIDIA A16. With
+Qwen3-1.7B, an M1 Max writes about 40 to 50 tokens/s and reads prompts at about 860 tokens/s, roughly half the speed of
+its default GPU kernels; an A16 writes about 31 tokens/s (its default kernels: 39) and reads about 550 tokens/s.
 
 ## Test without a model
 

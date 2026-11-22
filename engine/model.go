@@ -46,7 +46,7 @@ type LoadOptions struct {
 	Deterministic bool
 	// GPU picks where the forward pass runs: "" or "auto" uses a GPU when one works and supports the model (Metal on
 	// Apple Silicon, CUDA on NVIDIA); "off" keeps it on the CPU. Respond models always use the CPU. Deterministic models
-	// use only a GPU with deterministic kernels (Metal so far), which give the CPU's results bit for bit.
+	// use only a GPU with deterministic kernels (Metal and CUDA), which give the CPU's results bit for bit.
 	// Info.GPU says which GPU, and Info.GPUNote why none. NOLLAMA_NO_GPU=1 in the environment also turns it off.
 	GPU string
 }

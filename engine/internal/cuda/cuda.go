@@ -202,7 +202,10 @@ func (d *Device) Alloc(n int) (Ptr, error) {
 		if r := cuMemAlloc(&p, uint64(n)); r != 0 {
 			return errorOf(fmt.Sprintf("cuMemAlloc(%d)", n), r)
 		}
-		return errorOf("cuMemsetD8", cuMemsetD8(p, 0, uint64(n)))
+		if r := cuMemsetD8(p, 0, uint64(n)); r != 0 {
+			return errorOf("cuMemsetD8", r)
+		}
+		return errorOf("cuStreamSynchronize", cuStreamSynchronize(0)) // see Write
 	})
 	return Ptr(p), err
 }
@@ -213,6 +216,10 @@ func (d *Device) Free(p Ptr) {
 }
 
 // Write copies src to device memory at dst (after the stream's queued work).
+// cuMemsetD8 and cuMemcpyHtoD from pageable memory run on the legacy default stream and can return before
+// the device has finished them, and d.stream is non-blocking, so it doesn't wait for that stream. Without
+// synchronizing stream 0 after them, a kernel launched next could run first, and the memset or copy would then
+// overwrite its output (seen on an A16: a freshly zeroed output buffer came back with zeros after the kernel ran).
 func (d *Device) Write(dst Ptr, src []byte) error {
 	if len(src) == 0 {
 		return nil
@@ -221,7 +228,10 @@ func (d *Device) Write(dst Ptr, src []byte) error {
 		if r := cuStreamSynchronize(d.stream); r != 0 {
 			return errorOf("cuStreamSynchronize", r)
 		}
-		return errorOf("cuMemcpyHtoD", cuMemcpyHtoD(uint64(dst), unsafe.Pointer(unsafe.SliceData(src)), uint64(len(src))))
+		if r := cuMemcpyHtoD(uint64(dst), unsafe.Pointer(unsafe.SliceData(src)), uint64(len(src))); r != 0 {
+			return errorOf("cuMemcpyHtoD", r)
+		}
+		return errorOf("cuStreamSynchronize", cuStreamSynchronize(0))
 	})
 }
 
