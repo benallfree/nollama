@@ -20,7 +20,7 @@ var metalDetSource string
 var metalDetKernels = []string{"rmsnorm_det", "swiglu_det", "quant_q8_0_det", "quant_q8_k_det", "matvec_q8_0_det", "matvec_q4k_det", "matmul_q8_0_det", "matvec1_q8_0_det", "attention_det"}
 
 // metalKernels are the kernels metalSource defines.
-var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "matmul_q4k_f32", "matmul_q6k_f32", "matvec_q6k_f32", "matvec_f16_f32", "matmul_f16_f32", "attention_f32", "attention_split_f32", "attention_combine_f32", "kv_store_f32", "copy_f32"}
+var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "matmul_q4k_f32", "matmul_q6k_f32", "matvec_q6k_f32", "matvec_f16_f32", "matmul_f16_f32", "norm_rope_f32", "add_norm_f32", "attention_f32", "attention_split_f32", "attention_combine_f32", "kv_store_f32", "copy_f32"}
 
 // metalBackend is the gpuBackend for Apple GPUs (unified memory only).
 type metalBackend struct {
@@ -287,6 +287,39 @@ func (b *metalBatch) rope(x, cs, sn gpuRef, tokens, heads, headDim int) {
 		Args:    []metal.Arg{marg(x), marg(cs), marg(sn), {Bytes: u32(uint32(heads), uint32(headDim))}},
 		Groups:  metal.Size{W: uint((half + tw - 1) / tw), H: uint(heads), D: uint(tokens)},
 		Threads: metal.Size{W: uint(tw), H: 1, D: 1},
+	})
+}
+
+func (b *metalBatch) normRope(x, w, cs, sn gpuRef, tokens, heads, headDim int, eps float64) {
+	if b.m.det { // the separate kernels: the CPU's order
+		b.rmsnorm(x, w, x, tokens*heads, headDim, eps)
+		b.rope(x, cs, sn, tokens, heads, headDim)
+		return
+	}
+	b.wrote()
+	b.ds = append(b.ds, metal.Dispatch{
+		P:       b.m.ps["norm_rope_f32"],
+		Args:    []metal.Arg{marg(x), marg(w), marg(cs), marg(sn), {Bytes: u32(uint32(heads), uint32(headDim), math.Float32bits(float32(eps)))}},
+		Groups:  metal.Size{W: uint(tokens * heads), H: 1, D: 1},
+		Threads: metal.Size{W: uint(headDim / 2), H: 1, D: 1},
+		Shared:  32 * 4,
+	})
+}
+
+func (b *metalBatch) addNorm(x, y, w, out gpuRef, rows, n int, eps float64) {
+	if b.m.det {
+		b.add(x, y, rows*n)
+		b.rmsnorm(x, w, out, rows, n, eps)
+		return
+	}
+	b.wrote()
+	p := b.m.ps["add_norm_f32"]
+	b.ds = append(b.ds, metal.Dispatch{
+		P:       p,
+		Args:    []metal.Arg{marg(x), marg(y), marg(w), marg(out), {Bytes: u32(uint32(n), math.Float32bits(float32(eps)))}},
+		Groups:  metal.Size{W: uint(rows), H: 1, D: 1},
+		Threads: metal.Size{W: uint(min(p.MaxThreads, 1024, (n+31)&^31)), H: 1, D: 1},
+		Shared:  32 * 4,
 	})
 }
 

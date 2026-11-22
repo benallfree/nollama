@@ -434,6 +434,44 @@ extern "C" __global__ void rope_neox_f32(float *x, const float *cs, const float 
 	v[i + half_] = x0 * s + x1 * c;
 }
 
+// norm_rope_f32: rmsnorm over each head, then rope_neox, in place; one block of headDim/2 threads per [token][head]
+// row (see gpu.metal).
+struct NormRopeArgs {
+	uint heads, headDim;
+	float eps;
+};
+
+extern "C" __global__ void norm_rope_f32(float *x, const float *w, const float *cs, const float *sn, NormRopeArgs a) {
+	__shared__ float red[32];
+	uint half_ = a.headDim / 2, row = blockIdx.x, t = row / a.heads, i = threadIdx.x;
+	float *v = x + (size_t)row * a.headDim;
+	float x0 = v[i], x1 = v[i + half_];
+	float ss = block_sum(x0 * x0 + x1 * x1, red);
+	float scale = rsqrtf(ss / a.headDim + a.eps);
+	x0 *= scale * w[i];
+	x1 *= scale * w[i + half_];
+	float c = cs[t * half_ + i], s = sn[t * half_ + i];
+	v[i] = x0 * c - x1 * s;
+	v[i + half_] = x0 * s + x1 * c;
+}
+
+// add_norm_f32: x += y, then out = rmsnorm(x) * w; one block per row.
+extern "C" __global__ void add_norm_f32(float *x, const float *y, const float *w, float *out, NormArgs a) {
+	__shared__ float red[32];
+	float *xr = x + (size_t)blockIdx.x * a.n;
+	const float *yr = y + (size_t)blockIdx.x * a.n;
+	float *o = out + (size_t)blockIdx.x * a.n;
+	float ss = 0;
+	for (uint i = threadIdx.x; i < a.n; i += blockDim.x) {
+		float v = xr[i] + yr[i];
+		xr[i] = v;
+		ss += v * v;
+	}
+	ss = block_sum(ss, red);
+	float scale = rsqrtf(ss / a.n + a.eps);
+	for (uint i = threadIdx.x; i < a.n; i += blockDim.x) o[i] = xr[i] * scale * w[i];
+}
+
 extern "C" __global__ void swiglu_f32(const float *gate, const float *up, float *out, uint n) {
 	uint i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i < n) {

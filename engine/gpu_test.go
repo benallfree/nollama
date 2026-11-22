@@ -112,10 +112,11 @@ func checkMatmul(t *testing.T, b gpuBackend, w *weight, r *rand.Rand) {
 	const n = 45
 	x := randFloats(r, n*w.cols)
 	xr, or := upload(t, b, x), zeros(t, b, n*w.rows)
+	act := zeros(t, b, gpuActBytes(n, w.cols)/4)
 	ref, mag := refMatmul(w, x, n)
 	for _, nt := range []int{1, 5, n} {
 		bt := b.batch()
-		bt.matmul(w, xr, or, nt, gpuRef{})
+		bt.matmul(w, xr, or, nt, act)
 		submit(t, bt)
 		got := download(b, or, nt*w.rows)
 		var worst float64
@@ -203,11 +204,12 @@ func TestGPUMatmul(t *testing.T) {
 	}
 	const prompt = 512
 	xr, or := upload(t, b, randFloats(r, prompt*maxCols)), zeros(t, b, prompt*maxRows)
+	act := zeros(t, b, gpuActBytes(prompt, maxCols)/4)
 	timeIt := func(n int, ws []*weight) time.Duration {
 		run := func() {
 			bt := b.batch()
 			for _, w := range ws {
-				bt.matmul(w, xr, or, n, gpuRef{})
+				bt.matmul(w, xr, or, n, act)
 			}
 			submit(t, bt)
 		}

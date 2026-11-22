@@ -252,6 +252,83 @@ kernel void rmsnorm_f32(device const float *x [[buffer(0)]],
 	}
 }
 
+// norm_rope_f32 is rmsnorm over each head (one threadgroup of headDim/2 threads per [token][head] row of x, in place)
+// followed by rope_neox: two dispatches in one.
+struct NormRopeArgs {
+	uint heads;
+	uint headDim;
+	float eps;
+};
+
+kernel void norm_rope_f32(device float *x [[buffer(0)]],
+                          device const float *w [[buffer(1)]],
+                          device const float *cs [[buffer(2)]],
+                          device const float *sn [[buffer(3)]],
+                          constant NormRopeArgs &a [[buffer(4)]],
+                          threadgroup float *part [[threadgroup(0)]],
+                          uint row [[threadgroup_position_in_grid]],
+                          uint i [[thread_index_in_threadgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]],
+                          uint nsg [[simdgroups_per_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+	uint half_ = a.headDim / 2, t = row / a.heads;
+	device float *v = x + (ulong)row * a.headDim;
+	float x0 = v[i], x1 = v[i + half_];
+	float ss = simd_sum(x0 * x0 + x1 * x1);
+	if (lane == 0) {
+		part[sg] = ss;
+	}
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+	ss = 0;
+	for (uint k = 0; k < nsg; k++) {
+		ss += part[k];
+	}
+	float scale = rsqrt(ss / float(a.headDim) + a.eps);
+	x0 *= scale * w[i];
+	x1 *= scale * w[i + half_];
+	float c = cs[t * half_ + i], s = sn[t * half_ + i];
+	v[i] = x0 * c - x1 * s;
+	v[i + half_] = x0 * s + x1 * c;
+}
+
+// add_norm_f32 is x += y then out = rmsnorm(x) * w, per row of n (one threadgroup per row): add_f32 and rmsnorm_f32 in
+// one dispatch.
+kernel void add_norm_f32(device float *x [[buffer(0)]],
+                         device const float *y [[buffer(1)]],
+                         device const float *w [[buffer(2)]],
+                         device float *out [[buffer(3)]],
+                         constant NormArgs &a [[buffer(4)]],
+                         threadgroup float *part [[threadgroup(0)]],
+                         uint row [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]],
+                         uint nt [[threads_per_threadgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]],
+                         uint nsg [[simdgroups_per_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+	device float *xr = x + (ulong)row * a.n;
+	device const float *yr = y + (ulong)row * a.n;
+	device float *orow = out + (ulong)row * a.n;
+	float ss = 0;
+	for (uint i = tid; i < a.n; i += nt) {
+		float v = xr[i] + yr[i];
+		xr[i] = v;
+		ss += v * v;
+	}
+	ss = simd_sum(ss);
+	if (lane == 0) {
+		part[sg] = ss;
+	}
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+	ss = 0;
+	for (uint k = 0; k < nsg; k++) {
+		ss += part[k];
+	}
+	float scale = rsqrt(ss / float(a.n) + a.eps);
+	for (uint i = tid; i < a.n; i += nt) {
+		orow[i] = xr[i] * scale * w[i];
+	}
+}
+
 // rope_neox rotates pairs (i, i+half) of every head in place: x is [tokens][heads][headDim],
 // cs/sn are [tokens][half] (cos and sin of position*freq, computed on the CPU as forward does).
 struct RopeArgs {

@@ -281,14 +281,14 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 	bt := b.batch()
 	for li := range m.layers {
 		l := &m.layers[li]
-		bt.rmsnorm(gs.x, g.attnNorm[li], gs.an, n, dim, hp.eps)
+		if li == 0 { // later layers' input norm is fused into the previous layer's last add
+			bt.rmsnorm(gs.x, g.attnNorm[li], gs.an, n, dim, hp.eps)
+		}
 		bt.matmul(l.wq, gs.an, gs.q, n, gs.act)
 		bt.matmul(l.wk, gs.an, gs.k, n, gs.act)
 		bt.matmul(l.wv, gs.an, gs.v, n, gs.act)
-		bt.rmsnorm(gs.q, g.qNorm[li], gs.q, n*hp.heads, hd, hp.eps)
-		bt.rmsnorm(gs.k, g.kNorm[li], gs.k, n*hp.kvHeads, hd, hp.eps)
-		bt.rope(gs.q, gs.cs, gs.sn, n, hp.heads, hd)
-		bt.rope(gs.k, gs.cs, gs.sn, n, hp.kvHeads, hd)
+		bt.normRope(gs.q, g.qNorm[li], gs.cs, gs.sn, n, hp.heads, hd, hp.eps)
+		bt.normRope(gs.k, g.kNorm[li], gs.cs, gs.sn, n, hp.kvHeads, hd, hp.eps)
 		bt.storeKV(gs.k, gs.v, gs.kc[li], gs.vc[li], n, pos, kvd, gs.ctxP)
 		if !g.shared {
 			// keys transposed, [kvd][n], so the CPU copies them into kc a row at a time
@@ -303,13 +303,16 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 			})
 		}
 		bt.matmul(l.wo, gs.att, gs.tmp, n, gs.act)
-		bt.add(gs.x, gs.tmp, n*dim)
-		bt.rmsnorm(gs.x, g.ffnNorm[li], gs.an, n, dim, hp.eps)
+		bt.addNorm(gs.x, gs.tmp, g.ffnNorm[li], gs.an, n, dim, hp.eps)
 		bt.matmul(l.wgate, gs.an, gs.gate, n, gs.act)
 		bt.matmul(l.wup, gs.an, gs.up, n, gs.act)
 		bt.swiglu(gs.gate, gs.up, gs.hf, n*hp.ffn)
 		bt.matmul(l.wdown, gs.hf, gs.tmp, n, gs.act)
-		bt.add(gs.x, gs.tmp, n*dim)
+		if li+1 < len(m.layers) {
+			bt.addNorm(gs.x, gs.tmp, g.attnNorm[li+1], gs.an, n, dim, hp.eps)
+		} else {
+			bt.add(gs.x, gs.tmp, n*dim)
+		}
 	}
 	last := gs.x.at(4 * (n - 1) * dim)
 	defer func() {

@@ -63,6 +63,10 @@ type gpuBatch interface {
 	rmsnorm(x, w, out gpuRef, rows, n int, eps float64)
 	// rope applies NeoX RoPE in place to x [tokens][heads][headDim] with cos/sin tables [tokens][headDim/2].
 	rope(x, cs, sn gpuRef, tokens, heads, headDim int)
+	// normRope is rmsnorm(x, w, x, tokens*heads, headDim, eps) then rope(x, cs, sn, tokens, heads, headDim).
+	normRope(x, w, cs, sn gpuRef, tokens, heads, headDim int, eps float64)
+	// addNorm is add(x, y, rows*n) then rmsnorm(x, w, out, rows, n, eps).
+	addNorm(x, y, w, out gpuRef, rows, n int, eps float64)
 	swiglu(gate, up, out gpuRef, n int) // out = silu(gate) * up
 	add(x, y gpuRef, n int)             // x += y
 	copy(dst, src gpuRef, n int)        // n floats

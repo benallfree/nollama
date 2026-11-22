@@ -300,27 +300,44 @@ type Dispatch struct {
 func (d *Device) Run(ds ...Dispatch) error {
 	var err error
 	withPool(func() {
-		cb := d.queue.Send(selCommandBuffer)
-		enc := cb.Send(selComputeEncoder)
-		for _, x := range ds {
-			enc.Send(selSetPipeline, x.P.ps)
-			for i, a := range x.Args {
-				if a.Buf != nil {
-					enc.Send(selSetBuffer, a.Buf.buf, uint(a.Offset), uint(i))
-				} else {
-					enc.Send(selSetBytes, unsafe.Pointer(unsafe.SliceData(a.Bytes)), uint(len(a.Bytes)), uint(i))
+		// Commit a command buffer every runChunk dispatches, so the GPU starts on the first ones while the rest are
+		// encoded (a decode step is hundreds of small dispatches, and encoding them takes milliseconds). The queue
+		// runs its buffers in order; waiting on the last one waits for all.
+		var cbs []objc.ID
+		for start := 0; start < len(ds) || start == 0; start += runChunk {
+			cb := d.queue.Send(selCommandBuffer)
+			enc := cb.Send(selComputeEncoder)
+			for _, x := range ds[start:min(start+runChunk, len(ds))] {
+				enc.Send(selSetPipeline, x.P.ps)
+				for i, a := range x.Args {
+					if a.Buf != nil {
+						enc.Send(selSetBuffer, a.Buf.buf, uint(a.Offset), uint(i))
+					} else {
+						enc.Send(selSetBytes, unsafe.Pointer(unsafe.SliceData(a.Bytes)), uint(len(a.Bytes)), uint(i))
+					}
 				}
+				if x.Shared > 0 {
+					enc.Send(selSetThreadgroupMemory, uint(x.Shared), uint(0))
+				}
+				enc.Send(selDispatch, x.Groups, x.Threads)
 			}
-			if x.Shared > 0 {
-				enc.Send(selSetThreadgroupMemory, uint(x.Shared), uint(0))
+			enc.Send(selEndEncoding)
+			cb.Send(selCommit)
+			cbs = append(cbs, cb)
+			if len(ds) == 0 {
+				break
 			}
-			enc.Send(selDispatch, x.Groups, x.Threads)
 		}
-		enc.Send(selEndEncoding)
-		cb.Send(selCommit)
-		cb.Send(selWaitUntilCompleted)
-		err = nsError(cb.Send(selError))
+		cbs[len(cbs)-1].Send(selWaitUntilCompleted)
+		for _, cb := range cbs {
+			if err == nil {
+				err = nsError(cb.Send(selError))
+			}
+		}
 		runtime.KeepAlive(ds)
 	})
 	return err
 }
+
+// runChunk is how many dispatches Run puts in one command buffer.
+const runChunk = 48
