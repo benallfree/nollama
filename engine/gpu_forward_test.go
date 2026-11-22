@@ -197,8 +197,6 @@ func TestGPUForwardDiscrete(t *testing.T) {
 }
 
 func testGPUForwardDiscrete(t *testing.T, kvType string) {
-	cudaBlockKV = true // tests check the block caches on CUDA too (off in use until verified on a card)
-	defer func() { cudaBlockKV = false }()
 	m, err := Load(testGGUF(t), LoadOptions{GPU: "off", KVCacheType: kvType})
 	if err != nil {
 		t.Fatal(err)
@@ -312,8 +310,6 @@ func TestGPUSplitAttention(t *testing.T) {
 // 256 positions), so the cache layouts, stores and every attention kernel (prompt and one-token, one-pass and split)
 // run on f16, q8_0 and q4_0.
 func TestGPUForwardCompactKV(t *testing.T) {
-	cudaBlockKV = true
-	defer func() { cudaBlockKV = false }()
 	for _, kv := range []string{KVCacheF16, KVCacheQ8_0, KVCacheQ4_0} {
 		t.Run(kv, func(t *testing.T) { testGPUForwardCompactKV(t, kv) })
 	}

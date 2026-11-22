@@ -94,13 +94,10 @@ func (c *cudaBackend) name() string {
 func (c *cudaBackend) unified() bool     { return false }
 func (c *cudaBackend) halfPrompts() bool { return !c.det && !cudaPromptF32 }
 
-// supportsKV: f32, and f16 outside deterministic mode (checked on an NVIDIA A16).
+// supportsKV: f32, and the compact caches (f16, q8_0, q4_0) outside deterministic mode (checked on an NVIDIA A16).
 func (c *cudaBackend) supportsKV(t uint32) bool {
-	return t == typeF32 || t == typeF16 && !c.det || (t == typeQ8_0 || t == typeQ4_0) && !c.det && cudaBlockKV
+	return t == typeF32 || (t == typeF16 || t == typeQ8_0 || t == typeQ4_0) && !c.det
 }
-
-// cudaBlockKV turns on the q8_0 and q4_0 KV caches on CUDA (off until checked on a card; tests turn it on).
-var cudaBlockKV = false
 
 func (c *cudaBackend) int8Prompts() bool { return c.mmaMod != nil && !cudaNoMMQ && !cudaPromptF32 }
 

@@ -407,9 +407,8 @@ nollama runs the model on a GPU when it finds one that works, with no toolkit or
   with Q4_K weights use the int8 tensor cores.
 
 It takes models whose weights are all Q8_0, Q4_K, Q6_K or F16 (Ollama's Q8_0 and Q4_K_M files are), with any KV cache
-type on Metal and the `f32` or `f16` cache on CUDA (see [Long contexts](#long-contexts-a-smaller-kv-cache)). When
-something doesn't fit, such as another weight type, a `q8_0` cache on CUDA or a model larger than the card, the whole
-model runs on the CPU, and the server's
+type (see [Long contexts](#long-contexts-a-smaller-kv-cache)). When something doesn't fit, such as another weight type
+or a model larger than the card, the whole model runs on the CPU, and the server's
 log says why when it loads it: `loaded qwen3-1.7b in 120ms (CPU, ...; no GPU: ...)`. `--gpu off` (or `NOLLAMA_GPU=off`,
 or `engine.LoadOptions.GPU = "off"`) keeps it on the CPU; `engine.Model.Info().GPU` names the GPU in use.
 
@@ -450,10 +449,10 @@ dominated by the weights either way. These are estimates until they're measured 
 The prompt cache and threads keep their copies at full precision, within their own budgets (`--prompt-cache-mb`,
 `LoadOptions.ThreadMemory`); the KV cache type sets the memory of the answers being written.
 
-On a GPU, `f32` and `f16` caches run on the GPU, and so do `q8_0` and `q4_0` on Metal (deterministic mode takes `f32`
-only); on CUDA a `q8_0` or `q4_0` cache keeps the model on the CPU for now. On an M1 Max the compact caches read
-prompts as fast as `f32` and write within 4% of it (Qwen3 1.7B, Q8_0 and Q4_K_M, short and long prompts); on an
-NVIDIA A16 `f16` is 2 to 10% slower than `f32` (more so at longer contexts).
+Every cache type runs on the GPU (deterministic mode takes `f32` only). On an M1 Max the compact caches read prompts
+as fast as `f32` and write within 4% of it; on an NVIDIA A16 they read prompts as fast and write as fast with `f16`,
+and 6 to 10% slower with `q8_0` or `q4_0` (more so at longer contexts). Both measured on Qwen3 1.7B, Q8_0 and Q4_K_M,
+short and long prompts.
 
 ```bash
 nollama serve --kv-cache-type q8_0
