@@ -109,7 +109,7 @@ type gpuState struct {
 	scratch, logits, act       gpuRef // act: deterministic backends' quantized activations
 	allLogits                  gpuRef // maxN*vocab, allocated on the first Score
 	kc, vc                     []gpuRef
-	kStage, vStage             gpuRef // discrete GPUs: each layer's new keys and values, [layers][maxN][kvd]
+	kStage, vStage             gpuRef // discrete GPUs: this call's new keys and values, per layer [kvd][n] and [n][kvd]
 	maxN, ctxP, attnChunk      int
 	lastEnd                    int // discrete GPUs: where the last call ended (-1: the device cache is stale)
 }
@@ -271,10 +271,10 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 	b.write(gs.cs, floatBytes(cs))
 	b.write(gs.sn, floatBytes(sn))
 	b.write(gs.mask, mask)
-	if !g.shared && pos != gs.lastEnd { // the device cache may not match kc/vc: upload them
+	if !g.shared && pos != gs.lastEnd && pos > 0 { // the device cache may not match kc/vc: upload positions < pos
 		for li := range m.layers {
 			b.write(gs.kc[li], floatBytes(s.kc[li]))
-			b.write(gs.vc[li], floatBytes(s.vc[li]))
+			b.write(gs.vc[li], floatBytes(s.vc[li][:pos*kvd]))
 		}
 	}
 
@@ -291,8 +291,8 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 		bt.rope(gs.k, gs.cs, gs.sn, n, hp.kvHeads, hd)
 		bt.storeKV(gs.k, gs.v, gs.kc[li], gs.vc[li], n, pos, kvd, gs.ctxP)
 		if !g.shared {
-			bt.copy(gs.kStage.at(4*li*gs.maxN*kvd), gs.k, n*kvd)
-			bt.copy(gs.vStage.at(4*li*gs.maxN*kvd), gs.v, n*kvd)
+			// keys transposed, [kvd][n], so the CPU copies them into kc a row at a time
+			bt.storeKV(gs.k, gs.v, gs.kStage.at(4*li*n*kvd), gs.vStage.at(4*li*n*kvd), n, 0, kvd, n)
 		}
 		for t0 := 0; t0 < n; t0 += gs.attnChunk {
 			c := min(gs.attnChunk, n-t0)
@@ -314,14 +314,14 @@ func (g *gpuModel) forward(s *state, tokens []int, pos int) error {
 	last := gs.x.at(4 * (n - 1) * dim)
 	defer func() {
 		if !g.shared { // bring kc/vc up to date with the keys and values this call wrote
-			k, v := make([]float32, n*kvd), make([]float32, n*kvd)
+			nl := len(m.layers)
+			ks, vs := make([]float32, nl*n*kvd), make([]float32, nl*n*kvd)
+			g.readFloats(gs.kStage, ks) // two reads for all layers
+			g.readFloats(gs.vStage, vs)
 			for li := range m.layers {
-				g.readFloats(gs.kStage.at(4*li*gs.maxN*kvd), k)
-				g.readFloats(gs.vStage.at(4*li*gs.maxN*kvd), v)
-				for t := 0; t < n; t++ {
-					for i := 0; i < kvd; i++ {
-						s.kc[li][i*gs.ctxP+pos+t] = k[t*kvd+i]
-					}
+				k, v := ks[li*n*kvd:(li+1)*n*kvd], vs[li*n*kvd:(li+1)*n*kvd]
+				for i := 0; i < kvd; i++ {
+					copy(s.kc[li][i*gs.ctxP+pos:i*gs.ctxP+pos+n], k[i*n:(i+1)*n])
 				}
 				copy(s.vc[li][pos*kvd:(pos+n)*kvd], v)
 			}
@@ -362,17 +362,10 @@ func (g *gpuModel) readFloats(src gpuRef, dst []float32) {
 		copy(dst, unsafe.Slice((*float32)(unsafe.Pointer(unsafe.SliceData(mem))), len(dst)))
 		return
 	}
-	raw := make([]byte, 4*len(dst))
-	b.read(src, raw)
-	for i := range dst {
-		dst[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[4*i:]))
-	}
+	b.read(src, floatBytes(dst))
 }
 
+// floatBytes is x's memory as bytes (no copy; every GPU platform is little-endian).
 func floatBytes(x []float32) []byte {
-	b := make([]byte, 4*len(x))
-	for i, v := range x {
-		binary.LittleEndian.PutUint32(b[4*i:], math.Float32bits(v))
-	}
-	return b
+	return unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(x))), 4*len(x))
 }

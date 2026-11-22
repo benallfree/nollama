@@ -23,6 +23,9 @@ type gpuBackend interface {
 	name() string // "metal (Apple M1 Max)"
 	unified() bool
 	supports(weightType uint32) bool // weights of other types run on the CPU
+	// halfPrompts reports that prompt-sized matmuls round their inputs to half (tensor cores): about 4e-5 of a
+	// row's magnitude instead of f32's 1e-7, still far closer to the float reference than the CPU's 8-bit path.
+	halfPrompts() bool
 	// loadWeights makes the model file's weights available to batches: zero-copy on unified memory,
 	// one upload otherwise. Called once, before any batch.
 	loadWeights(file []byte) error

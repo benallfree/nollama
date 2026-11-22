@@ -18,6 +18,7 @@
 #
 # The API key comes from VULTR_API_KEY (or the macOS Keychain item vultr-api-key) and reaches curl on stdin, never
 # on a command line or in a file.
+# VULTR_BENCH_TAG=name adds name to the instance label (nollama-bench-name-PLAN), so two runs of a plan can coexist.
 # Plans must be listed in VULTR_BENCH_APPROVED, so nothing is created that wasn't agreed to. Run dirs (instance id,
 # address, throwaway SSH key, results) live under $NOLLAMA_BENCH_DIR (default ~/.cache/nollama-vultr-bench).
 set -eu
@@ -61,12 +62,13 @@ cmd_create() {
 	plan=$1 region=${2:-ewr} ollama=0
 	[ "${3:-}" = --ollama ] && ollama=1
 	case ",${VULTR_BENCH_APPROVED:-}," in *",$plan,"*) ;; *) die "plan $plan is not in VULTR_BENCH_APPROVED" ;; esac
-	label="nollama-bench-$plan"
+	label="nollama-bench-${VULTR_BENCH_TAG:+$VULTR_BENCH_TAG-}$plan" # a tag lets two runs of one plan coexist
 	existing=$(ids_by_label "$label") || die "can't list instances"
 	[ -z "$existing" ] || die "an instance labelled $label already exists ($existing): destroy it first"
 	run=${RUN:-"$BASE/$(date +%Y%m%d-%H%M%S)-$plan"}
 	mkdir -p "$run"
 	echo "$plan" >"$run/plan"
+	echo "$label" >"$run/label"
 	ssh-keygen -q -t ed25519 -N '' -C nollama-bench -f "$run/key"
 	pub=$(cat "$run/key.pub")
 	ud=$(sed -e "s|__PUBKEY__|$pub|" -e "s|__OLLAMA__|$ollama|" "$HERE/box-setup.sh" | base64 | tr -d '\n')
@@ -144,7 +146,8 @@ cmd_destroy() {
 	run=$1
 	id=$(cat "$run/id" 2>/dev/null) || id=""
 	if [ -z "$id" ] && [ -s "$run/plan" ]; then
-		id=$(ids_by_label "nollama-bench-$(cat "$run/plan")" | head -1) || id=""
+		label=$(cat "$run/label" 2>/dev/null || echo "nollama-bench-$(cat "$run/plan")")
+		id=$(ids_by_label "$label" | head -1) || id=""
 		[ -n "$id" ] && echo "$id" >"$run/id"
 	fi
 	[ -n "$id" ] || { say "no instance to destroy for $run"; return 0; }

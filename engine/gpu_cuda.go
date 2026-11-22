@@ -25,9 +25,11 @@ var cudaDetPTX string
 var cudaDetKernels = []string{"rmsnorm_det", "swiglu_det", "quant_q8_0_det", "quant_q8_k_det", "matvec_q8_0_det",
 	"matvec1_q8_0_det", "matmul_q8_0_det", "matvec_q4k_det", "attention_det"}
 
-var cudaKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "matmul_q8_0_f32", "rmsnorm_f32", "rope_neox_f32",
+var cudaKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "matvec_q6k_f32", "matvec_f16_f32",
+	"matmul_q8_0_f32", "matmul_q4k_f32", "matmul_q6k_f32", "matmul_f16_f32",
+	"matmul_q8_0_tc", "matmul_q4k_tc", "matmul_q6k_tc", "matmul_f16_tc", "rmsnorm_f32", "rope_neox_f32",
 	"swiglu_f32", "add_f32", "copy_f32", "kv_store_f32", "attention_f32",
-	"attention_split_f32", "attention_combine_f32"}
+	"attention_split_f32", "attention_combine_f32", "attention_tile_f32"}
 
 // cudaBackend is the gpuBackend for NVIDIA GPUs, through the driver API (no toolkit needed).
 type cudaBackend struct {
@@ -67,8 +69,12 @@ func (c *cudaBackend) name() string {
 	}
 	return fmt.Sprintf("cuda (%s, %d GB, compute %d.%d%s)", c.dev.Name, c.dev.Memory>>30, c.dev.Major, c.dev.Minor, det)
 }
-func (c *cudaBackend) unified() bool          { return false }
-func (c *cudaBackend) supports(t uint32) bool { return t == typeQ4_K || t == typeQ8_0 }
+func (c *cudaBackend) unified() bool     { return false }
+func (c *cudaBackend) halfPrompts() bool { return !c.det && !cudaPromptF32 }
+
+func (c *cudaBackend) supports(t uint32) bool {
+	return t == typeQ4_K || t == typeQ8_0 || (t == typeQ6_K || t == typeF16) && !c.det // deterministic mode: no Q6_K/F16 kernels yet
+}
 
 func (c *cudaBackend) loadWeights(file []byte) error {
 	if uint64(len(file)) > c.dev.Memory {
@@ -173,24 +179,43 @@ func (b *cudaBatch) matmul(w *weight, x, out gpuRef, n int, act gpuRef) {
 		b.matmulDet(w, x, out, n, act)
 		return
 	}
-	if n >= matmulTiledMin && w.typ == typeQ8_0 {
-		b.launch("matmul_q8_0_f32", [3]uint32{uint32((w.rows + 63) / 64), uint32((n + 63) / 64), 1}, [3]uint32{256, 1, 1}, 0,
+	k, ok := cudaMatmuls[w.typ]
+	if !ok {
+		panic("cuda: matmul doesn't support " + typeName(w.typ))
+	}
+	if n >= matmulTiledMin {
+		tiled, rowsPer := k.tc, 128
+		if cudaPromptF32 || w.cols%64 != 0 {
+			tiled, rowsPer = k.tiled, 64
+		}
+		b.launch(tiled, [3]uint32{uint32((w.rows + rowsPer - 1) / rowsPer), uint32((n + 63) / 64), 1}, [3]uint32{256, 1, 1}, 0,
 			b.weightArg(w), carg(x), carg(out), cuda.Arg{Bytes: u32(uint32(w.rows), uint32(w.cols/32), uint32(w.rowBytes), uint32(w.cols), uint32(n))})
 		return
 	}
-	var k string
-	var nb int
-	switch w.typ {
-	case typeQ4_K:
-		k, nb = "matvec_q4k_f32", w.cols/qk
-	case typeQ8_0:
-		k, nb = "matvec_q8_0_f32", w.cols/32
-	default:
-		panic("cuda: matmul doesn't support " + typeName(w.typ))
-	}
-	b.launch(k, [3]uint32{uint32((w.rows + 3) / 4), uint32(n), 1}, [3]uint32{128, 1, 1}, 0,
-		b.weightArg(w), carg(x), carg(out), cuda.Arg{Bytes: u32(uint32(w.rows), uint32(nb), uint32(w.rowBytes), uint32(w.cols))})
+	const rows = 4 * cudaMVRows // 4 warps per block
+	b.launch(k.matvec, [3]uint32{uint32((w.rows + rows - 1) / rows), uint32(n), 1}, [3]uint32{128, 1, 1}, 0,
+		b.weightArg(w), carg(x), carg(out), cuda.Arg{Bytes: u32(uint32(w.rows), uint32(w.cols/k.step), uint32(w.rowBytes), uint32(w.cols))})
 }
+
+// cudaMatmuls are each weight type's one-token and tiled kernels, and the elements per one-token step.
+var cudaMatmuls = map[uint32]struct {
+	matvec, tiled, tc string // tc: tensor cores (half inputs, f32 sums)
+	step              int
+}{
+	typeQ8_0: {"matvec_q8_0_f32", "matmul_q8_0_f32", "matmul_q8_0_tc", 32},
+	typeQ4_K: {"matvec_q4k_f32", "matmul_q4k_f32", "matmul_q4k_tc", qk},
+	typeQ6_K: {"matvec_q6k_f32", "matmul_q6k_f32", "matmul_q6k_tc", qk},
+	typeF16:  {"matvec_f16_f32", "matmul_f16_f32", "matmul_f16_tc", 256},
+}
+
+// cudaAttnOnePass uses the one-pass attention kernel instead of the tiled one (tests compare the two).
+var cudaAttnOnePass = false
+
+// cudaPromptF32 runs prompts with the plain f32 kernels instead of the tensor cores (tests compare the two).
+var cudaPromptF32 = false
+
+// cudaMVRows is MV_ROWS in gpu.cu: rows per warp in the matvecs.
+const cudaMVRows = 8
 
 // matmulDet quantizes x into act as the CPU does (once for matmuls sharing x), then runs the integer dot products in
 // the CPU's order (gpu_det.cu).
@@ -298,6 +323,13 @@ func (b *cudaBatch) attention(a gpuAttention) {
 			4*(a.headDim+chunk+nt/32*a.headDim), carg(a.q), carg(a.k), carg(a.v), carg(a.scratch), carg(a.mask), args)
 		b.launch("attention_combine_f32", [3]uint32{uint32(a.heads), uint32(a.n), 1},
 			[3]uint32{uint32((a.headDim + 31) &^ 31), 1, 1}, 0, carg(a.scratch), carg(a.out), args)
+		return
+	}
+	if a.headDim <= 128 && !cudaAttnOnePass {
+		const qt = 16 // ATT_QT
+		b.launch("attention_tile_f32", [3]uint32{uint32(a.heads), uint32((a.n + qt - 1) / qt), 1}, [3]uint32{256, 1, 1}, 0,
+			carg(a.q), carg(a.k), carg(a.v), carg(a.out), carg(a.mask),
+			cuda.Arg{Bytes: u32(uint32(a.heads), uint32(a.kvHeads), uint32(a.headDim), uint32(a.ctxP), uint32(a.pos), a.scale(), uint32(a.n))})
 		return
 	}
 	b.launch("attention_f32", [3]uint32{uint32(a.heads), uint32(a.n), 1}, [3]uint32{nt, 1, 1}, 4*(a.headDim+nt),

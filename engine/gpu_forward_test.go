@@ -2,6 +2,7 @@ package engine
 
 import (
 	"math"
+	"slices"
 	"testing"
 	"time"
 )
@@ -58,14 +59,18 @@ func TestGPUForward(t *testing.T) {
 	}
 	d := logitDiff(sf.logits, sg.logits)
 	t.Logf("prompt: GPU vs float reference %.1e of the logits' spread (fast CPU path: %.1e)", d, logitDiff(sf.logits, sc.logits))
-	if d > 1e-4 {
+	if d > promptTol(g.b, split, 1e-4, 2e-3) {
 		t.Errorf("GPU vs float reference: %.2e", d)
 	}
 	check := func(step string) int {
 		d := logitDiff(sc.logits, sg.logits)
 		a, b := argmax(sc.logits), argmax(sg.logits)
 		t.Logf("%s: logits differ by %.1e of their spread; top token CPU %d %q, GPU %d", step, d, a, detok(m, []int{a}), b)
-		if d > 5e-2 || a != b {
+		// The CPU's 8-bit path can flip a near tie: a different top token is fine when the CPU itself scores
+		// the GPU's pick within the two paths' difference of its own.
+		lo, hi := slices.Min(sc.logits), slices.Max(sc.logits)
+		tie := float64(sc.logits[a]-sc.logits[b]) <= 2*d*float64(hi-lo)
+		if d > 5e-2 || a != b && !tie {
 			t.Errorf("%s: GPU disagrees (diff %.2e, top %d vs %d)", step, d, a, b)
 		}
 		return a
@@ -166,7 +171,7 @@ func TestGPUScoreEmbed(t *testing.T) {
 		worst = max(worst, logitDiff(sf.allLogits[p*vocab:(p+1)*vocab], sg.allLogits[p*vocab:(p+1)*vocab]))
 	}
 	t.Logf("Score, %d positions: worst %.1e of the logits' spread vs the float reference", n, worst)
-	if worst > 1e-4 {
+	if worst > promptTol(g.b, n, 1e-4, 5e-3) {
 		t.Errorf("Score: %.2e", worst)
 	}
 
@@ -178,7 +183,7 @@ func TestGPUScoreEmbed(t *testing.T) {
 	if err := g.forward(eg, ids, 0); err != nil {
 		t.Fatal(err)
 	}
-	maxRelDiff(t, "Embed hidden state vs float reference", eg.hidden, ef.hidden, 1e-3)
+	maxRelDiff(t, "Embed hidden state vs float reference", eg.hidden, ef.hidden, promptTol(g.b, n, 1e-3, 5e-2))
 }
 
 // TestGPUForwardDiscrete runs the discrete-GPU KV path (device cache, keys and values copied back to kc/vc,

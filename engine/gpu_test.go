@@ -123,26 +123,33 @@ func checkMatmul(t *testing.T, b gpuBackend, w *weight, r *rand.Rand) {
 			worst = max(worst, math.Abs(float64(got[i])-ref[i])/max(mag[i], 1e-6))
 		}
 		t.Logf("%s %dx%d, %d token(s): worst error %.1e of the row's magnitude", typeName(w.typ), w.rows, w.cols, nt, worst)
-		if worst > 1e-5 {
+		if lim := promptTol(b, nt, 1e-5, 1e-4); worst > lim {
 			t.Errorf("%s %dx%d, %d tokens: error %.2e", typeName(w.typ), w.rows, w.cols, nt, worst)
 		}
 	}
 }
 
-// TestGPUMatmulQ4KSynthetic checks Q4_K on random blocks (the default models are Q8_0).
-func TestGPUMatmulQ4KSynthetic(t *testing.T) {
+// TestGPUMatmulKQuantsSynthetic checks Q4_K, Q6_K and F16 on random blocks (the test model is Q8_0).
+func TestGPUMatmulKQuantsSynthetic(t *testing.T) {
 	b := testBackend(t)
-	if !b.supports(typeQ4_K) {
-		t.Skip(b.name() + " has no Q4_K")
+	for _, c := range []struct {
+		typ      uint32
+		size     int
+		f16s     []int // offsets of the block's f16 scales
+		rows, nb int
+	}{{typeQ4_K, q4kBytes, []int{0, 2}, 77, 8}, {typeQ6_K, q6kBytes, []int{208}, 77, 8}, {typeF16, 512, f16Offsets(256), 77, 8}} {
+		if !b.supports(c.typ) {
+			t.Logf("%s has no %s", b.name(), typeName(c.typ))
+			continue
+		}
+		r := rand.New(rand.NewPCG(5, 6))
+		file := alignedBytes(c.rows * c.nb * c.size)
+		copy(file, randBlocks(r, c.rows*c.nb, c.size, c.f16s))
+		if err := b.loadWeights(file); err != nil {
+			t.Fatal(err)
+		}
+		checkMatmul(t, b, &weight{typ: c.typ, cols: c.nb * qk, rows: c.rows, rowBytes: c.nb * c.size, data: file}, r)
 	}
-	r := rand.New(rand.NewPCG(5, 6))
-	const rows, nb = 77, 8
-	file := alignedBytes(rows * nb * q4kBytes)
-	copy(file, randBlocks(r, rows*nb, q4kBytes, []int{0, 2}))
-	if err := b.loadWeights(file); err != nil {
-		t.Fatal(err)
-	}
-	checkMatmul(t, b, &weight{typ: typeQ4_K, cols: nb * qk, rows: rows, rowBytes: nb * q4kBytes, data: file}, r)
 }
 
 // openModelGPU loads the test model and opens a backend with its weights, or skips.
@@ -331,7 +338,7 @@ func TestGPUElementwise(t *testing.T) {
 // The second case is a short batch over a long context, which runs split attention.
 func TestGPUAttention(t *testing.T) {
 	b := testBackend(t)
-	for _, c := range []struct{ pos, n int }{{37, 5}, {700, 3}} {
+	for _, c := range []struct{ pos, n int }{{37, 5}, {700, 3}, {90, 45}} {
 		t.Run(fmt.Sprintf("pos=%d,n=%d", c.pos, c.n), func(t *testing.T) { testGPUAttention(t, b, c.pos, c.n) })
 	}
 }
@@ -413,4 +420,21 @@ func TestGPUBackends(t *testing.T) {
 		t.Logf("backend %d: %s, unified=%v", i, b.name(), b.unified())
 		b.close()
 	}
+}
+
+// f16Offsets lists every f16 in a block of n F16 values, so randBlocks makes them all finite.
+func f16Offsets(n int) []int {
+	o := make([]int, n)
+	for i := range o {
+		o[i] = 2 * i
+	}
+	return o
+}
+
+// promptTol is f32 for f32 kernels, or half when n tokens run on half-precision prompt kernels.
+func promptTol(b gpuBackend, n int, f32, half float64) float64 {
+	if n >= matmulTiledMin && b.halfPrompts() {
+		return half
+	}
+	return f32
 }

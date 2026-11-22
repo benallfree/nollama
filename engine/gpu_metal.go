@@ -20,7 +20,7 @@ var metalDetSource string
 var metalDetKernels = []string{"rmsnorm_det", "swiglu_det", "quant_q8_0_det", "quant_q8_k_det", "matvec_q8_0_det", "matvec_q4k_det", "matmul_q8_0_det", "matvec1_q8_0_det", "attention_det"}
 
 // metalKernels are the kernels metalSource defines.
-var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "attention_f32", "attention_split_f32", "attention_combine_f32", "kv_store_f32", "copy_f32"}
+var metalKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "rmsnorm_f32", "rope_neox_f32", "swiglu_f32", "add_f32", "matmul_q8_0_f32", "matmul_q4k_f32", "matmul_q6k_f32", "matvec_q6k_f32", "matvec_f16_f32", "matmul_f16_f32", "attention_f32", "attention_split_f32", "attention_combine_f32", "kv_store_f32", "copy_f32"}
 
 // metalBackend is the gpuBackend for Apple GPUs (unified memory only).
 type metalBackend struct {
@@ -61,7 +61,11 @@ func (m *metalBackend) name() string {
 }
 func (m *metalBackend) unified() bool { return true }
 
-func (m *metalBackend) supports(t uint32) bool { return t == typeQ4_K || t == typeQ8_0 }
+func (m *metalBackend) halfPrompts() bool { return false }
+
+func (m *metalBackend) supports(t uint32) bool {
+	return t == typeQ4_K || t == typeQ8_0 || (t == typeQ6_K || t == typeF16) && !m.det // deterministic mode: no Q6_K/F16 kernels yet
+}
 
 func (m *metalBackend) loadWeights(file []byte) error {
 	wb, err := m.dev.Wrap(file)
@@ -140,14 +144,14 @@ const matmulTiledMin = 8
 func (b *metalBatch) matmul(w *weight, x, out gpuRef, n int, act gpuRef) {
 	if b.m.det {
 		b.matmulDet(w, x, out, n, act)
-	} else if n >= matmulTiledMin && w.typ == typeQ8_0 {
+	} else if n >= matmulTiledMin {
 		b.matmulTiled(w, x, out, n)
 	} else {
 		b.matvec(w, x, out, n)
 	}
 }
 
-// matvec is the one-token kernel (one simdgroup per row), also usable for small batches.
+// matvec is the one-token kernel (a simdgroup per mvRows rows), also usable for small batches.
 func (b *metalBatch) matvec(w *weight, x, out gpuRef, n int) {
 	var kernel string
 	var nb int
@@ -156,25 +160,34 @@ func (b *metalBatch) matvec(w *weight, x, out gpuRef, n int) {
 		kernel, nb = "matvec_q4k_f32", w.cols/qk
 	case typeQ8_0:
 		kernel, nb = "matvec_q8_0_f32", w.cols/32
+	case typeQ6_K:
+		kernel, nb = "matvec_q6k_f32", w.cols/qk
+	case typeF16:
+		kernel, nb = "matvec_f16_f32", w.cols/256
 	default:
 		panic("metal: matmul doesn't support " + typeName(w.typ))
 	}
-	const nsg = 4 // rows (simdgroups) per threadgroup
+	const nsg = 4       // simdgroups per threadgroup
+	const rows = mvRows // rows per simdgroup
 	b.ds = append(b.ds, metal.Dispatch{
 		P:       b.m.ps[kernel],
 		Args:    []metal.Arg{b.weightArg(w), marg(x), marg(out), {Bytes: u32(uint32(w.rows), uint32(nb), uint32(w.rowBytes), uint32(w.cols))}},
-		Groups:  metal.Size{W: uint((w.rows + nsg - 1) / nsg), H: uint(n), D: 1},
+		Groups:  metal.Size{W: uint((w.rows + nsg*rows - 1) / (nsg * rows)), H: uint(n), D: 1},
 		Threads: metal.Size{W: 32 * nsg, H: 1, D: 1},
 	})
 }
 
+// mvRows is MV_ROWS in gpu.metal: rows per simdgroup in the matvecs.
+const mvRows = 8
+
 // matmulTiled is the 32x32-tile kernel for prompt batches (Q8_0 only so far).
 func (b *metalBatch) matmulTiled(w *weight, x, out gpuRef, n int) {
-	if w.typ != typeQ8_0 {
+	kernel := map[uint32]string{typeQ8_0: "matmul_q8_0_f32", typeQ4_K: "matmul_q4k_f32", typeQ6_K: "matmul_q6k_f32", typeF16: "matmul_f16_f32"}[w.typ]
+	if kernel == "" {
 		panic("metal: tiled matmul doesn't support " + typeName(w.typ))
 	}
 	b.ds = append(b.ds, metal.Dispatch{
-		P:       b.m.ps["matmul_q8_0_f32"],
+		P:       b.m.ps[kernel],
 		Args:    []metal.Arg{b.weightArg(w), marg(x), marg(out), {Bytes: u32(uint32(w.rows), uint32(w.cols/32), uint32(w.rowBytes), uint32(w.cols), uint32(n))}},
 		Groups:  metal.Size{W: uint((w.rows + 31) / 32), H: uint((n + 31) / 32), D: 1},
 		Threads: metal.Size{W: 128, H: 1, D: 1},
