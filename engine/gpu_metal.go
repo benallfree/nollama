@@ -62,6 +62,7 @@ func (m *metalBackend) name() string {
 func (m *metalBackend) unified() bool { return true }
 
 func (m *metalBackend) halfPrompts() bool { return false }
+func (m *metalBackend) int8Prompts() bool { return false }
 
 func (m *metalBackend) supports(t uint32) bool {
 	return t == typeQ4_K || t == typeQ8_0 || (t == typeQ6_K || t == typeF16) && !m.det // deterministic mode: no Q6_K/F16 kernels yet

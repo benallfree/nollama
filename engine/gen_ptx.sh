@@ -10,9 +10,12 @@ DET="-fmad=false -ftz=false -prec-div=true -prec-sqrt=true"
 if command -v nvcc >/dev/null 2>&1; then
 	nvcc -ptx -arch=compute_75 -O3 -o gpu_cuda.ptx gpu.cu
 	nvcc -ptx -arch=compute_75 -O3 $DET -o gpu_cuda_det.ptx gpu_det.cu
+	nvcc -ptx -arch=compute_80 -O3 -o gpu_cuda_mma.ptx gpu_mma.cu
 else
 	docker run --rm -v "$PWD":/src -w /src "$IMAGE" sh -c "nvcc -ptx -arch=compute_75 -O3 -o gpu_cuda.ptx gpu.cu &&
-		nvcc -ptx -arch=compute_75 -O3 $DET -o gpu_cuda_det.ptx gpu_det.cu" >/dev/null
+		nvcc -ptx -arch=compute_75 -O3 $DET -o gpu_cuda_det.ptx gpu_det.cu &&
+		nvcc -ptx -arch=compute_80 -O3 -o gpu_cuda_mma.ptx gpu_mma.cu" >/dev/null
 fi
 echo "gpu_cuda.ptx: $(grep -c '^.visible .entry' gpu_cuda.ptx) kernels"
 echo "gpu_cuda_det.ptx: $(grep -c '^.visible .entry' gpu_cuda_det.ptx) kernels"
+echo "gpu_cuda_mma.ptx: $(grep -c '^.visible .entry' gpu_cuda_mma.ptx) kernels"

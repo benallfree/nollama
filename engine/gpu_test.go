@@ -439,8 +439,12 @@ func f16Offsets(n int) []int {
 	return o
 }
 
-// promptTol is f32 for f32 kernels, or half when n tokens run on half-precision prompt kernels.
+// promptTol is f32 for f32 kernels, half when n tokens run on half-precision prompt kernels, and 20x that on
+// int8 ones.
 func promptTol(b gpuBackend, n int, f32, half float64) float64 {
+	if n >= matmulTiledMin && b.int8Prompts() {
+		return 20 * half // 8-bit inputs, as the CPU's fast path and llama.cpp's MMQ
+	}
 	if n >= matmulTiledMin && b.halfPrompts() {
 		return half
 	}

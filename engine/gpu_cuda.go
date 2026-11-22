@@ -21,6 +21,17 @@ var cudaPTX string
 //go:embed gpu_cuda_det.ptx
 var cudaDetPTX string
 
+// gpu_cuda_mma.ptx is gpu_mma.cu compiled for compute capability 8.0 (A100, A10, A16, L4, L40S, H100, RTX 30xx+): the
+// int8 tensor-core prompt matmuls, loaded on GPUs that have them.
+//
+//go:embed gpu_cuda_mma.ptx
+var cudaMMAPTX string
+
+var cudaMMAKernels = []string{"quant_act_mma", "matmul_q4k_mmq"}
+
+// cudaNoMMQ keeps prompts on the half-precision tensor-core kernels even where the int8 ones load (tests compare).
+var cudaNoMMQ = false
+
 // cudaDetKernels are the kernels gpu_det.cu adds for deterministic mode.
 var cudaDetKernels = []string{"rmsnorm_det", "swiglu_det", "quant_q8_0_det", "quant_q8_k_det", "matvec_q8_0_det",
 	"matvec1_q8_0_det", "matmul_q8_0_det", "matvec_q4k_det", "attention_det"}
@@ -36,6 +47,7 @@ var cudaKernels = []string{"matvec_q4k_f32", "matvec_q8_0_f32", "matvec_q6k_f32"
 type cudaBackend struct {
 	dev     *cuda.Device
 	mod     *cuda.Module
+	mmaMod  *cuda.Module // the int8 prompt kernels (compute 8.0+, not deterministic mode), or nil
 	ks      map[string]*cuda.Kernel
 	weights cuda.Ptr // the model file, uploaded once
 	base    uintptr  // address of the file's first byte in host memory
@@ -60,7 +72,16 @@ func openCUDA(det bool) (gpuBackend, error) {
 		dev.Close()
 		return nil, err
 	}
-	return &cudaBackend{dev: dev, mod: mod, ks: ks, det: det}, nil
+	c := &cudaBackend{dev: dev, mod: mod, ks: ks, det: det}
+	if !det && dev.Major >= 8 {
+		if mm, mks, err := dev.Load(cudaMMAPTX, cudaMMAKernels...); err == nil { // without it, prompts use the half kernels
+			c.mmaMod = mm
+			for k, v := range mks {
+				ks[k] = v
+			}
+		}
+	}
+	return c, nil
 }
 
 func (c *cudaBackend) name() string {
@@ -72,6 +93,7 @@ func (c *cudaBackend) name() string {
 }
 func (c *cudaBackend) unified() bool     { return false }
 func (c *cudaBackend) halfPrompts() bool { return !c.det && !cudaPromptF32 }
+func (c *cudaBackend) int8Prompts() bool { return c.mmaMod != nil && !cudaNoMMQ && !cudaPromptF32 }
 
 func (c *cudaBackend) supports(t uint32) bool {
 	return t == typeQ4_K || t == typeQ8_0 || (t == typeQ6_K || t == typeF16) && !c.det // deterministic mode: no Q6_K/F16 kernels yet
@@ -99,6 +121,9 @@ func (c *cudaBackend) loadWeights(file []byte) error {
 func (c *cudaBackend) close() {
 	if c.weights != 0 {
 		c.dev.Free(c.weights)
+	}
+	if c.mmaMod != nil {
+		c.mmaMod.Unload()
 	}
 	c.mod.Unload()
 	c.dev.Close()
@@ -184,6 +209,12 @@ func (b *cudaBatch) matmul(w *weight, x, out gpuRef, n int, act gpuRef) {
 	if !ok {
 		panic("cuda: matmul doesn't support " + typeName(w.typ))
 	}
+	if out.buf == b.quantized.x.buf || out.buf == b.quantized.act.buf {
+		b.wrote()
+	}
+	if n >= matmulTiledMin && b.mmq(w, x, out, n, act) {
+		return
+	}
 	if n >= matmulTiledMin {
 		tiled, rowsPer, tokensPer := k.tc, 128, 64
 		if cudaPromptF32 || w.cols%64 != 0 {
@@ -196,6 +227,30 @@ func (b *cudaBatch) matmul(w *weight, x, out gpuRef, n int, act gpuRef) {
 	const rows = 4 * cudaMVRows // 4 warps per block
 	b.launch(k.matvec, [3]uint32{uint32((w.rows + rows - 1) / rows), uint32(n), 1}, [3]uint32{128, 1, 1}, 0,
 		b.weightArg(w), carg(x), carg(out), cuda.Arg{Bytes: u32(uint32(w.rows), uint32(w.cols/k.step), uint32(w.rowBytes), uint32(w.cols))})
+}
+
+// mmq runs a prompt matmul on the int8 tensor cores when the GPU has them and w is Q4_K: x is quantized into
+// act (once for matmuls sharing it), then multiplied with the weights' quants. It reports false to leave the matmul
+// to the half-precision kernels.
+func (b *cudaBatch) mmq(w *weight, x, out gpuRef, n int, act gpuRef) bool {
+	kernel := map[uint32]string{typeQ4_K: "matmul_q4k_mmq"}[w.typ] // Q8_0 measured no faster on an A16
+	qbytes := n * w.cols                                           // int8 quants, then a (scale, scaled sum) pair per 32
+	if b.c.mmaMod == nil || cudaNoMMQ || cudaPromptF32 || kernel == "" || w.cols%128 != 0 || act.buf == nil ||
+		act.buf.size()-act.off < qbytes+qbytes/32*8 {
+		return false
+	}
+	scales := act.at(qbytes)
+	q := &b.quantized
+	if q.kernel != "quant_act_mma" || q.x != x || q.act != act || q.n != n {
+		nblk := qbytes / 32
+		b.launch("quant_act_mma", [3]uint32{uint32((nblk + 31) / 32), 1, 1}, [3]uint32{256, 1, 1}, 0,
+			carg(x), carg(act), carg(scales), cuda.Arg{Bytes: u32(uint32(nblk))})
+		q.x, q.act, q.n, q.kernel = x, act, n, "quant_act_mma"
+	}
+	b.launch(kernel, [3]uint32{uint32((w.rows + 127) / 128), uint32((n + 63) / 64), 1}, [3]uint32{256, 1, 1}, 0,
+		b.weightArg(w), carg(act), carg(scales), carg(out),
+		cuda.Arg{Bytes: u32(uint32(w.rows), uint32(w.cols/32), uint32(w.rowBytes), uint32(w.cols), uint32(n))})
+	return true
 }
 
 // cudaMatmuls are each weight type's one-token and tiled kernels, and the elements per one-token step.

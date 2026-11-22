@@ -26,6 +26,9 @@ type gpuBackend interface {
 	// halfPrompts reports that prompt-sized matmuls round their inputs to half (tensor cores): about 4e-5 of a
 	// row's magnitude instead of f32's 1e-7, still far closer to the float reference than the CPU's 8-bit path.
 	halfPrompts() bool
+	// int8Prompts reports that prompt-sized matmuls of some weight types quantize their inputs to 8 bits (int8
+	// tensor cores), as the CPU's fast path does: about 1% of the logits' spread.
+	int8Prompts() bool
 	// loadWeights makes the model file's weights available to batches: zero-copy on unified memory,
 	// one upload otherwise. Called once, before any batch.
 	loadWeights(file []byte) error
