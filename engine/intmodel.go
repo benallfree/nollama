@@ -53,6 +53,8 @@ type IntModel struct {
 	ropeC, ropeS            []int16
 	expA, expF, sig         []int64
 	pool                    *pool
+	gpu                     *intMetal // nil: the CPU
+	gpuNote                 string    // why the CPU, when gpu is nil
 }
 
 func viewI8(b []byte) []int8 {
@@ -91,8 +93,47 @@ func i32to64(a []int32) []int64 {
 	return out
 }
 
-// LoadIntModel opens a converted model (GGUF, architecture "qwen2-intcodec"). threads <= 0 means all CPUs.
+// IntOptions are LoadIntModelOptions' settings.
+type IntOptions struct {
+	Threads int    // CPU threads; <= 0: all CPUs
+	GPU     string // "" or "auto": a GPU when one works (Metal); "off": the CPU. NOLLAMA_NO_GPU=1 also turns it off.
+}
+
+// LoadIntModel opens a converted model (GGUF, architecture "qwen2-intcodec") on a GPU when one works, else the CPU.
+// threads <= 0 means all CPUs.
 func LoadIntModel(path string, threads int) (*IntModel, error) {
+	return LoadIntModelOptions(path, IntOptions{Threads: threads})
+}
+
+// LoadIntModelOptions opens a converted model with options. The GPU and the CPU give the same distributions, bit for bit.
+func LoadIntModelOptions(path string, o IntOptions) (*IntModel, error) {
+	m, err := loadIntCPU(path, o.Threads)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case o.GPU == "off":
+		m.gpuNote = "GPU off"
+	default:
+		g, err := openIntMetal(m)
+		if err != nil {
+			m.gpuNote = err.Error()
+		} else {
+			m.gpu = g
+		}
+	}
+	return m, nil
+}
+
+// Device names where the model runs: a GPU ("metal (Apple M1 Max)") or "cpu (<why no GPU>)".
+func (m *IntModel) Device() string {
+	if m.gpu != nil {
+		return m.gpu.name()
+	}
+	return "cpu (" + m.gpuNote + ")"
+}
+
+func loadIntCPU(path string, threads int) (*IntModel, error) {
 	if !littleEndian() {
 		return nil, errors.New("intmodel: needs a little-endian CPU")
 	}
@@ -230,8 +271,14 @@ func newIntModel(g *ggufFile, path string, threads int) (*IntModel, error) {
 	return m, nil
 }
 
-// Close releases the model's file mapping.
-func (m *IntModel) Close() error { return m.g.close() }
+// Close releases the model's GPU state and file mapping.
+func (m *IntModel) Close() error {
+	if m.gpu != nil {
+		m.gpu.close()
+		m.gpu = nil
+	}
+	return m.g.close()
+}
 
 // ---- integer helpers (SPEC §2)
 

@@ -38,12 +38,18 @@ func intModelPath(t *testing.T, size string) string {
 	return p
 }
 
-func loadIntTest(t *testing.T, size string) *IntModel {
-	m, err := LoadIntModel(intModelPath(t, size), 0)
+func loadIntTest(t *testing.T, size string) *IntModel { return loadIntDev(t, size, "off") }
+
+// loadIntDev loads on the CPU (gpu "off") or a GPU ("auto"; the test skips when there is none).
+func loadIntDev(t *testing.T, size, gpu string) *IntModel {
+	m, err := LoadIntModelOptions(intModelPath(t, size), IntOptions{GPU: gpu})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { m.Close() })
+	if gpu != "off" && m.gpu == nil {
+		t.Skip("no GPU: ", m.Device())
+	}
 	return m
 }
 
@@ -88,28 +94,46 @@ func TestIntTokenizer(t *testing.T) {
 	}
 }
 
-func checkTables(t *testing.T, size string, input, tables string) {
-	m := loadIntTest(t, size)
+func checkTables(t *testing.T, size, gpu, input, tables string) {
+	m := loadIntDev(t, size, gpu)
 	ids := vecIDs(t, input)
 	var want []string
 	sc := bufio.NewScanner(bytes.NewReader(readVec(t, tables)))
 	for sc.Scan() {
 		want = append(want, strings.Fields(sc.Text())[1])
 	}
-	ses := m.NewSession(len(want))
+	ses, err := m.NewSession(len(want))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ses.Close()
 	prev := m.BOS()
 	t0 := time.Now()
 	for k, w := range want {
-		if got := tableHash(ses.Feed(prev)); got != w {
+		cum, err := ses.Feed(prev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := tableHash(cum); got != w {
 			t.Fatalf("position %d: table hash %s, want %s", k, got, w)
 		}
 		prev = ids[k]
 	}
-	t.Logf("%d tables match (%.1f ms/token)", len(want), float64(time.Since(t0).Milliseconds())/float64(len(want)))
+	t.Logf("%s: %d tables match (%.1f ms/token)", m.Device(), len(want), float64(time.Since(t0).Milliseconds())/float64(len(want)))
 }
 
-func TestIntTables05B(t *testing.T) { checkTables(t, "0.5B", "slice.ids.json", "m1-slice-tables.txt") }
-func TestIntTables15B(t *testing.T) { checkTables(t, "1.5B", "tiny.ids.json", "m2-tiny-tables.txt") }
+func TestIntTables05B(t *testing.T) {
+	checkTables(t, "0.5B", "off", "slice.ids.json", "m1-slice-tables.txt")
+}
+func TestIntTables05BGPU(t *testing.T) {
+	checkTables(t, "0.5B", "auto", "slice.ids.json", "m1-slice-tables.txt")
+}
+func TestIntTables15B(t *testing.T) {
+	checkTables(t, "1.5B", "off", "tiny.ids.json", "m2-tiny-tables.txt")
+}
+func TestIntTables15BGPU(t *testing.T) {
+	checkTables(t, "1.5B", "auto", "tiny.ids.json", "m2-tiny-tables.txt")
+}
 
 func TestIntDotRow(t *testing.T) {
 	r := rand.New(rand.NewSource(1))
