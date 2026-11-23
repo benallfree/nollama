@@ -47,6 +47,9 @@ Usage:
                                  compress text to file.13k with a converted model; any
                                  machine with nollama and that model unpacks it exactly
   nollama unpack file.13k        decompress (the archive names the model it needs)
+  nollama convert --profile good|better|best
+                                 make pack/unpack's model from the official Qwen2.5
+                                 weights (downloaded once; sha256 checked)
   nollama version
 
 Models: %s, hf:<org>/<repo>/<file>.gguf, or a path to a .gguf file.
@@ -91,6 +94,8 @@ func main() {
 		err = cmdPack(args)
 	case "unpack":
 		err = cmdUnpack(args)
+	case "convert":
+		err = cmdConvert(args)
 	case "version", "--version", "-v":
 		fmt.Println("nollama", version)
 	case "help", "-h", "--help":

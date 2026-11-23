@@ -22,8 +22,9 @@ func intModelFile(mi engine.IntModelInfo, override string) (string, error) {
 	}
 	p := filepath.Join(modelsDir(), mi.Bundle.File)
 	if _, err := os.Stat(p); err != nil {
-		return "", fmt.Errorf("model %d (%s, %s) is not in %s: put %s there, or pass --model", mi.ID, mi.Profile,
-			mi.Source.Repo, modelsDir(), mi.Bundle.File)
+		return "", fmt.Errorf("model %d (%s, from %s) is not in %s yet: run nollama convert --profile %s "+
+			"(downloads the official weights once and converts them), or pass --model", mi.ID, mi.Profile, mi.Source.Repo,
+			modelsDir(), mi.Profile)
 	}
 	return p, nil
 }

@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -203,3 +204,32 @@ func TestIntAttnKernels(t *testing.T) {
 		}
 	}
 }
+
+// TestIntConvert converts a Qwen2.5 bf16 snapshot directory (NOLLAMA_INTCODEC_SRC) and checks the result against the
+// manifest's SHA-256 (NOLLAMA_INTCODEC_SRC_ID names the model id, default 1).
+func TestIntConvert(t *testing.T) {
+	src := os.Getenv("NOLLAMA_INTCODEC_SRC")
+	if src == "" {
+		t.Skip("NOLLAMA_INTCODEC_SRC not set")
+	}
+	id := 1
+	if v := os.Getenv("NOLLAMA_INTCODEC_SRC_ID"); v != "" {
+		fmt.Sscan(v, &id)
+	}
+	mi, _ := IntModelByID(id)
+	dst := filepath.Join(t.TempDir(), mi.Bundle.File)
+	t0 := time.Now()
+	if err := ConvertIntModel(src, dst, nil); err != nil {
+		t.Fatal(err)
+	}
+	h, err := FileSHA256(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h != mi.Bundle.SHA256 {
+		t.Fatalf("converted %s: sha256 %s, want %s", mi.Bundle.File, h, mi.Bundle.SHA256)
+	}
+	t.Logf("%s: converted in %v, sha256 matches the manifest", mi.Bundle.File, time.Since(t0).Round(time.Second))
+}
+
+func TestIntArchive7BTiny(t *testing.T) { checkArchive(t, 3, "tiny.html", "m3-tiny.13k", true) }
