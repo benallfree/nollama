@@ -17,9 +17,10 @@ import (
 //go:embed gpu_int.metal
 var metalIntSource string
 
-var metalIntKernels = []string{"int_embed", "int_norm", "int_matvec", "int_qkv", "int_attn", "int_blockf", "int_mlp", "int_table"}
+var metalIntKernels = []string{"int_embed", "int_norm", "int_matvec", "int_qkv", "int_blockf", "int_mlp", "int_table1",
+	"int_table2", "int_table3", "int_table4", "int_attn1", "int_attn2", "int_attn3"}
 
-const intTG = 1024 // threads per threadgroup the single-group kernels assume
+const intTG = 1024 // threads per threadgroup int_qkv and int_blockf assume
 
 // intMetal is a model's Metal state: the device, its pipelines and the wrapped model file.
 type intMetal struct {
@@ -43,7 +44,7 @@ func openIntMetal(m *IntModel) (*intMetal, error) {
 		dev.Close()
 		return nil, err
 	}
-	for _, k := range []string{"int_norm", "int_qkv", "int_attn", "int_blockf", "int_table"} {
+	for _, k := range []string{"int_qkv", "int_blockf"} {
 		if ps[k].MaxThreads < intTG {
 			dev.Close()
 			return nil, fmt.Errorf("metal: %s runs at most %d threads per group, needs %d", k, ps[k].MaxThreads, intTG)
@@ -87,6 +88,11 @@ type intMetalState struct {
 	bufs   []*metal.Buffer
 }
 
+const (
+	intACH = 256  // positions per attention chunk (ACH in gpu_int.metal)
+	intTCH = 2048 // table values per threadgroup (TCH)
+)
+
 func (g *intMetal) newState(m *IntModel, maxlen int) (*intMetalState, error) {
 	s := &intMetalState{g: g, maxlen: maxlen}
 	nb := func(n int) (*metal.Buffer, error) {
@@ -100,13 +106,16 @@ func (g *intMetal) newState(m *IntModel, maxlen int) (*intMetalState, error) {
 	qkvN := (nq + 2*nkv) * hd
 	accN := max(qkvN, D, 2*I, V)
 	var err error
-	var h, mb, ex, acc, mq, shq, kc, vc, sb, o, p, lg, cum *metal.Buffer
+	maxch := (maxlen + intACH - 1) / intACH
+	tch := (V + intTCH - 1) / intTCH
+	var h, mb, ex, acc, mq, shq, kc, vc, sb, o, p, lg, cum, cmax, zpart, opart, tpart *metal.Buffer
 	for _, x := range []struct {
 		dst **metal.Buffer
 		n   int
 	}{{&s.params, 8}, {&h, 8 * D}, {&mb, 4 * max(D, I, nq*hd)}, {&ex, 16}, {&acc, 8 * accN}, {&mq, 4 * nq * hd},
-		{&shq, 4 * nq}, {&kc, 4 * L * nkv * maxlen * hd}, {&vc, 4 * L * nkv * maxlen * hd}, {&sb, 8 * nq * maxlen},
-		{&o, 8 * nq * hd}, {&p, 8 * I}, {&lg, 8 * V}, {&cum, 8 * V}} {
+		{&shq, 4 * nq}, {&kc, 4 * (L*nkv*maxlen + intACH) * hd}, {&vc, 4 * (L*nkv*maxlen + intACH) * hd}, {&sb, 8 * nq * maxlen},
+		{&o, 8 * nq * hd}, {&p, 8 * I}, {&lg, 8 * V}, {&cum, 8 * V}, {&cmax, 8 * nq * maxch}, {&zpart, 8 * nq * maxch},
+		{&opart, 8 * nq * maxch * hd}, {&tpart, 8 * 3 * tch}} {
 		if *x.dst, err = nb(x.n); err != nil {
 			s.release()
 			return nil, err
@@ -115,6 +124,19 @@ func (g *intMetal) newState(m *IntModel, maxlen int) (*intMetalState, error) {
 	s.cum = unsafe.Slice((*int64)(unsafe.Pointer(unsafe.SliceData(cum.Bytes()))), V)
 	B := func(b *metal.Buffer) metal.Arg { return metal.Arg{Buf: b} }
 	BO := func(b *metal.Buffer, off int) metal.Arg { return metal.Arg{Buf: b, Offset: off} }
+	// Constant arguments live in one buffer, 256-byte aligned, so every argument is a buffer and Run binds a
+	// dispatch's arguments in one call.
+	var consts []byte
+	constArg := func(b []byte) func(cb *metal.Buffer) metal.Arg {
+		off := len(consts)
+		consts = append(consts, b...)
+		consts = append(consts, make([]byte, (256-len(consts)%256)%256)...)
+		return func(cb *metal.Buffer) metal.Arg { return metal.Arg{Buf: cb, Offset: off} }
+	}
+	var pending []struct {
+		d, a int
+		f    func(*metal.Buffer) metal.Arg
+	}
 	C := func(vs ...int) metal.Arg { return metal.Arg{Bytes: i32b(vs...)} }
 	F := func(x any) metal.Arg {
 		switch v := x.(type) {
@@ -136,13 +158,19 @@ func (g *intMetal) newState(m *IntModel, maxlen int) (*intMetalState, error) {
 		return metal.Dispatch{P: g.ps[k], Args: args, Groups: metal.Size{W: uint((n + 255) / 256), H: 1, D: 1},
 			Threads: metal.Size{W: 256, H: 1, D: 1}}
 	}
+	tbl := func(k string, args ...metal.Arg) metal.Dispatch {
+		return metal.Dispatch{P: g.ps[k], Args: args, Groups: metal.Size{W: uint(tch), H: 1, D: 1},
+			Threads: metal.Size{W: 256, H: 1, D: 1}}
+	}
 	matvec := func(w *intMat, x *metal.Buffer, einSlot, to int, out *metal.Buffer) metal.Dispatch {
 		return metal.Dispatch{P: g.ps["int_matvec"], Args: []metal.Arg{F(w.q), F(w.s), B(x), B(out), B(ex),
 			C(w.out), C(w.in), C(w.e), C(einSlot), C(to)},
 			Groups: metal.Size{W: uint((w.out + 7) / 8), H: 1, D: 1}, Threads: metal.Size{W: 256, H: 1, D: 1}}
 	}
 	norm := func(add int, E, einSlot int, gw []int64) metal.Dispatch {
-		return one("int_norm", B(h), B(acc), F(gw), B(mb), B(ex), C(D), C(E), C(einSlot), C(0), C(add))
+		d := one("int_norm", B(h), B(acc), F(gw), B(mb), B(ex), C(D), C(E), C(einSlot), C(0), C(add))
+		d.Threads.W = 256
+		return d
 	}
 	qkvArgs := make([]byte, 24)
 	binary.LittleEndian.PutUint32(qkvArgs[0:], uint32(nq))
@@ -150,7 +178,7 @@ func (g *intMetal) newState(m *IntModel, maxlen int) (*intMetalState, error) {
 	binary.LittleEndian.PutUint32(qkvArgs[8:], uint32(hd))
 	binary.LittleEndian.PutUint32(qkvArgs[12:], uint32(maxlen))
 	binary.LittleEndian.PutUint64(qkvArgs[16:], uint64(m.sc))
-	attnArgs := i32b(nq, nkv, hd, maxlen, intNA)
+	attnArgs := i32b(nq, nkv, hd, maxlen, intNA, maxch)
 	kvLayer := 4 * nkv * maxlen * hd
 	rawA, rawF, rawS := m.g.Tensors["EXPA"].Data, m.g.Tensors["EXPF"].Data, m.g.Tensors["SIG"].Data
 
@@ -168,9 +196,17 @@ func (g *intMetal) newState(m *IntModel, maxlen int) (*intMetalState, error) {
 			matvec(&ly.qkv, mb, 0, -24, acc),
 			one("int_qkv", B(acc), F(ly.b), F(m.ropeC), F(m.ropeS), B(s.params), BO(kc, l*kvLayer), BO(vc, l*kvLayer),
 				B(mq), B(shq), B(ex), metal.Arg{Bytes: qkvArgs}, C(ly.qkv.e), C(0)),
-			metal.Dispatch{P: g.ps["int_attn"], Args: []metal.Arg{B(mq), B(shq), BO(kc, l*kvLayer), BO(vc, l*kvLayer),
-				F(rawA), B(sb), B(o), B(s.params), metal.Arg{Bytes: attnArgs}},
-				Groups: metal.Size{W: uint(nq), H: 1, D: 1}, Threads: metal.Size{W: intTG, H: 1, D: 1}},
+		)
+		ds = append(ds,
+			metal.Dispatch{P: g.ps["int_attn1"], Args: []metal.Arg{B(mq), B(shq), BO(kc, l*kvLayer), B(sb), B(cmax),
+				B(s.params), metal.Arg{Bytes: attnArgs}},
+				Groups: metal.Size{W: uint(nkv), H: 1, D: 1}, Threads: metal.Size{W: intACH, H: 1, D: 1}},
+			metal.Dispatch{P: g.ps["int_attn2"], Args: []metal.Arg{B(sb), B(cmax), BO(vc, l*kvLayer), F(rawA), B(zpart),
+				B(opart), B(s.params), metal.Arg{Bytes: attnArgs}},
+				Groups: metal.Size{W: uint(nkv), H: 1, D: 1}, Threads: metal.Size{W: intACH, H: 1, D: 1}},
+			metal.Dispatch{P: g.ps["int_attn3"], Args: []metal.Arg{B(zpart), B(opart), B(o), B(s.params),
+				metal.Arg{Bytes: attnArgs}},
+				Groups: metal.Size{W: uint(nq), H: 1, D: 1}, Threads: metal.Size{W: uint(hd), H: 1, D: 1}},
 			one("int_blockf", B(o), B(mb), B(ex), C(nq*hd), C(-24), C(1)),
 			matvec(&ly.o, mb, 1, -24, acc),
 			norm(1, ly.o.e, 1, ly.g2),
@@ -183,8 +219,33 @@ func (g *intMetal) newState(m *IntModel, maxlen int) (*intMetalState, error) {
 	}
 	ds = append(ds,
 		matvec(&m.head, mb, 0, -10, lg),
-		one("int_table", B(lg), F(rawF), B(cum), C(V), C(intNF)),
+		tbl("int_table1", B(lg), BO(tpart, 0), C(V)),
+		tbl("int_table2", B(lg), F(rawF), BO(tpart, 0), BO(tpart, 8*tch), B(cum), C(V), C(intNF)),
+		tbl("int_table3", BO(tpart, 8*tch), BO(tpart, 16*tch), B(cum), C(V)),
+		tbl("int_table4", BO(tpart, 16*tch), B(cum), C(V)),
 	)
+	// move the constant arguments into the constants buffer
+	for di := range ds {
+		for ai, a := range ds[di].Args {
+			if a.Buf == nil {
+				pending = append(pending, struct {
+					d, a int
+					f    func(*metal.Buffer) metal.Arg
+				}{di, ai, constArg(a.Bytes)})
+			}
+		}
+	}
+	cb, err := nb(len(consts))
+	if err != nil {
+		s.release()
+		return nil, err
+	}
+	copy(cb.Bytes(), consts)
+	for _, p := range pending {
+		args := append([]metal.Arg(nil), ds[p.d].Args...)
+		args[p.a] = p.f(cb)
+		ds[p.d].Args = args
+	}
 	s.ds = ds
 	return s, nil
 }
@@ -193,6 +254,13 @@ func (s *intMetalState) step(tok, pos int) error {
 	pb := s.params.Bytes()
 	binary.LittleEndian.PutUint32(pb[0:], uint32(tok))
 	binary.LittleEndian.PutUint32(pb[4:], uint32(pos))
+	nch := uint((pos + intACH) / intACH)
+	s1, s2 := s.g.ps["int_attn1"], s.g.ps["int_attn2"]
+	for i := range s.ds { // the split-attention grids follow the position
+		if p := s.ds[i].P; p == s1 || p == s2 {
+			s.ds[i].Groups.H = nch
+		}
+	}
 	return s.g.dev.Run(s.ds...)
 }
 

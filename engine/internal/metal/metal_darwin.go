@@ -18,6 +18,9 @@ import (
 // Size is MTLSize.
 type Size struct{ W, H, D uint }
 
+// nsRange is NSRange.
+type nsRange struct{ Loc, Len uint }
+
 var (
 	initOnce sync.Once
 	initErr  error
@@ -41,6 +44,7 @@ var (
 	selSetPipeline          = objc.RegisterName("setComputePipelineState:")
 	selSetBuffer            = objc.RegisterName("setBuffer:offset:atIndex:")
 	selSetBytes             = objc.RegisterName("setBytes:length:atIndex:")
+	selSetBuffers           = objc.RegisterName("setBuffers:offsets:withRange:")
 	selSetThreadgroupMemory = objc.RegisterName("setThreadgroupMemoryLength:atIndex:")
 	selDispatch             = objc.RegisterName("dispatchThreadgroups:threadsPerThreadgroup:")
 	selEndEncoding          = objc.RegisterName("endEncoding")
@@ -314,6 +318,8 @@ func (d *Device) Run(ds ...Dispatch) error {
 		// encoded (a decode step is hundreds of small dispatches, and encoding them takes milliseconds). The queue
 		// runs its buffers in order; waiting on the last one waits for all.
 		var cbs []objc.ID
+		var ids []objc.ID
+		var offs []uint
 		for start := 0; start < len(ds) || start == 0; start += runChunk {
 			cb := d.queue.Send(selCommandBuffer)
 			// A concurrent encoder: dispatches may overlap unless a barrier separates them (a serial encoder
@@ -343,10 +349,21 @@ func (d *Device) Run(ds ...Dispatch) error {
 					}
 				}
 				enc.Send(selSetPipeline, x.P.ps)
-				for i, a := range x.Args {
+				// Buffers in one call (each objc call costs encoding time, and a decode step has hundreds of
+				// dispatches); bytes, if any, then replace their slots.
+				ids, offs = ids[:0], offs[:0]
+				for _, a := range x.Args {
 					if a.Buf != nil {
-						enc.Send(selSetBuffer, a.Buf.buf, uint(a.Offset), uint(i))
+						ids, offs = append(ids, a.Buf.buf), append(offs, uint(a.Offset))
 					} else {
+						ids, offs = append(ids, 0), append(offs, 0)
+					}
+				}
+				if len(ids) > 0 {
+					enc.Send(selSetBuffers, unsafe.Pointer(&ids[0]), unsafe.Pointer(&offs[0]), nsRange{0, uint(len(ids))})
+				}
+				for i, a := range x.Args {
+					if a.Buf == nil {
 						enc.Send(selSetBytes, unsafe.Pointer(unsafe.SliceData(a.Bytes)), uint(len(a.Bytes)), uint(i))
 					}
 				}
@@ -376,4 +393,7 @@ func (d *Device) Run(ds ...Dispatch) error {
 }
 
 // runChunk is how many dispatches Run puts in one command buffer.
-const runChunk = 48
+var runChunk = 48
+
+// SetRunChunk sets how many dispatches Run puts in one command buffer (for measurements); it returns the old value.
+func SetRunChunk(n int) int { old := runChunk; runChunk = n; return old }

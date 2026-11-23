@@ -2,7 +2,10 @@ package engine
 
 import (
 	"testing"
+	"time"
 	"unsafe"
+
+	"github.com/benallfree/nollama/engine/internal/metal"
 )
 
 func i64s(b []byte, n int) []int64 { return unsafe.Slice((*int64)(unsafe.Pointer(&b[0])), n) }
@@ -40,7 +43,7 @@ func TestIntGPUStages(t *testing.T) {
 		}
 		t.Logf("%s: %d values match", name, len(want))
 	}
-	cmp32 := func(name string, got []int32, want []int16) {
+	cmp16 := func(name string, got []int16, want []int16) {
 		for i := range want {
 			if int64(got[i]) != int64(want[i]) {
 				t.Fatalf("%s: first difference at %d: gpu %d, cpu %d", name, i, got[i], want[i])
@@ -55,7 +58,7 @@ func TestIntGPUStages(t *testing.T) {
 	run(2)
 	copy(st.h, h)
 	e := m.rmsnorm(st.h, m.layers[0].g1, st.xm, st.y)
-	cmp32("norm m", i32s(B(2), D), st.xm)
+	cmp16("norm m", unsafe.Slice((*int16)(unsafe.Pointer(&B(2)[0])), D), st.xm)
 	if g := i32s(B(3), 4)[0]; int(g) != e {
 		t.Fatalf("norm exponent: gpu %d, cpu %d", g, e)
 	}
@@ -108,8 +111,8 @@ func TestIntGPUStages(t *testing.T) {
 	}
 	t.Logf("q mantissas: match")
 	// attention at position 0: one key, weight EXPA[0]; o = V * 2^12 exactly
-	gs.ds = all[:5]
-	run(5)
+	gs.ds = all[:7] // three split-attention passes
+	run(7)
 	go_ := i64s(B(10), nq*hd)
 	grp := nq / nkv
 	for i := 0; i < nq; i++ {
@@ -130,4 +133,154 @@ func abs64(v int64) int64 {
 		return -v
 	}
 	return v
+}
+
+// TestIntGPUProfile times one token's dispatch list, whole and without each kernel type, to see where time goes.
+func TestIntGPUProfile(t *testing.T) {
+	m := loadIntDev(t, "0.5B", "auto")
+	gs, err := m.gpu.newState(m, 32768)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gs.release()
+	all := gs.ds
+	tm := func(ds []metal.Dispatch) float64 {
+		gs.ds = ds
+		gs.step(m.BOS(), 500)
+		t0 := time.Now()
+		for i := 0; i < 30; i++ {
+			gs.step(m.BOS(), 500)
+		}
+		return float64(time.Since(t0).Microseconds()) / 30 / 1000
+	}
+	full := tm(all)
+	t.Logf("full step at position 500: %.2f ms (%d dispatches), GPU %.2f ms", full, len(all),
+		float64(m.gpu.dev.LastGPU.Microseconds())/1000)
+	for _, pos := range []int{100, 1000, 4000, 16000, 30000} {
+		if pos < gs.maxlen {
+			gs.ds = all
+			gs.step(m.BOS(), pos)
+			t0 := time.Now()
+			gs.step(m.BOS(), pos)
+			t.Logf("position %5d: %.2f ms, GPU %.2f ms", pos, float64(time.Since(t0).Microseconds())/1000,
+				float64(m.gpu.dev.LastGPU.Microseconds())/1000)
+		}
+	}
+	for _, k := range metalIntKernels {
+		var rest []metal.Dispatch
+		n := 0
+		for _, d := range all {
+			if d.P.Name == k {
+				n++
+				continue
+			}
+			rest = append(rest, d)
+		}
+		if n == 0 {
+			continue
+		}
+		t.Logf("without %-12s (%3d dispatches): %.2f ms  -> about %.2f ms", k, n, tm(rest), full-tm(rest))
+	}
+}
+
+// TestIntGPUFloor: the cost of a dependent dispatch, and each matvec's bandwidth.
+func TestIntGPUFloor(t *testing.T) {
+	m := loadIntDev(t, "0.5B", "auto")
+	gs, err := m.gpu.newState(m, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gs.release()
+	all := gs.ds
+	tm := func(ds []metal.Dispatch) float64 {
+		gs.ds = ds
+		gs.step(m.BOS(), 10)
+		best := 1e9
+		for i := 0; i < 10; i++ {
+			gs.step(m.BOS(), 10)
+			best = min(best, float64(m.gpu.dev.LastGPU.Microseconds()))
+		}
+		return best
+	}
+	byName := map[string][]metal.Dispatch{}
+	for _, d := range all {
+		byName[d.P.Name] = append(byName[d.P.Name], d)
+	}
+	rep := func(d metal.Dispatch, n int) []metal.Dispatch {
+		r := make([]metal.Dispatch, n)
+		for i := range r {
+			r[i] = d
+		}
+		return r
+	}
+	for _, k := range []string{"int_blockf", "int_norm", "int_qkv", "int_table1", "int_table2", "int_table3", "int_table4", "int_attn2"} {
+		d := byName[k][0]
+		t.Logf("%-12s x200: %.1f us each", k, tm(rep(d, 200))/200)
+	}
+	mv := byName["int_matvec"]
+	ly := &m.layers[0]
+	for i, w := range []*intMat{&ly.qkv, &ly.o, &ly.gu, &ly.d} {
+		us := tm(rep(mv[i], 100)) / 100
+		t.Logf("matvec %dx%d: %.1f us each, %.0f GB/s", w.out, w.in, us, float64(w.out*w.in)/us/1e3)
+	}
+	us := tm(rep(mv[len(mv)-1], 20)) / 20
+	t.Logf("head %dx%d: %.1f us, %.0f GB/s", m.head.out, m.head.in, us, float64(m.head.out*m.head.in)/us/1e3)
+}
+
+// TestIntGPUEncode: how long encoding a token's dispatches takes, against the GPU's own time.
+func TestIntGPUEncode(t *testing.T) {
+	m := loadIntDev(t, "0.5B", "auto")
+	gs, err := m.gpu.newState(m, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gs.release()
+	for _, ch := range []int{48, 100000} {
+		old := metal.SetRunChunk(ch)
+		gs.step(m.BOS(), 10)
+		var wall, gpu float64
+		for i := 0; i < 20; i++ {
+			t0 := time.Now()
+			gs.step(m.BOS(), 10)
+			wall += float64(time.Since(t0).Microseconds()) / 20
+			gpu += float64(m.gpu.dev.LastGPU.Microseconds()) / 20
+		}
+		metal.SetRunChunk(old)
+		t.Logf("chunk %6d: wall %.0f us, gpu %.0f us (%d dispatches)", ch, wall, gpu, len(gs.ds))
+	}
+}
+
+// TestIntGPUAttnLong times the attention passes at long positions.
+func TestIntGPUAttnLong(t *testing.T) {
+	m := loadIntDev(t, "0.5B", "auto")
+	gs, err := m.gpu.newState(m, 32768)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gs.release()
+	all := gs.ds
+	for _, pos := range []int{1000, 8000, 16000, 30000} {
+		for _, k := range []string{"int_attn1", "int_attn2", "int_attn3"} {
+			var d metal.Dispatch
+			for _, x := range all {
+				if x.P.Name == k {
+					d = x
+					break
+				}
+			}
+			r := make([]metal.Dispatch, 50)
+			for i := range r {
+				r[i] = d
+			}
+			gs.ds = r
+			gs.step(m.BOS(), pos)
+			best := 1e9
+			for i := 0; i < 5; i++ {
+				gs.step(m.BOS(), pos)
+				best = min(best, float64(m.gpu.dev.LastGPU.Microseconds())/50)
+			}
+			t.Logf("pos %5d %s: %.1f us", pos, k, best)
+		}
+	}
+	gs.ds = all
 }
