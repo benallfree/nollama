@@ -8,12 +8,15 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"github.com/benallfree/nollama/engine/internal/metal"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // The integer model's conformance tests need the converted models (GGUF, 0.5 to 8 GB): set NOLLAMA_INTMODEL_DIR to
@@ -216,4 +219,122 @@ func TestIntConvert(t *testing.T) {
 		t.Fatalf("converted %s: sha256 %s, want %s", want.file, h, want.sha256)
 	}
 	t.Logf("%s: converted in %v, sha256 matches", want.file, time.Since(t0).Round(time.Second))
+}
+
+// checkBatch: FeedBatch's counts equal those of stepping one token at a time (on the same device).
+func checkBatch(t *testing.T, size, input string, n int) {
+	m := loadIntDev(t, size, "auto")
+	if m.gpu == nil {
+		t.Skip("no GPU")
+	}
+	ids := vecIDs(t, input)
+	if n > 0 && n < len(ids) {
+		ids = ids[:n]
+	}
+	toks := append([]int{m.BOS()}, ids[:len(ids)-1]...)
+	a, err := m.NewSession(len(ids))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	t0 := time.Now()
+	got, err := a.FeedBatch(toks, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tb := time.Since(t0)
+	b, err := m.NewSession(len(ids))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	t0 = time.Now()
+	for k, tok := range toks {
+		cum, err := b.Feed(tok)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w := countOf(cum, ids[k]); got[k] != w {
+			t.Fatalf("position %d: batch %+v, step %+v", k, got[k], w)
+		}
+	}
+	t.Logf("%s, %d positions: batch %.2f s (%.0f tok/s), step %.2f s", m.Device(), len(ids), tb.Seconds(),
+		float64(len(ids))/tb.Seconds(), time.Since(t0).Seconds())
+}
+
+func TestIntBatch05B(t *testing.T) { checkBatch(t, "0.5B", "slice.ids.json", 0) }
+func TestIntBatch15B(t *testing.T) { checkBatch(t, "1.5B", "slice.ids.json", 600) }
+func TestIntBatch7B(t *testing.T)  { checkBatch(t, "7B", "slice.ids.json", 100) }
+
+// TestIntBatchBJJ times FeedBatch over the whole BJJ input (no comparison; signal's vector test checks the archive).
+func TestIntBatchBJJ(t *testing.T) {
+	m := loadIntDev(t, "0.5B", "auto")
+	ids := vecIDs(t, "bjj.ids.json")
+	toks := append([]int{m.BOS()}, ids[:len(ids)-1]...)
+	a, err := m.NewSession(len(ids))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	t0 := time.Now()
+	for k := 0; k < len(ids); k += 4096 {
+		e := min(k+4096, len(ids))
+		if _, err := a.FeedBatch(toks[k:e], ids[k:e]); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("%5d: %.1f s, GPU %.1f s, slow batches %d", e, time.Since(t0).Seconds(), intBatchGPU.Seconds(), intBatchSlow)
+	}
+}
+
+// TestIntBatchBJJProfile: after BJJ's batches, one batch at position 23000 (real keys and values), kernel by kernel.
+func TestIntBatchBJJProfile(t *testing.T) {
+	m := loadIntDev(t, "0.5B", "auto")
+	ids := vecIDs(t, "bjj.ids.json")
+	toks := append([]int{m.BOS()}, ids[:len(ids)-1]...)
+	a, err := m.NewSession(len(ids))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if _, err := a.FeedBatch(toks, ids); err != nil {
+		t.Fatal(err)
+	}
+	gs := a.g
+	b := gs.b
+	pos, R := 23000, b.P
+	tk := unsafe.Slice((*int32)(unsafe.Pointer(unsafe.SliceData(b.toks.Bytes()))), R)
+	tg := unsafe.Slice((*int32)(unsafe.Pointer(unsafe.SliceData(b.tgt.Bytes()))), R)
+	for i := range R {
+		tk[i], tg[i] = int32(toks[pos+i]), int32(ids[pos+i])
+	}
+	binary.LittleEndian.PutUint32(b.params.Bytes()[0:], uint32(R))
+	binary.LittleEndian.PutUint32(b.params.Bytes()[4:], uint32(pos))
+	nch := uint((pos+R-1)/intKC + 1)
+	ds := append([]metal.Dispatch(nil), b.ds...)
+	for i := range ds {
+		switch b.kind[i] {
+		case scoreG:
+			ds[i].Groups.H, ds[i].Groups.D = uint((R+b.scoreBR-1)/b.scoreBR), nch
+		case pvG:
+			ds[i].Groups.H, ds[i].Groups.D = uint((R+b.pvBR-1)/b.pvBR), nch
+		}
+	}
+	for _, h := range b.head {
+		ds = append(ds, h[0], h[1])
+	}
+	run := func(ds []metal.Dispatch) float64 {
+		gs.g.dev.Run(ds...)
+		return float64(gs.g.dev.LastGPU.Microseconds()) / 1000
+	}
+	line := ""
+	for _, k := range []string{"int_gemm", "int_bscores64", "int_bpv64", "int_bcomb", "int_counts", "int_norm", "int_qkv"} {
+		var sub []metal.Dispatch
+		for _, d := range ds {
+			if d.P.Name == k {
+				sub = append(sub, d)
+			}
+		}
+		line += fmt.Sprintf(" %s %.0f", k, run(sub))
+	}
+	t.Logf("pos %d, %d rows: %.0f ms |%s", pos, R, run(ds), line)
 }

@@ -66,6 +66,46 @@ func (s *IntSession) Reset() {
 // Pos is the number of tokens fed so far.
 func (s *IntSession) Pos() int { return s.pos }
 
+// IntCount is one position's counts for a known next token t: the coder's interval [Low, High) out of Total, where
+// High = cum[t], Low = cum[t-1] (0 for t = 0) and Total = cum[VocabSize-1] (see Feed).
+type IntCount struct{ Total, High, Low int64 }
+
+// FeedBatch adds toks to the context and returns, for each, the counts of next[i] (the token that follows it):
+// the numbers Feed's tables give, computed many positions at a time when the device can (a GPU), so compression,
+// which knows every token in advance, needn't go one token at a time.
+func (s *IntSession) FeedBatch(toks, next []int) ([]IntCount, error) {
+	if len(next) != len(toks) {
+		return nil, errors.New("intmodel: FeedBatch needs one next token per token")
+	}
+	if s.pos+len(toks) > s.maxlen {
+		return nil, errors.New("intmodel: context full")
+	}
+	out := make([]IntCount, len(toks))
+	if s.g != nil {
+		if err := s.g.feedBatch(toks, next, s.pos, out); err != nil {
+			return nil, err
+		}
+		s.pos += len(toks)
+		return out, nil
+	}
+	for i, t := range toks {
+		cum, err := s.Feed(t)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = countOf(cum, next[i])
+	}
+	return out, nil
+}
+
+func countOf(cum []int64, t int) IntCount {
+	c := IntCount{Total: cum[len(cum)-1], High: cum[t]}
+	if t > 0 {
+		c.Low = cum[t-1]
+	}
+	return c
+}
+
 // Feed adds a token to the context and returns the next token's distribution as cumulative counts: token t has
 // count cum[t] - cum[t-1] (cum[-1] = 0), and cum[VocabSize-1] is the total. The slice is reused by the next Feed.
 func (s *IntSession) Feed(tok int) ([]int64, error) {

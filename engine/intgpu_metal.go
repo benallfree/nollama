@@ -18,7 +18,8 @@ import (
 var metalIntSource string
 
 var metalIntKernels = []string{"int_embed", "int_norm", "int_matvec", "int_qkv", "int_blockf", "int_mlp", "int_table1",
-	"int_table2", "int_table3", "int_table4", "int_attn1", "int_attn2", "int_attn3"}
+	"int_table2", "int_table3", "int_table4", "int_attn1", "int_attn2", "int_attn3", "int_gemm", "int_attnb64", "int_attnb128",
+	"int_counts", "int_bscores64", "int_bscores128", "int_bpv64", "int_bpv128", "int_bcomb"}
 
 const intTG = 1024 // threads per threadgroup int_qkv and int_blockf assume
 
@@ -44,7 +45,7 @@ func openIntMetal(m *IntModel) (*intMetal, error) {
 		dev.Close()
 		return nil, err
 	}
-	for _, k := range []string{"int_qkv", "int_blockf"} {
+	for _, k := range []string{"int_qkv", "int_blockf", "int_counts"} {
 		if ps[k].MaxThreads < intTG {
 			dev.Close()
 			return nil, fmt.Errorf("metal: %s runs at most %d threads per group, needs %d", k, ps[k].MaxThreads, intTG)
@@ -86,6 +87,11 @@ type intMetalState struct {
 	cum    []int64       // the table, as the CPU sees it
 	ds     []metal.Dispatch
 	bufs   []*metal.Buffer
+	// kept for batches (intgpu_batch.go)
+	m       *IntModel
+	kc, vc  *metal.Buffer
+	kvLayer int
+	b       *intBatch
 }
 
 const (
@@ -94,14 +100,8 @@ const (
 )
 
 func (g *intMetal) newState(m *IntModel, maxlen int) (*intMetalState, error) {
-	s := &intMetalState{g: g, maxlen: maxlen}
-	nb := func(n int) (*metal.Buffer, error) {
-		b, err := g.dev.NewBuffer(max(n, 16))
-		if err == nil {
-			s.bufs = append(s.bufs, b)
-		}
-		return b, err
-	}
+	s := &intMetalState{g: g, maxlen: maxlen, m: m}
+	nb := s.newBuffer
 	D, I, V, hd, nq, nkv, L := m.D, m.I, m.V, m.hd, m.nq, m.nkv, m.L
 	qkvN := (nq + 2*nkv) * hd
 	accN := max(qkvN, D, 2*I, V)
@@ -124,33 +124,7 @@ func (g *intMetal) newState(m *IntModel, maxlen int) (*intMetalState, error) {
 	s.cum = unsafe.Slice((*int64)(unsafe.Pointer(unsafe.SliceData(cum.Bytes()))), V)
 	B := func(b *metal.Buffer) metal.Arg { return metal.Arg{Buf: b} }
 	BO := func(b *metal.Buffer, off int) metal.Arg { return metal.Arg{Buf: b, Offset: off} }
-	// Constant arguments live in one buffer, 256-byte aligned, so every argument is a buffer and Run binds a
-	// dispatch's arguments in one call.
-	var consts []byte
-	constArg := func(b []byte) func(cb *metal.Buffer) metal.Arg {
-		off := len(consts)
-		consts = append(consts, b...)
-		consts = append(consts, make([]byte, (256-len(consts)%256)%256)...)
-		return func(cb *metal.Buffer) metal.Arg { return metal.Arg{Buf: cb, Offset: off} }
-	}
-	var pending []struct {
-		d, a int
-		f    func(*metal.Buffer) metal.Arg
-	}
-	C := func(vs ...int) metal.Arg { return metal.Arg{Bytes: i32b(vs...)} }
-	F := func(x any) metal.Arg {
-		switch v := x.(type) {
-		case []int8:
-			return g.file(unsafe.Pointer(unsafe.SliceData(v)))
-		case []int16:
-			return g.file(unsafe.Pointer(unsafe.SliceData(v)))
-		case []int64:
-			return g.file(unsafe.Pointer(unsafe.SliceData(v)))
-		case []byte:
-			return g.file(unsafe.Pointer(unsafe.SliceData(v)))
-		}
-		panic("intmetal: unknown file slice")
-	}
+	C, F := cArg, g.farg
 	one := func(k string, args ...metal.Arg) metal.Dispatch {
 		return metal.Dispatch{P: g.ps[k], Args: args, Groups: metal.Size{W: 1, H: 1, D: 1}, Threads: metal.Size{W: intTG, H: 1, D: 1}}
 	}
@@ -168,7 +142,7 @@ func (g *intMetal) newState(m *IntModel, maxlen int) (*intMetalState, error) {
 			Groups: metal.Size{W: uint((w.out + 7) / 8), H: 1, D: 1}, Threads: metal.Size{W: 256, H: 1, D: 1}}
 	}
 	norm := func(add int, E, einSlot int, gw []int64) metal.Dispatch {
-		d := one("int_norm", B(h), B(acc), F(gw), B(mb), B(ex), C(D), C(E), C(einSlot), C(0), C(add))
+		d := one("int_norm", B(h), B(acc), F(gw), B(mb), B(ex), C(D), C(E), C(einSlot), C(0), C(add), C(0, 0))
 		d.Threads.W = 256
 		return d
 	}
@@ -180,6 +154,7 @@ func (g *intMetal) newState(m *IntModel, maxlen int) (*intMetalState, error) {
 	binary.LittleEndian.PutUint64(qkvArgs[16:], uint64(m.sc))
 	attnArgs := i32b(nq, nkv, hd, maxlen, intNA, maxch)
 	kvLayer := 4 * nkv * maxlen * hd
+	s.kc, s.vc, s.kvLayer = kc, vc, kvLayer
 	rawA, rawF, rawS := m.g.Tensors["EXPA"].Data, m.g.Tensors["EXPF"].Data, m.g.Tensors["SIG"].Data
 
 	ds := []metal.Dispatch{
@@ -195,7 +170,7 @@ func (g *intMetal) newState(m *IntModel, maxlen int) (*intMetalState, error) {
 		ds = append(ds,
 			matvec(&ly.qkv, mb, 0, -24, acc),
 			one("int_qkv", B(acc), F(ly.b), F(m.ropeC), F(m.ropeS), B(s.params), BO(kc, l*kvLayer), BO(vc, l*kvLayer),
-				B(mq), B(shq), B(ex), metal.Arg{Bytes: qkvArgs}, C(ly.qkv.e), C(0)),
+				B(mq), B(shq), B(ex), metal.Arg{Bytes: qkvArgs}, C(ly.qkv.e), C(0), C(0)),
 		)
 		ds = append(ds,
 			metal.Dispatch{P: g.ps["int_attn1"], Args: []metal.Arg{B(mq), B(shq), BO(kc, l*kvLayer), B(sb), B(cmax),
@@ -207,12 +182,12 @@ func (g *intMetal) newState(m *IntModel, maxlen int) (*intMetalState, error) {
 			metal.Dispatch{P: g.ps["int_attn3"], Args: []metal.Arg{B(zpart), B(opart), B(o), B(s.params),
 				metal.Arg{Bytes: attnArgs}},
 				Groups: metal.Size{W: uint(nq), H: 1, D: 1}, Threads: metal.Size{W: uint(hd), H: 1, D: 1}},
-			one("int_blockf", B(o), B(mb), B(ex), C(nq*hd), C(-24), C(1)),
+			one("int_blockf", B(o), B(mb), B(ex), C(nq*hd), C(-24), C(1), C(0, 0)),
 			matvec(&ly.o, mb, 1, -24, acc),
 			norm(1, ly.o.e, 1, ly.g2),
 			matvec(&ly.gu, mb, 0, -16, acc),
-			grid("int_mlp", I, B(acc), F(rawS), B(p), B(ex), C(I), C(ly.gu.e), C(0)),
-			one("int_blockf", B(p), B(mb), B(ex), C(I), C(-16), C(2)),
+			grid("int_mlp", I, B(acc), F(rawS), B(p), B(ex), C(I), C(ly.gu.e), C(0), C(0, 0)),
+			one("int_blockf", B(p), B(mb), B(ex), C(I), C(-16), C(2), C(0, 0)),
 			matvec(&ly.d, mb, 2, -24, acc),
 			norm(1, ly.d.e, 2, next),
 		)
@@ -224,30 +199,65 @@ func (g *intMetal) newState(m *IntModel, maxlen int) (*intMetalState, error) {
 		tbl("int_table3", BO(tpart, 8*tch), BO(tpart, 16*tch), B(cum), C(V)),
 		tbl("int_table4", BO(tpart, 16*tch), B(cum), C(V)),
 	)
-	// move the constant arguments into the constants buffer
-	for di := range ds {
-		for ai, a := range ds[di].Args {
-			if a.Buf == nil {
-				pending = append(pending, struct {
-					d, a int
-					f    func(*metal.Buffer) metal.Arg
-				}{di, ai, constArg(a.Bytes)})
-			}
-		}
-	}
-	cb, err := nb(len(consts))
-	if err != nil {
+	if err := s.constify(ds); err != nil {
 		s.release()
 		return nil, err
 	}
-	copy(cb.Bytes(), consts)
-	for _, p := range pending {
-		args := append([]metal.Arg(nil), ds[p.d].Args...)
-		args[p.a] = p.f(cb)
-		ds[p.d].Args = args
-	}
 	s.ds = ds
 	return s, nil
+}
+
+func (s *intMetalState) newBuffer(n int) (*metal.Buffer, error) {
+	b, err := s.g.dev.NewBuffer(max(n, 16))
+	if err == nil {
+		s.bufs = append(s.bufs, b)
+	}
+	return b, err
+}
+
+func cArg(vs ...int) metal.Arg { return metal.Arg{Bytes: i32b(vs...)} }
+
+// farg is a kernel argument pointing at a slice of the model file.
+func (g *intMetal) farg(x any) metal.Arg {
+	switch v := x.(type) {
+	case []int8:
+		return g.file(unsafe.Pointer(unsafe.SliceData(v)))
+	case []int16:
+		return g.file(unsafe.Pointer(unsafe.SliceData(v)))
+	case []int64:
+		return g.file(unsafe.Pointer(unsafe.SliceData(v)))
+	case []byte:
+		return g.file(unsafe.Pointer(unsafe.SliceData(v)))
+	}
+	panic("intmetal: unknown file slice")
+}
+
+// constify moves the dispatches' constant arguments into one buffer (256-byte aligned), so every argument is a
+// buffer and Run binds a dispatch's arguments in one call.
+func (s *intMetalState) constify(ds []metal.Dispatch) error {
+	var consts []byte
+	type slot struct{ d, a, off int }
+	var slots []slot
+	for di := range ds {
+		for ai, a := range ds[di].Args {
+			if a.Buf == nil {
+				slots = append(slots, slot{di, ai, len(consts)})
+				consts = append(consts, a.Bytes...)
+				consts = append(consts, make([]byte, (256-len(consts)%256)%256)...)
+			}
+		}
+	}
+	cb, err := s.newBuffer(len(consts))
+	if err != nil {
+		return err
+	}
+	copy(cb.Bytes(), consts)
+	for _, sl := range slots {
+		args := append([]metal.Arg(nil), ds[sl.d].Args...)
+		args[sl.a] = metal.Arg{Buf: cb, Offset: sl.off}
+		ds[sl.d].Args = args
+	}
+	return nil
 }
 
 func (s *intMetalState) step(tok, pos int) error {

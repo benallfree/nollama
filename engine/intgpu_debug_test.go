@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"encoding/binary"
+	"fmt"
 	"testing"
 	"time"
 	"unsafe"
@@ -283,4 +285,59 @@ func TestIntGPUAttnLong(t *testing.T) {
 		}
 	}
 	gs.ds = all
+}
+
+// TestIntBatchProfile: GPU time of one full batch at several positions, and per kernel.
+func TestIntBatchProfile(t *testing.T) {
+	m := loadIntDev(t, "0.5B", "auto")
+	gs, err := m.gpu.newState(m, 32768)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gs.release()
+	P := 64
+	toks, next := make([]int, P), make([]int, P)
+	out := make([]IntCount, P)
+	if err := gs.feedBatch(toks, next, 0, out); err != nil {
+		t.Fatal(err)
+	}
+	b := gs.b
+	P = b.P
+	binary.LittleEndian.PutUint32(b.params.Bytes()[0:], uint32(P))
+	all := append([]metal.Dispatch(nil), b.ds...)
+	for _, h := range b.head {
+		all = append(all, h[0], h[1])
+	}
+	run := func(ds []metal.Dispatch) float64 {
+		gs.g.dev.Run(ds...)
+		best := 1e9
+		for i := 0; i < 3; i++ {
+			gs.g.dev.Run(ds...)
+			best = min(best, float64(m.gpu.dev.LastGPU.Microseconds())/1000)
+		}
+		return best
+	}
+	for _, pos := range []int{16000} {
+		binary.LittleEndian.PutUint32(b.params.Bytes()[4:], uint32(pos))
+		nch := uint((pos+P-1)/intKC + 1)
+		for i := range all {
+			if i < len(b.kind) && (b.kind[i] == scoreG || b.kind[i] == pvG) {
+				all[i].Groups.D = nch
+				br := map[int]int{scoreG: b.scoreBR, pvG: b.pvBR}[b.kind[i]]
+				all[i].Groups.H = uint((P + br - 1) / br)
+			}
+		}
+		full := run(all)
+		line := ""
+		for _, k := range []string{"int_gemm", "int_bscores64", "int_bpv64", "int_bcomb", "int_counts", "int_norm", "int_qkv", "int_blockf", "int_mlp", "int_embed"} {
+			var sub []metal.Dispatch
+			for _, d := range all {
+				if d.P.Name == k {
+					sub = append(sub, d)
+				}
+			}
+			line += fmt.Sprintf(" %s %.1f", k, run(sub))
+		}
+		t.Logf("pos %5d: batch of %d %.1f ms (%.0f tok/s) |%s", pos, P, full, float64(P)/full*1000, line)
+	}
 }
