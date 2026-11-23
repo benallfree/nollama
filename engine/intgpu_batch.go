@@ -30,6 +30,7 @@ const (
 	scoreG          // int_bscores*: H = ceil(rows / rows per block), D = chunks
 	pvG             // int_bpv*: H = ceil(rows / BRV), D = chunks
 	battnG          // int_battn*: W = ceil(rows / 8)
+	gemm2H          // int_gemm_mma2: H = ceil(rows / 64)
 	fixedDim        // no change
 )
 
@@ -107,13 +108,21 @@ func (s *intGPUState) newBatch() (*intBatch, error) {
 			Threads: isize{W: uint(threads), H: 1, D: 1}})
 	}
 	gemmD := func(w *intMat, x iarg, exA iarg, einSlot, to int, out iarg, outS, rows int) idisp {
-		return idisp{K: "int_gemm", Args: []iarg{F(w.q), F(w.s), x, out, exA, C(w.out), C(w.in),
+		d := idisp{K: "int_gemm", Args: []iarg{F(w.q), F(w.s), x, out, exA, C(w.out), C(w.in),
 			C(w.e), C(einSlot), C(to), C(0, mN, outS, 0)},
 			Groups:  isize{W: uint((w.out + 63) / 64), H: uint((rows + intGemmRows - 1) / intGemmRows), D: 1},
 			Threads: isize{W: 256, H: 1, D: 1}}
+		if s.kp != nil && os.Getenv("NOLLAMA_INT_GEMM2") != "" { // experiment: 128 x 64 tiles (slower so far)
+			d.K, d.Groups.W, d.Groups.H = "int_gemm_mma2", uint((w.out+127)/128), uint((rows+63)/64)
+		}
+		return d
 	}
 	gemm := func(w *intMat, einSlot, to int, out ibuf, outS int) {
-		add(gemmH, gemmD(w, B(mb), B(ex), einSlot, to, B(out), outS, P))
+		k := gemmH
+		if s.kp != nil && os.Getenv("NOLLAMA_INT_GEMM2") != "" {
+			k = gemm2H
+		}
+		add(k, gemmD(w, B(mb), B(ex), einSlot, to, B(out), outS, P))
 	}
 	norm := func(addv, E, einSlot int, gw []int64) {
 		perRow("int_norm", 256, B(h), B(acc), F(gw), B(mb), B(ex), C(D), C(E), C(einSlot), C(0), C(addv), C(accN, mN))
@@ -304,12 +313,18 @@ func (s *intGPUState) runBatch(list []idisp, kind []int, R int, nch uint, ds []i
 			ds[i].Groups.H, ds[i].Groups.D = uint((R+b.pvBR-1)/b.pvBR), nch
 		case battnG:
 			ds[i].Groups.W = uint((R + 7) / 8)
+		case gemm2H:
+			ds[i].Groups.H = uint((R + 63) / 64)
 		}
 	}
 	for hb := 0; hb*intHeadRows < R; hb++ {
 		n := min(intHeadRows, R-hb*intHeadRows)
 		gm, ct := b.head[hb][0], b.head[hb][1]
-		gm.Groups.H = uint((n + intGemmRows - 1) / intGemmRows)
+		if gm.K == "int_gemm_mma2" {
+			gm.Groups.H = uint((n + 63) / 64)
+		} else {
+			gm.Groups.H = uint((n + intGemmRows - 1) / intGemmRows)
+		}
 		ct.Groups.W = uint(n)
 		ds = append(ds, gm, ct)
 	}

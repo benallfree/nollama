@@ -55,3 +55,5 @@ type Graph struct{}
 func (d *Device) Record(ls ...Launch) (*Graph, error) { return nil, errNo }
 func (g *Graph) Replay() error                        { return errNo }
 func (g *Graph) Destroy()                             {}
+
+func (d *Device) Profile(on bool) {}

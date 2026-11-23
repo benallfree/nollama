@@ -12,6 +12,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -389,4 +390,38 @@ func TestIntFeedThenBatch(t *testing.T) {
 		}
 	}
 	t.Logf("%s: 300 steps then a batch of 600 match steps", m.Device())
+}
+
+// TestIntBatchNcu feeds BJJ up to INTNCU positions, then runs one batch with the CUDA profiler collecting (for
+// ncu --profile-from-start off).
+func TestIntBatchNcu(t *testing.T) {
+	at, err := strconv.Atoi(os.Getenv("INTNCU"))
+	if err != nil {
+		t.Skip("set INTNCU=<position>")
+	}
+	size := os.Getenv("INTMODEL")
+	if size == "" {
+		size = "0.5B"
+	}
+	m := loadIntDev(t, size, "auto")
+	ids := vecIDs(t, "bjj.ids.json")
+	toks := append([]int{m.BOS()}, ids[:len(ids)-1]...)
+	a, err := m.NewSession(len(ids))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if _, err := a.FeedBatch(toks[:at], ids[:at]); err != nil {
+		t.Fatal(err)
+	}
+	cd, ok := a.g.g.dev.(*cudaIntDev)
+	if !ok {
+		t.Skip("not CUDA")
+	}
+	cd.dev.Profile(true)
+	_, err = a.FeedBatch(toks[at:at+512], ids[at:at+512])
+	cd.dev.Profile(false)
+	if err != nil {
+		t.Fatal(err)
+	}
 }

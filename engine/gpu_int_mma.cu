@@ -377,59 +377,45 @@ static __device__ __forceinline__ void bmax_mma(const int *mq, const int *shq, l
 			}
 		}
 		__syncthreads();
-		long acc[NPW][4];
+		// one key tile (8 keys) at a time: its 6 plane pairs in 4 int64s, used at once (few registers live)
 		for (int n = 0; n < NPW; n++) {
+			int key = (nw * NPW + n) * 8 + gid;
+			// the 6 plane pairs as independent accumulators, interleaved (their tensor-core operations overlap)
+			int cc[6][4] = {{0}};
+#pragma unroll
+			for (int kd = 0; kd < HD; kd += 32) {
+				uint af[2][4], bf[3][2];
+#pragma unroll
+				for (int pa = 0; pa < 2; pa++) {
+					const unsigned char *A = qp + pa * QR * LD;
+					af[pa][0] = *(const uint *)(A + qrA * LD + kd + tig * 4);
+					af[pa][1] = *(const uint *)(A + qrB * LD + kd + tig * 4);
+					af[pa][2] = *(const uint *)(A + qrA * LD + kd + 16 + tig * 4);
+					af[pa][3] = *(const uint *)(A + qrB * LD + kd + 16 + tig * 4);
+				}
+#pragma unroll
+				for (int pb = 0; pb < 3; pb++) {
+					const unsigned char *B = kp + pb * KT * LD + key * LD + kd + tig * 4;
+					bf[pb][0] = *(const uint *)B;
+					bf[pb][1] = *(const uint *)(B + 16);
+				}
+				mma8<false, false>(cc[0], af[0], bf[0]);
+				mma8<false, false>(cc[1], af[0], bf[1]);
+				mma8<false, true>(cc[2], af[0], bf[2]);
+				mma8<true, false>(cc[3], af[1], bf[0]);
+				mma8<true, false>(cc[4], af[1], bf[1]);
+				mma8<true, true>(cc[5], af[1], bf[2]);
+			}
+			long a4[4];
 			for (int e = 0; e < 4; e++) {
-				acc[n][e] = 0;
+				a4[e] = (long)cc[0][e] + ((long)cc[1][e] << 8) + ((long)cc[2][e] << 16) + ((long)cc[3][e] << 8) +
+				        ((long)cc[4][e] << 16) + ((long)cc[5][e] << 24);
 			}
-		}
-#pragma unroll
-		for (int pa = 0; pa < 2; pa++) {
-#pragma unroll
-			for (int pb = 0; pb < 3; pb++) {
-				int cc[NPW][4];
-				for (int n = 0; n < NPW; n++) {
-					for (int e = 0; e < 4; e++) {
-						cc[n][e] = 0;
-					}
-				}
-				const unsigned char *A = qp + pa * QR * LD, *B = kp + pb * KT * LD;
-#pragma unroll
-				for (int kd = 0; kd < HD; kd += 32) {
-					uint af[4];
-					af[0] = *(const uint *)(A + qrA * LD + kd + tig * 4);
-					af[1] = *(const uint *)(A + qrB * LD + kd + tig * 4);
-					af[2] = *(const uint *)(A + qrA * LD + kd + 16 + tig * 4);
-					af[3] = *(const uint *)(A + qrB * LD + kd + 16 + tig * 4);
-					for (int n = 0; n < NPW; n++) {
-						int key = (nw * NPW + n) * 8 + gid;
-						uint bf[2];
-						bf[0] = *(const uint *)(B + key * LD + kd + tig * 4);
-						bf[1] = *(const uint *)(B + key * LD + kd + 16 + tig * 4);
-						if (pa == 0 && pb < 2) {
-							mma8<false, false>(cc[n], af, bf);
-						} else if (pa == 0) {
-							mma8<false, true>(cc[n], af, bf);
-						} else if (pb < 2) {
-							mma8<true, false>(cc[n], af, bf);
-						} else {
-							mma8<true, true>(cc[n], af, bf);
-						}
-					}
-				}
-				for (int n = 0; n < NPW; n++) {
-					for (int e = 0; e < 4; e++) {
-						acc[n][e] += (long)cc[n][e] << (8 * pa + 8 * pb);
-					}
-				}
-			}
-		}
-		for (int n = 0; n < NPW; n++) {
 			for (int e = 0; e < 4; e++) {
 				int qr = e < 2 ? qrA : qrB, g = qr / br, r = qr % br;
 				int t = k0 + (nw * NPW + n) * 8 + tig * 2 + (e & 1);
 				if (g < grp && t0 + r < R && t <= base + t0 + r) {
-					long s = rsh(acc[n][e], 42 - shs[qr]);
+					long s = rsh(a4[e], 42 - shs[qr]);
 					if (s != (long)(int)s) {
 						atomicExch(ovf, 1); // the caller then reruns the batch with int_attnb*
 					}
@@ -478,13 +464,13 @@ BMAX_MMA(int_bmax_mma128, 128, 64, 32)
 
 // pass 2: per (query head, block of BRV rows, key chunk): the scores again (tensor cores make that cheaper than
 // storing them), weights w = EXPA[min(M - s, na - 1)], the chunk's Z and O = sum w V; partials to zp, op as int_bpv.
-template <int HD>
+template <int HD, int BRV>
 static __device__ __forceinline__ void bpv2_mma(const long *cmax, const int *expa, long *zp, long *op, const unsigned char *Kp,
                                                 const unsigned char *Vp, int Mp, const int *mq, const int *shq, int base,
                                                 int R, const BAttnArgs &a, uint3 tg3, uint tid, unsigned char *qp,
                                                 unsigned char *kp, unsigned char *vp, unsigned char *wp, long *Ms, int *zs,
                                                 int *shs) {
-	constexpr int KT = 32, BRV = HD == 64 ? 64 : 32, MT = BRV / 16, NW = 8 / MT;
+	constexpr int KT = 32, MT = BRV / 16, NW = 8 / MT;
 	constexpr int LD = HD + 16, LW = KT + 16;
 	constexpr int SNT = KT / 8, SNPW = SNT / NW; // score n-tiles (keys) per warp
 	constexpr int ONT = HD / 8, ONPW = ONT / NW; // output n-tiles (dimensions) per warp
@@ -531,62 +517,46 @@ static __device__ __forceinline__ void bpv2_mma(const long *cmax, const int *exp
 			}
 		}
 		__syncthreads();
-		// scores for rows rA, rB x this warp's keys
-		long sc[SNPW][4];
-		for (int n = 0; n < SNPW; n++) {
-			for (int e = 0; e < 4; e++) {
-				sc[n][e] = 0;
-			}
-		}
-#pragma unroll
-		for (int pa = 0; pa < 2; pa++) {
-#pragma unroll
-			for (int pb = 0; pb < 3; pb++) {
-				int cc[SNPW][4];
-				for (int n = 0; n < SNPW; n++) {
-					for (int e = 0; e < 4; e++) {
-						cc[n][e] = 0;
-					}
-				}
-				const unsigned char *A = qp + pa * BRV * LD, *B = kp + pb * KT * LD;
-#pragma unroll
-				for (int kd = 0; kd < HD; kd += 32) {
-					uint af[4];
-					af[0] = *(const uint *)(A + rA * LD + kd + tig * 4);
-					af[1] = *(const uint *)(A + rB * LD + kd + tig * 4);
-					af[2] = *(const uint *)(A + rA * LD + kd + 16 + tig * 4);
-					af[3] = *(const uint *)(A + rB * LD + kd + 16 + tig * 4);
-					for (int n = 0; n < SNPW; n++) {
-						int key = (nw * SNPW + n) * 8 + gid;
-						uint bf[2];
-						bf[0] = *(const uint *)(B + key * LD + kd + tig * 4);
-						bf[1] = *(const uint *)(B + key * LD + kd + 16 + tig * 4);
-						if (pa == 0 && pb < 2) {
-							mma8<false, false>(cc[n], af, bf);
-						} else if (pa == 0) {
-							mma8<false, true>(cc[n], af, bf);
-						} else if (pb < 2) {
-							mma8<true, false>(cc[n], af, bf);
-						} else {
-							mma8<true, true>(cc[n], af, bf);
-						}
-					}
-				}
-				for (int n = 0; n < SNPW; n++) {
-					for (int e = 0; e < 4; e++) {
-						sc[n][e] += (long)cc[n][e] << (8 * pa + 8 * pb);
-					}
-				}
-			}
-		}
-		// weights into planes wp[plane][row][key]
+		// one key tile (8 keys) at a time: scores (6 plane pairs, 4 int64s), then weights into the planes wp
 		int any = 0;
 		for (int n = 0; n < SNPW; n++) {
+			int key = (nw * SNPW + n) * 8 + gid;
+			// the 6 plane pairs as independent accumulators, interleaved (their tensor-core operations overlap)
+			int cc[6][4] = {{0}};
+#pragma unroll
+			for (int kd = 0; kd < HD; kd += 32) {
+				uint af[2][4], bf[3][2];
+#pragma unroll
+				for (int pa = 0; pa < 2; pa++) {
+					const unsigned char *A = qp + pa * BRV * LD;
+					af[pa][0] = *(const uint *)(A + rA * LD + kd + tig * 4);
+					af[pa][1] = *(const uint *)(A + rB * LD + kd + tig * 4);
+					af[pa][2] = *(const uint *)(A + rA * LD + kd + 16 + tig * 4);
+					af[pa][3] = *(const uint *)(A + rB * LD + kd + 16 + tig * 4);
+				}
+#pragma unroll
+				for (int pb = 0; pb < 3; pb++) {
+					const unsigned char *B = kp + pb * KT * LD + key * LD + kd + tig * 4;
+					bf[pb][0] = *(const uint *)B;
+					bf[pb][1] = *(const uint *)(B + 16);
+				}
+				mma8<false, false>(cc[0], af[0], bf[0]);
+				mma8<false, false>(cc[1], af[0], bf[1]);
+				mma8<false, true>(cc[2], af[0], bf[2]);
+				mma8<true, false>(cc[3], af[1], bf[0]);
+				mma8<true, false>(cc[4], af[1], bf[1]);
+				mma8<true, true>(cc[5], af[1], bf[2]);
+			}
+			long a4[4];
+			for (int e = 0; e < 4; e++) {
+				a4[e] = (long)cc[0][e] + ((long)cc[1][e] << 8) + ((long)cc[2][e] << 16) + ((long)cc[3][e] << 8) +
+				        ((long)cc[4][e] << 16) + ((long)cc[5][e] << 24);
+			}
 			for (int e = 0; e < 4; e++) {
 				int r = e < 2 ? rA : rB, kk = (nw * SNPW + n) * 8 + tig * 2 + (e & 1), t = k0 + kk;
 				int wv = 0;
 				if (t0 + r < R && t <= base + t0 + r) {
-					long d = Ms[r] - rsh(sc[n][e], 42 - shs[r]);
+					long d = Ms[r] - rsh(a4[e], 42 - shs[r]);
 					if (d >= 0 && d < ez) {
 						wv = expa[d];
 					}
@@ -658,22 +628,21 @@ static __device__ __forceinline__ void bpv2_mma(const long *cmax, const int *exp
 }
 
 // arguments: int_bpv's, then the planes (Kp, Vp at the layer), Mp, the query mantissas and shifts
-#define BPV2_MMA(NAME, HD)                                                                                                 \
+#define BPV2_MMA(NAME, HD, BRV)                                                                                            \
 	extern "C" __global__ void NAME(const int *S, const long *cmax, const int *Vc, const int *expa, long *zp, long *op,     \
 	                                const IntParams *pr, BAttnArgs a, const unsigned char *Kp, const unsigned char *Vp,  \
 	                                int Mp, const int *mq, const int *shq) {                                             \
-		constexpr int BRV = HD == 64 ? 64 : 32;                                                                            \
 		__shared__ __align__(16) unsigned char qp[2 * BRV * (HD + 16)];                                                    \
 		__shared__ __align__(16) unsigned char kp[3 * 32 * (HD + 16)];                                                     \
 		__shared__ __align__(16) unsigned char vp[3 * HD * 48];                                                            \
 		__shared__ __align__(16) unsigned char wp[2 * BRV * 48];                                                           \
 		__shared__ long Ms[BRV];                                                                                           \
 		__shared__ int zs[BRV], shs[BRV];                                                                                  \
-		bpv2_mma<HD>(cmax, expa, zp, op, Kp, Vp, Mp, mq, shq, pr->pos, pr->tok, a,                                        \
+		bpv2_mma<HD, BRV>(cmax, expa, zp, op, Kp, Vp, Mp, mq, shq, pr->pos, pr->tok, a,                                        \
 		             make_uint3(blockIdx.x, blockIdx.y, blockIdx.z), threadIdx.x, qp, kp, vp, wp, Ms, zs, shs);            \
 	}
-BPV2_MMA(int_bpv2_mma64, 64)
-BPV2_MMA(int_bpv2_mma128, 128)
+BPV2_MMA(int_bpv2_mma64, 64, 64)
+BPV2_MMA(int_bpv2_mma128, 128, 32)
 
 // int_gemm on tensor cores, same arguments, grid (64 outputs x 32 rows a threadgroup) and results: per 64-group the
 // activations' two byte planes (x = xh * 2^8 + xl) times the int8 weights, each an exact int32 mma sum, combined as
@@ -1243,3 +1212,94 @@ static __device__ __forceinline__ void battn(const int *mq, const int *shq, long
 	}
 BATTN(int_battn64, 64, 64)
 BATTN(int_battn128, 128, 64)
+
+// int_gemm_mma2: int_gemm with a 128-output x 64-row tile a threadgroup (grid (ceil(O / 128), ceil(rows / 64))): warp
+// w computes rows (w % 2) * 32 .. +31 x outputs (w / 2) * 32 .. +31. Per 64-group, each activation plane's exact int32
+// sum is scaled into 64 bits on its own (s * (256 (w . xh) + (w . xl)) = 256 s (w . xh) + s (w . xl)), so fewer
+// registers stay live; the same integers as int_gemm.
+extern "C" __global__ void __launch_bounds__(256) int_gemm_mma2(const signed char *q, const short *s, const short *x, long *out,
+                                                               const int *ex, int O, int K, int E, int einSlot, int to,
+                                                               int4 st) {
+	constexpr int LD = 64 + 16;
+	__shared__ __align__(16) unsigned char xp[2 * 64 * LD]; // xp[plane][row][k]
+	__shared__ __align__(16) signed char wq[128 * LD];      // wq[out][k]
+	__shared__ short sc[128];
+	int xS = st.y, outS = st.z;
+	int o0 = blockIdx.x * 128, t0 = blockIdx.y * 64;
+	int tid = threadIdx.x, w = tid / 32, lane = tid % 32, gid = lane / 4, tig = lane % 4;
+	int rw = (w % 2) * 32, ow = (w / 2) * 32;
+	int ng = K / 64;
+	long acc[2][4][4];
+	for (int m = 0; m < 2; m++) {
+		for (int n = 0; n < 4; n++) {
+			for (int e = 0; e < 4; e++) {
+				acc[m][n][e] = 0;
+			}
+		}
+	}
+	for (int g = 0; g < ng; g++) {
+		__syncthreads();
+		for (int i = tid; i < 64 * 16; i += 256) { // activations: 64 rows x 64 shorts, 4 at a time -> planes
+			int r = i / 16, k = (i % 16) * 4;
+			short4 v = *(const short4 *)(x + (long)(t0 + r) * xS + g * 64 + k);
+			const short *vs = (const short *)&v;
+			for (int u = 0; u < 4; u++) {
+				xp[r * LD + k + u] = (unsigned char)(vs[u] & 255);
+				xp[64 * LD + r * LD + k + u] = (unsigned char)(vs[u] >> 8);
+			}
+		}
+		for (int i = tid; i < 128 * 4; i += 256) { // weights: 128 rows x 64 bytes
+			int r = i / 4, part = i % 4;
+			*(uint4 *)(wq + r * LD + part * 16) = *(const uint4 *)(q + (long)min(o0 + r, O - 1) * K + g * 64 + part * 16);
+		}
+		if (tid < 128) {
+			sc[tid] = s[(long)min(o0 + tid, O - 1) * ng + g];
+		}
+		__syncthreads();
+#pragma unroll
+		for (int pl = 0; pl < 2; pl++) {
+			int cc[2][4][4] = {{{0}}};
+			const unsigned char *A = xp + pl * 64 * LD;
+#pragma unroll
+			for (int kd = 0; kd < 64; kd += 32) {
+				uint af[2][4];
+				for (int m = 0; m < 2; m++) {
+					int rA = rw + m * 16 + gid;
+					af[m][0] = *(const uint *)(A + rA * LD + kd + tig * 4);
+					af[m][1] = *(const uint *)(A + (rA + 8) * LD + kd + tig * 4);
+					af[m][2] = *(const uint *)(A + rA * LD + kd + 16 + tig * 4);
+					af[m][3] = *(const uint *)(A + (rA + 8) * LD + kd + 16 + tig * 4);
+				}
+				for (int n = 0; n < 4; n++) {
+					int o = ow + n * 8 + gid;
+					uint bf[2] = {*(const uint *)(wq + o * LD + kd + tig * 4), *(const uint *)(wq + o * LD + kd + 16 + tig * 4)};
+					for (int m = 0; m < 2; m++) {
+						if (pl == 0) {
+							mma8<false, true>(cc[m][n], af[m], bf);
+						} else {
+							mma8<true, true>(cc[m][n], af[m], bf);
+						}
+					}
+				}
+			}
+			for (int m = 0; m < 2; m++) {
+				for (int n = 0; n < 4; n++) {
+					for (int e = 0; e < 4; e++) {
+						long v = (long)cc[m][n][e] * sc[ow + n * 8 + tig * 2 + (e & 1)];
+						acc[m][n][e] += pl == 0 ? v : v << 8;
+					}
+				}
+			}
+		}
+	}
+	for (int m = 0; m < 2; m++) {
+		for (int n = 0; n < 4; n++) {
+			for (int e = 0; e < 4; e++) {
+				int t = t0 + rw + m * 16 + gid + (e < 2 ? 0 : 8), o = o0 + ow + n * 8 + tig * 2 + (e & 1);
+				if (o < O) {
+					out[(long)t * outS + o] = rsh(acc[m][n][e], to - (E + ex[4 * t + einSlot]));
+				}
+			}
+		}
+	}
+}

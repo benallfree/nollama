@@ -54,6 +54,8 @@ var (
 	cuGraphLaunch             func(exec uintptr, s uintptr) result
 	cuGraphExecDestroy        func(exec uintptr) result
 	cuGraphDestroy            func(graph uintptr) result
+	cuProfilerStart           func() result // optional
+	cuProfilerStop            func() result
 )
 
 const (
@@ -108,6 +110,12 @@ func load() error {
 				return
 			}
 			purego.RegisterFunc(f.ptr, sym)
+		}
+		if sym, err := symbol(lib, "cuProfilerStart"); err == nil {
+			purego.RegisterFunc(&cuProfilerStart, sym)
+		}
+		if sym, err := symbol(lib, "cuProfilerStop"); err == nil {
+			purego.RegisterFunc(&cuProfilerStop, sym)
 		}
 		if r := cuInit(0); r != 0 {
 			initErr = errorOf("cuInit", r)
@@ -433,4 +441,16 @@ func (d *Device) enqueue(ls []Launch) error {
 		}
 	}
 	return nil
+}
+
+// Profile starts (on) or stops collection for a profiler started with collection off (ncu --profile-from-start off).
+func (d *Device) Profile(on bool) {
+	d.do(func() error {
+		if on && cuProfilerStart != nil {
+			cuProfilerStart()
+		} else if !on && cuProfilerStop != nil {
+			cuProfilerStop()
+		}
+		return nil
+	})
 }
