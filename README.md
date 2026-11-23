@@ -322,6 +322,38 @@ Qwen3-1.7B, an M1 Max writes about 40 to 50 tokens/s and reads prompts at about 
 of its default GPU kernels; an A16 writes about 31 tokens/s (its default kernels: about 60) and reads about 550
 tokens/s.
 
+## Compress text with a model (pack, unpack)
+
+`nollama pack` compresses text with a language model driving an arithmetic coder. Any machine with nollama unpacks
+the archive (`.13k`) exactly: an M1 Mac, an Intel server, an NVIDIA GPU running the reference code. That holds because
+the model runs in integer arithmetic only. Every step gives the same result whatever the CPU, the instruction set or
+the thread count, so every machine computes the same next-token probabilities, bit for bit.
+
+```bash
+nollama convert --profile best      # once: download Qwen2.5-Coder-7B and convert it (sha256 checked)
+nollama pack notes.md               # notes.md.13k
+nollama unpack notes.md.13k         # notes.md, byte for byte
+```
+
+| profile | model | converted file | a 55,854-byte minified HTML game |
+|---|---|---:|---:|
+| good | Qwen2.5-Coder-0.5B | 520 MB | 7,186 bytes |
+| better | Qwen2.5-Coder-1.5B | 1.6 GB | 5,856 bytes |
+| best (default) | Qwen2.5-Coder-7B | 7.9 GB | 4,970 bytes |
+
+For comparison, the best zip of that file is about 23 KB.
+
+- **The converted model** is the official Qwen2.5-Coder with every weight rounded to 8 bits, plus lookup tables, in a
+  GGUF (architecture `qwen2-intcodec`). `nollama convert` downloads the official weights at a pinned revision,
+  converts them, and installs the file only if its SHA-256 matches the published one. The conversion is
+  deterministic, so everyone's file is the same.
+- **An archive names its model** in a 2-byte header, so `unpack` knows which profile it needs.
+- **It is slow on a CPU:** each token is a full forward pass. On an M1 Max (NEON kernels), the 0.5B packs or unpacks
+  about 30–60 tokens/s on short texts, and the 7B about 8. A short message takes seconds; a 50 KB file takes
+  minutes to hours.
+- **It is defined by a spec** with conformance vectors (`engine/testdata/intcodec`). `go test ./engine -run TestInt`
+  checks them, given `NOLLAMA_INTCODEC_DIR` pointing at the converted models.
+
 ## Test without a model
 
 The `nollamatest` package lets your tests run in CI with no download. A scripted model answers with a function you
