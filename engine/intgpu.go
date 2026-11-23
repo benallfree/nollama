@@ -69,9 +69,10 @@ type replayKey struct {
 
 // intGPU is a model's GPU: the device and the model file on it.
 type intGPU struct {
-	dev  intDev
-	file ibuf
-	base uintptr // the file's first byte in host memory
+	normTG int // threads for a step's norms (CUDA prefers more: shorter chains of divisions)
+	dev    intDev
+	file   ibuf
+	base   uintptr // the file's first byte in host memory
 }
 
 func openIntGPU(m *IntModel) (*intGPU, error) {
@@ -82,7 +83,11 @@ func openIntGPU(m *IntModel) (*intGPU, error) {
 			return nil, errors.Join(err, err2)
 		}
 	}
-	return &intGPU{dev: dev, file: file, base: uintptr(unsafe.Pointer(unsafe.SliceData(m.g.data)))}, nil
+	g := &intGPU{dev: dev, file: file, base: uintptr(unsafe.Pointer(unsafe.SliceData(m.g.data))), normTG: 256}
+	if dev.graphs() {
+		g.normTG = 1024
+	}
+	return g, nil
 }
 
 func (g *intGPU) close() {
@@ -105,6 +110,7 @@ type intGPUState struct {
 	find   []idisp
 	maxch  int
 	kp, vp ibuf // the byte-plane KV cache, when planes()
+	kpTo   int  // positions the planes hold
 	mp     int  // positions per plane
 	kpl    int  // bytes per layer
 	ds     []idisp
@@ -183,7 +189,7 @@ func (g *intGPU) newState(m *IntModel, maxlen int) (*intGPUState, error) {
 	}
 	norm := func(add int, E, einSlot int, gw []int64) idisp {
 		d := one("int_norm", B(h), B(acc), F(gw), B(mb), B(ex), C(D), C(E), C(einSlot), C(0), C(add), C(0, 0))
-		d.Threads.W = 256
+		d.Threads.W = uint(g.normTG)
 		return d
 	}
 	qkvArgs := make([]byte, 24)
@@ -223,9 +229,7 @@ func (g *intGPU) newState(m *IntModel, maxlen int) (*intGPUState, error) {
 			one("int_qkv", B(acc), F(ly.b), F(m.ropeC), F(m.ropeS), B(s.params), BO(kc, l*kvLayer), BO(vc, l*kvLayer),
 				B(mq), B(shq), B(ex), iarg{Bytes: qkvArgs}, C(ly.qkv.e), C(0), C(0)),
 		)
-		if s.kp != nil {
-			ds = append(ds, s.kvplanes(l, s.params, 1))
-		}
+		// (the plane cache isn't kept per step: FeedBatch catches it up when it needs it)
 		ds = append(ds,
 			idisp{K: "int_attn1", Args: []iarg{B(mq), B(shq), BO(kc, l*kvLayer), B(sb), B(cmax),
 				B(s.params), iarg{Bytes: attnArgs}},
@@ -240,8 +244,7 @@ func (g *intGPU) newState(m *IntModel, maxlen int) (*intGPUState, error) {
 			matvec(&ly.o, mb, 1, -24, acc),
 			norm(1, ly.o.e, 1, ly.g2),
 			matvec(&ly.gu, mb, 0, -16, acc),
-			grid("int_mlp", I, B(acc), F(rawS), B(p), B(ex), C(I), C(ly.gu.e), C(0), C(0, 0)),
-			one("int_blockf", B(p), B(mb), B(ex), C(I), C(-16), C(2), C(0, 0)),
+			one("int_mlpb", B(acc), F(rawS), B(p), B(mb), B(ex), C(I)),
 			matvec(&ly.d, mb, 2, -24, acc),
 			norm(1, ly.d.e, 2, next),
 		)

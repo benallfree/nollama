@@ -210,6 +210,22 @@ func (s *intGPUState) feedBatch(toks, next []int, pos int, out []IntCount) error
 	b := s.b
 	P := b.P
 	dev := s.g.dev
+	if s.kp != nil { // steps (Feed) don't keep the plane cache: copy the positions they added
+		s.kpTo = min(s.kpTo, pos)
+		for s.kpTo < pos {
+			R := min(P, pos-s.kpTo)
+			dev.write(b.params, 0, i32b(R, s.kpTo))
+			cu := make([]idisp, s.m.L)
+			for l := range cu {
+				cu[l] = s.kvplanes(l, b.params, R)
+			}
+			if err := dev.run(cu); err != nil {
+				return err
+			}
+			s.kpTo += R
+		}
+		s.kpTo = pos + len(toks)
+	}
 	tkb, tgb, cntb, ovf := make([]byte, 4*P), make([]byte, 4*P), make([]byte, 24*P), make([]byte, 4)
 	ds := make([]idisp, 0, len(b.ds)+2*len(b.head))
 	for r0 := 0; r0 < len(toks); r0 += P {

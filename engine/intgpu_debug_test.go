@@ -148,17 +148,21 @@ func TestIntGPUProfile(t *testing.T) {
 	}
 	defer gs.release()
 	all := gs.ds
+	at := 500
+	if v, err := strconv.Atoi(os.Getenv("INTPOS")); err == nil {
+		at = v
+	}
 	tm := func(ds []idisp) float64 {
 		gs.ds = ds
-		gs.step(m.BOS(), 500)
+		gs.step(m.BOS(), at)
 		t0 := time.Now()
 		for i := 0; i < 30; i++ {
-			gs.step(m.BOS(), 500)
+			gs.step(m.BOS(), at)
 		}
 		return float64(time.Since(t0).Microseconds()) / 30 / 1000
 	}
 	full := tm(all)
-	t.Logf("full step at position 500: %.2f ms (%d dispatches), GPU %.2f ms", full, len(all),
+	t.Logf("full step at position %d: %.2f ms (%d dispatches), GPU %.2f ms", at, full, len(all),
 		float64(m.gpu.dev.lastGPU().Microseconds())/1000)
 	for _, pos := range []int{100, 1000, 4000, 16000, 30000} {
 		if pos < gs.maxlen {

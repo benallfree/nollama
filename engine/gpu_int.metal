@@ -196,6 +196,7 @@ kernel void int_matvec(device const char *q [[buffer(0)]], device const short *s
 	device const char *qr = q + (long)row * K;
 	device const short *sr = s + (long)row * ng;
 	long acc = 0;
+#pragma unroll 4
 	for (int col = 16 * lane; col < K + 16 * 31; col += 512) {
 		bool in = col < K;
 		int d = 0;
@@ -1182,4 +1183,27 @@ kernel void int_find(device const long *cum [[buffer(0)]], device const long *tg
 	res[1] = lo < V ? cum[lo] : 0;
 	res[2] = lo > 0 ? cum[lo - 1] : 0;
 	res[3] = cum[V - 1];
+}
+
+// int_mlpb: int_mlp and the blockf after it in one threadgroup: p, then mantissas m and exponent ex[2] = -16 + shift.
+kernel void int_mlpb(device const long *acc [[buffer(0)]], device const int *sig [[buffer(1)]], device long *p [[buffer(2)]],
+                     device short *m [[buffer(3)]], device int *ex [[buffer(4)]], constant int &I [[buffer(5)]],
+                     uint tid [[thread_index_in_threadgroup]]) {
+	threadgroup long tg[TG];
+	const long NS = 16384;
+	long mx = 0;
+	for (int i = tid; i < I; i += TG) {
+		long g = acc[i], u = acc[I + i]; // the matvec already shifted them to e = -16
+		long av = rsh(g * (long)sig[clamp(rsh(g, 6), -NS, NS) + NS], 16);
+		long v = rsh(av * u, 16);
+		p[i] = v;
+		mx = max(mx, iabs(v));
+	}
+	int sh = max(0, bitlen(tg_max(mx, tg, tid)) - 15);
+	for (int i = tid; i < I; i += TG) {
+		m[i] = (short)clamp(rsh(p[i], sh), -32767L, 32767L);
+	}
+	if (tid == 0) {
+		ex[2] = -16 + sh;
+	}
 }

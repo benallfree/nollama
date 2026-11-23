@@ -337,3 +337,44 @@ func TestIntBatchBJJProfile(t *testing.T) {
 	}
 	t.Logf("pos %d, %d rows: %.0f ms |%s", pos, R, run(ds), line)
 }
+
+// TestIntFeedThenBatch: steps, then a batch, in one session (the batch must see the steps' keys and values, whatever
+// copies of the cache it reads), give the same counts as steps throughout.
+func TestIntFeedThenBatch(t *testing.T) {
+	m := loadIntDev(t, "0.5B", "auto")
+	ids := vecIDs(t, "slice.ids.json")[:900]
+	toks := append([]int{m.BOS()}, ids[:len(ids)-1]...)
+	a, err := m.NewSession(len(ids))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := m.NewSession(len(ids))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	var got []IntCount
+	for k := 0; k < 300; k++ {
+		cum, err := a.Feed(toks[k])
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, countOf(cum, ids[k]))
+	}
+	rest, err := a.FeedBatch(toks[300:], ids[300:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = append(got, rest...)
+	for k, tok := range toks {
+		cum, err := b.Feed(tok)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w := countOf(cum, ids[k]); got[k] != w {
+			t.Fatalf("position %d: %+v, steps %+v", k, got[k], w)
+		}
+	}
+	t.Logf("%s: 300 steps then a batch of 600 match steps", m.Device())
+}
