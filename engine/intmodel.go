@@ -53,8 +53,8 @@ type IntModel struct {
 	ropeC, ropeS            []int16
 	expA, expF, sig         []int64
 	pool                    *pool
-	gpu                     *intMetal // nil: the CPU
-	gpuNote                 string    // why the CPU, when gpu is nil
+	gpu                     *intGPU // nil: the CPU
+	gpuNote                 string  // why the CPU, when gpu is nil
 }
 
 func viewI8(b []byte) []int8 {
@@ -115,7 +115,7 @@ func LoadIntModelOptions(path string, o IntOptions) (*IntModel, error) {
 	case o.GPU == "off":
 		m.gpuNote = "GPU off"
 	default:
-		g, err := openIntMetal(m)
+		g, err := openIntGPU(m)
 		if err != nil {
 			m.gpuNote = err.Error()
 		} else {

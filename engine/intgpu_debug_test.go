@@ -3,6 +3,8 @@ package engine
 import (
 	"encoding/binary"
 	"fmt"
+	"os"
+	"strconv"
 	"testing"
 	"time"
 	"unsafe"
@@ -28,7 +30,7 @@ func TestIntGPUStages(t *testing.T) {
 		_ = n
 	}
 	all := gs.ds
-	B := func(i int) []byte { return gs.bufs[i].Bytes() }
+	B := func(i int) []byte { return gs.g.dev.host(gs.bufs[i]) }
 	D, I := m.D, m.I
 	// CPU reference, stage by stage
 	st := m.newState(8)
@@ -146,7 +148,7 @@ func TestIntGPUProfile(t *testing.T) {
 	}
 	defer gs.release()
 	all := gs.ds
-	tm := func(ds []metal.Dispatch) float64 {
+	tm := func(ds []idisp) float64 {
 		gs.ds = ds
 		gs.step(m.BOS(), 500)
 		t0 := time.Now()
@@ -157,7 +159,7 @@ func TestIntGPUProfile(t *testing.T) {
 	}
 	full := tm(all)
 	t.Logf("full step at position 500: %.2f ms (%d dispatches), GPU %.2f ms", full, len(all),
-		float64(m.gpu.dev.LastGPU.Microseconds())/1000)
+		float64(m.gpu.dev.lastGPU().Microseconds())/1000)
 	for _, pos := range []int{100, 1000, 4000, 16000, 30000} {
 		if pos < gs.maxlen {
 			gs.ds = all
@@ -165,14 +167,14 @@ func TestIntGPUProfile(t *testing.T) {
 			t0 := time.Now()
 			gs.step(m.BOS(), pos)
 			t.Logf("position %5d: %.2f ms, GPU %.2f ms", pos, float64(time.Since(t0).Microseconds())/1000,
-				float64(m.gpu.dev.LastGPU.Microseconds())/1000)
+				float64(m.gpu.dev.lastGPU().Microseconds())/1000)
 		}
 	}
-	for _, k := range metalIntKernels {
-		var rest []metal.Dispatch
+	for _, k := range intKernels {
+		var rest []idisp
 		n := 0
 		for _, d := range all {
-			if d.P.Name == k {
+			if d.K == k {
 				n++
 				continue
 			}
@@ -194,22 +196,22 @@ func TestIntGPUFloor(t *testing.T) {
 	}
 	defer gs.release()
 	all := gs.ds
-	tm := func(ds []metal.Dispatch) float64 {
+	tm := func(ds []idisp) float64 {
 		gs.ds = ds
 		gs.step(m.BOS(), 10)
 		best := 1e9
 		for i := 0; i < 10; i++ {
 			gs.step(m.BOS(), 10)
-			best = min(best, float64(m.gpu.dev.LastGPU.Microseconds()))
+			best = min(best, float64(m.gpu.dev.lastGPU().Microseconds()))
 		}
 		return best
 	}
-	byName := map[string][]metal.Dispatch{}
+	byName := map[string][]idisp{}
 	for _, d := range all {
-		byName[d.P.Name] = append(byName[d.P.Name], d)
+		byName[d.K] = append(byName[d.K], d)
 	}
-	rep := func(d metal.Dispatch, n int) []metal.Dispatch {
-		r := make([]metal.Dispatch, n)
+	rep := func(d idisp, n int) []idisp {
+		r := make([]idisp, n)
 		for i := range r {
 			r[i] = d
 		}
@@ -245,7 +247,7 @@ func TestIntGPUEncode(t *testing.T) {
 			t0 := time.Now()
 			gs.step(m.BOS(), 10)
 			wall += float64(time.Since(t0).Microseconds()) / 20
-			gpu += float64(m.gpu.dev.LastGPU.Microseconds()) / 20
+			gpu += float64(m.gpu.dev.lastGPU().Microseconds()) / 20
 		}
 		metal.SetRunChunk(old)
 		t.Logf("chunk %6d: wall %.0f us, gpu %.0f us (%d dispatches)", ch, wall, gpu, len(gs.ds))
@@ -263,14 +265,14 @@ func TestIntGPUAttnLong(t *testing.T) {
 	all := gs.ds
 	for _, pos := range []int{1000, 8000, 16000, 30000} {
 		for _, k := range []string{"int_attn1", "int_attn2", "int_attn3"} {
-			var d metal.Dispatch
+			var d idisp
 			for _, x := range all {
-				if x.P.Name == k {
+				if x.K == k {
 					d = x
 					break
 				}
 			}
-			r := make([]metal.Dispatch, 50)
+			r := make([]idisp, 50)
 			for i := range r {
 				r[i] = d
 			}
@@ -279,7 +281,7 @@ func TestIntGPUAttnLong(t *testing.T) {
 			best := 1e9
 			for i := 0; i < 5; i++ {
 				gs.step(m.BOS(), pos)
-				best = min(best, float64(m.gpu.dev.LastGPU.Microseconds())/50)
+				best = min(best, float64(m.gpu.dev.lastGPU().Microseconds())/50)
 			}
 			t.Logf("pos %5d %s: %.1f us", pos, k, best)
 		}
@@ -303,22 +305,22 @@ func TestIntBatchProfile(t *testing.T) {
 	}
 	b := gs.b
 	P = b.P
-	binary.LittleEndian.PutUint32(b.params.Bytes()[0:], uint32(P))
-	all := append([]metal.Dispatch(nil), b.ds...)
+	binary.LittleEndian.PutUint32(gs.g.dev.host(b.params)[0:], uint32(P))
+	all := append([]idisp(nil), b.ds...)
 	for _, h := range b.head {
 		all = append(all, h[0], h[1])
 	}
-	run := func(ds []metal.Dispatch) float64 {
-		gs.g.dev.Run(ds...)
+	run := func(ds []idisp) float64 {
+		gs.g.dev.run(ds)
 		best := 1e9
 		for i := 0; i < 3; i++ {
-			gs.g.dev.Run(ds...)
-			best = min(best, float64(m.gpu.dev.LastGPU.Microseconds())/1000)
+			gs.g.dev.run(ds)
+			best = min(best, float64(m.gpu.dev.lastGPU().Microseconds())/1000)
 		}
 		return best
 	}
 	for _, pos := range []int{16000} {
-		binary.LittleEndian.PutUint32(b.params.Bytes()[4:], uint32(pos))
+		binary.LittleEndian.PutUint32(gs.g.dev.host(b.params)[4:], uint32(pos))
 		nch := uint((pos+P-1)/intKC + 1)
 		for i := range all {
 			if i < len(b.kind) && (b.kind[i] == scoreG || b.kind[i] == pvG) {
@@ -330,14 +332,79 @@ func TestIntBatchProfile(t *testing.T) {
 		full := run(all)
 		line := ""
 		for _, k := range []string{"int_gemm", "int_bscores64", "int_bpv64", "int_bcomb", "int_counts", "int_norm", "int_qkv", "int_blockf", "int_mlp", "int_embed"} {
-			var sub []metal.Dispatch
+			var sub []idisp
 			for _, d := range all {
-				if d.P.Name == k {
+				if d.K == k {
 					sub = append(sub, d)
 				}
 			}
 			line += fmt.Sprintf(" %s %.1f", k, run(sub))
 		}
 		t.Logf("pos %5d: batch of %d %.1f ms (%.0f tok/s) |%s", pos, P, full, float64(P)/full*1000, line)
+	}
+}
+
+// TestIntBatchBisect runs the first INTBISECT launches of a 0.5B batch (a GPU fault ends the process, so a script
+// runs this once per prefix): which kernel faults.
+func TestIntBatchBisect(t *testing.T) {
+	n, err := strconv.Atoi(os.Getenv("INTBISECT"))
+	if err != nil {
+		t.Skip("set INTBISECT=<launches>")
+	}
+	m := loadIntDev(t, "0.5B", "auto")
+	gs, err := m.gpu.newState(m, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gs.release()
+	b, err := gs.newBatch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gs.b = b
+	all := append([]idisp(nil), b.ds...)
+	for _, h := range b.head {
+		all = append(all, h[0], h[1])
+	}
+	gs.g.dev.write(b.params, 0, i32b(b.P, 0))
+	for i := range all {
+		switch b.kind[min(i, len(b.kind)-1)] {
+		case scoreG, pvG:
+			if i < len(b.kind) {
+				all[i].Groups.D = 1
+				br := map[int]int{scoreG: b.scoreBR, pvG: b.pvBR}[b.kind[i]]
+				all[i].Groups.H = uint((b.P + br - 1) / br)
+			}
+		}
+	}
+	n = min(n, len(all))
+	err = gs.g.dev.run(all[:n])
+	t.Logf("%d launches of %d, last %s %+v x %+v: %v", n, len(all), all[n-1].K, all[n-1].Groups, all[n-1].Threads, err)
+	if err != nil {
+		t.Fail()
+	}
+}
+
+// TestIntBatchSteps feeds the slice 512 tokens at a time, logging each, to find a batch that faults.
+func TestIntBatchSteps(t *testing.T) {
+	m := loadIntDev(t, "0.5B", "auto")
+	ids := vecIDs(t, "slice.ids.json")
+	toks := append([]int{m.BOS()}, ids[:len(ids)-1]...)
+	a, err := m.NewSession(len(ids))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	step, _ := strconv.Atoi(os.Getenv("INTSTEP"))
+	if step == 0 {
+		step = 512
+	}
+	for k := 0; k < len(ids); k += step {
+		e := min(k+step, len(ids))
+		_, err := a.FeedBatch(toks[k:e], ids[k:e])
+		t.Logf("positions %d..%d: %v", k, e, err)
+		if err != nil {
+			t.FailNow()
+		}
 	}
 }

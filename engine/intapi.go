@@ -29,8 +29,8 @@ func (m *IntModel) ByteToken(b byte) int { return m.tok.vocab[string(m.tok.byteE
 
 // IntSession is one context: a KV cache and a position, on the model's device. Not safe for concurrent use.
 type IntSession struct {
-	s      *intState      // the CPU
-	g      *intMetalState // or the GPU
+	s      *intState    // the CPU
+	g      *intGPUState // or the GPU
 	pos    int
 	maxlen int
 }

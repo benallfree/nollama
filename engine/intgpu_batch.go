@@ -1,6 +1,6 @@
 package engine
 
-// Batches on Metal: when every token is known in advance (compression), a session runs intBatchRows positions at a
+// Batches on a GPU: when every token is known in advance (compression), a session runs intBatchRows positions at a
 // time as matrix-matrix work, and returns just each position's counts for the token that follows. Same kernels'
 // integer arithmetic row by row, so the same counts as stepping one token at a time.
 
@@ -8,9 +8,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"time"
-	"unsafe"
-
-	"github.com/benallfree/nollama/engine/internal/metal"
 )
 
 const (
@@ -42,14 +39,14 @@ var errUnsupportedHD = errors.New("intmodel: batches on the GPU need a head size
 
 type intBatch struct {
 	P                           int // rows per batch
-	params, toks, tgt, cnt, ovf *metal.Buffer
-	ds, slow                    []metal.Dispatch // slow: the same with int_attnb* (when a score overflows int32)
+	params, toks, tgt, cnt, ovf ibuf
+	ds, slow                    []idisp // slow: the same with int_attnb* (when a score overflows int32)
 	kind, slowKind              []int
-	head                        [][2]metal.Dispatch // per head block: the head GEMM and the counts
+	head                        [][2]idisp // per head block: the head GEMM and the counts
 	attnBR, scoreBR, pvBR       int
 }
 
-func (s *intMetalState) newBatch() (*intBatch, error) {
+func (s *intGPUState) newBatch() (*intBatch, error) {
 	g, m := s.g, s.m
 	D, I, V, hd, nq, nkv := m.D, m.I, m.V, m.hd, m.nq, m.nkv
 	// rows per batch: the stored scores (rows x heads x context, int32) stay within intScoreMem
@@ -66,10 +63,10 @@ func (s *intMetalState) newBatch() (*intBatch, error) {
 	} else if hd != 64 {
 		return nil, errUnsupportedHD
 	}
-	var h, mb, ex, acc, mq, shq, o, p, lg, sc, cmax, zp, op *metal.Buffer
+	var h, mb, ex, acc, mq, shq, o, p, lg, sc, cmax, zp, op ibuf
 	var err error
 	for _, x := range []struct {
-		dst **metal.Buffer
+		dst *ibuf
 		n   int
 	}{{&b.params, 8}, {&b.toks, 4 * P}, {&b.tgt, 4 * P}, {&b.cnt, 8 * 3 * P}, {&h, 8 * P * D}, {&mb, 2 * P * mN},
 		{&ex, 16 * P}, {&acc, 8 * P * accN}, {&mq, 4 * P * nq * hd}, {&shq, 4 * P * nq}, {&o, 8 * P * nq * hd},
@@ -79,26 +76,26 @@ func (s *intMetalState) newBatch() (*intBatch, error) {
 			return nil, err
 		}
 	}
-	B := func(b *metal.Buffer) metal.Arg { return metal.Arg{Buf: b} }
-	BO := func(b *metal.Buffer, off int) metal.Arg { return metal.Arg{Buf: b, Offset: off} }
+	B := func(b ibuf) iarg { return iarg{Buf: b} }
+	BO := func(b ibuf, off int) iarg { return iarg{Buf: b, Offset: off} }
 	C, F := cArg, g.farg
-	var ds, slowD []metal.Dispatch
+	var ds, slowD []idisp
 	var slowAt []int // where each layer's fast attention (three dispatches) starts in ds
-	add := func(kind int, d metal.Dispatch) {
+	add := func(kind int, d idisp) {
 		ds = append(ds, d)
 		b.kind = append(b.kind, kind)
 	}
-	perRow := func(k string, threads int, args ...metal.Arg) {
-		add(rowsW, metal.Dispatch{P: g.ps[k], Args: args, Groups: metal.Size{W: uint(P), H: 1, D: 1},
-			Threads: metal.Size{W: uint(threads), H: 1, D: 1}})
+	perRow := func(k string, threads int, args ...iarg) {
+		add(rowsW, idisp{K: k, Args: args, Groups: isize{W: uint(P), H: 1, D: 1},
+			Threads: isize{W: uint(threads), H: 1, D: 1}})
 	}
-	gemmD := func(w *intMat, x metal.Arg, exA metal.Arg, einSlot, to int, out metal.Arg, outS, rows int) metal.Dispatch {
-		return metal.Dispatch{P: g.ps["int_gemm"], Args: []metal.Arg{F(w.q), F(w.s), x, out, exA, C(w.out), C(w.in),
+	gemmD := func(w *intMat, x iarg, exA iarg, einSlot, to int, out iarg, outS, rows int) idisp {
+		return idisp{K: "int_gemm", Args: []iarg{F(w.q), F(w.s), x, out, exA, C(w.out), C(w.in),
 			C(w.e), C(einSlot), C(to), C(0, mN, outS, 0)},
-			Groups:  metal.Size{W: uint((w.out + 63) / 64), H: uint((rows + intGemmRows - 1) / intGemmRows), D: 1},
-			Threads: metal.Size{W: 256, H: 1, D: 1}}
+			Groups:  isize{W: uint((w.out + 63) / 64), H: uint((rows + intGemmRows - 1) / intGemmRows), D: 1},
+			Threads: isize{W: 256, H: 1, D: 1}}
 	}
-	gemm := func(w *intMat, einSlot, to int, out *metal.Buffer, outS int) {
+	gemm := func(w *intMat, einSlot, to int, out ibuf, outS int) {
 		add(gemmH, gemmD(w, B(mb), B(ex), einSlot, to, B(out), outS, P))
 	}
 	norm := func(addv, E, einSlot int, gw []int64) {
@@ -122,8 +119,8 @@ func (s *intMetalState) newBatch() (*intBatch, error) {
 	battnArgs := i32b(nq, nkv, hd, s.maxlen, intNA, s.maxlen, nchmax, ez)
 	rawA, rawF, rawS := m.g.Tensors["EXPA"].Data, m.g.Tensors["EXPF"].Data, m.g.Tensors["SIG"].Data
 
-	add(rowsH, metal.Dispatch{P: g.ps["int_embed"], Args: []metal.Arg{F(m.emb.q), F(m.emb.s), B(b.toks), B(h), C(D),
-		C(m.emb.e)}, Groups: metal.Size{W: uint((D + 255) / 256), H: uint(P), D: 1}, Threads: metal.Size{W: 256, H: 1, D: 1}})
+	add(rowsH, idisp{K: "int_embed", Args: []iarg{F(m.emb.q), F(m.emb.s), B(b.toks), B(h), C(D),
+		C(m.emb.e)}, Groups: isize{W: uint((D + 255) / 256), H: uint(P), D: 1}, Threads: isize{W: 256, H: 1, D: 1}})
 	norm(0, 0, 0, m.layers[0].g1)
 	for l := range m.layers {
 		ly := &m.layers[l]
@@ -134,41 +131,41 @@ func (s *intMetalState) newBatch() (*intBatch, error) {
 		kv := l * s.kvLayer
 		gemm(&ly.qkv, 0, -24, acc, accN)
 		perRow("int_qkv", intTG, B(acc), F(ly.b), F(m.ropeC), F(m.ropeS), B(b.params), BO(s.kc, kv), BO(s.vc, kv),
-			B(mq), B(shq), B(ex), metal.Arg{Bytes: qkvArgs}, C(ly.qkv.e), C(0), C(accN))
+			B(mq), B(shq), B(ex), iarg{Bytes: qkvArgs}, C(ly.qkv.e), C(0), C(accN))
 		slowAt = append(slowAt, len(ds))
-		slowD = append(slowD, metal.Dispatch{P: g.ps[attnK], Args: []metal.Arg{B(mq), B(shq), BO(s.kc, kv), BO(s.vc, kv),
-			F(rawA), B(o), B(b.params), metal.Arg{Bytes: attnArgs}},
-			Groups: metal.Size{W: uint(nq), H: uint(P / b.attnBR), D: 1}, Threads: metal.Size{W: 256, H: 1, D: 1}})
-		add(scoreG, metal.Dispatch{P: g.ps[scoreK], Args: []metal.Arg{B(mq), B(shq), BO(s.kc, kv), B(sc), B(cmax),
-			B(b.ovf), B(b.params), metal.Arg{Bytes: battnArgs}},
-			Groups: metal.Size{W: uint(nkv), H: 1, D: 1}, Threads: metal.Size{W: 256, H: 1, D: 1}})
-		add(pvG, metal.Dispatch{P: g.ps[pvK], Args: []metal.Arg{B(sc), B(cmax), BO(s.vc, kv), F(rawA), B(zp), B(op),
-			B(b.params), metal.Arg{Bytes: battnArgs}},
-			Groups: metal.Size{W: uint(nq), H: 1, D: 1}, Threads: metal.Size{W: 256, H: 1, D: 1}})
-		add(rowsH, metal.Dispatch{P: g.ps["int_bcomb"], Args: []metal.Arg{B(zp), B(op), B(o), B(b.params),
-			metal.Arg{Bytes: battnArgs}},
-			Groups: metal.Size{W: uint(nq), H: uint(P), D: 1}, Threads: metal.Size{W: uint(hd), H: 1, D: 1}})
+		slowD = append(slowD, idisp{K: attnK, Args: []iarg{B(mq), B(shq), BO(s.kc, kv), BO(s.vc, kv),
+			F(rawA), B(o), B(b.params), iarg{Bytes: attnArgs}},
+			Groups: isize{W: uint(nq), H: uint(P / b.attnBR), D: 1}, Threads: isize{W: 256, H: 1, D: 1}})
+		add(scoreG, idisp{K: scoreK, Args: []iarg{B(mq), B(shq), BO(s.kc, kv), B(sc), B(cmax),
+			B(b.ovf), B(b.params), iarg{Bytes: battnArgs}},
+			Groups: isize{W: uint(nkv), H: 1, D: 1}, Threads: isize{W: 256, H: 1, D: 1}})
+		add(pvG, idisp{K: pvK, Args: []iarg{B(sc), B(cmax), BO(s.vc, kv), F(rawA), B(zp), B(op),
+			B(b.params), iarg{Bytes: battnArgs}},
+			Groups: isize{W: uint(nq), H: 1, D: 1}, Threads: isize{W: 256, H: 1, D: 1}})
+		add(rowsH, idisp{K: "int_bcomb", Args: []iarg{B(zp), B(op), B(o), B(b.params),
+			iarg{Bytes: battnArgs}},
+			Groups: isize{W: uint(nq), H: uint(P), D: 1}, Threads: isize{W: uint(hd), H: 1, D: 1}})
 		perRow("int_blockf", intTG, B(o), B(mb), B(ex), C(nq*hd), C(-24), C(1), C(nq*hd, mN))
 		gemm(&ly.o, 1, -24, acc, accN)
 		norm(1, ly.o.e, 1, ly.g2)
 		gemm(&ly.gu, 0, -16, acc, accN)
-		add(rowsH, metal.Dispatch{P: g.ps["int_mlp"], Args: []metal.Arg{B(acc), F(rawS), B(p), B(ex), C(I), C(ly.gu.e),
-			C(0), C(accN, I)}, Groups: metal.Size{W: uint((I + 255) / 256), H: uint(P), D: 1},
-			Threads: metal.Size{W: 256, H: 1, D: 1}})
+		add(rowsH, idisp{K: "int_mlp", Args: []iarg{B(acc), F(rawS), B(p), B(ex), C(I), C(ly.gu.e),
+			C(0), C(accN, I)}, Groups: isize{W: uint((I + 255) / 256), H: uint(P), D: 1},
+			Threads: isize{W: 256, H: 1, D: 1}})
 		perRow("int_blockf", intTG, B(p), B(mb), B(ex), C(I), C(-16), C(2), C(I, mN))
 		gemm(&ly.d, 2, -24, acc, accN)
 		norm(1, ly.d.e, 2, next)
 	}
 	// head and counts, intHeadRows rows at a time
-	var hds []metal.Dispatch
+	var hds []idisp
 	for r0 := 0; r0 < P; r0 += intHeadRows {
 		hds = append(hds,
 			gemmD(&m.head, BO(mb, 2*r0*mN), BO(ex, 16*r0), 0, -10, B(lg), V, intHeadRows),
-			metal.Dispatch{P: g.ps["int_counts"], Args: []metal.Arg{B(lg), F(rawF), BO(b.tgt, 4*r0), BO(b.cnt, 24*r0), C(V),
-				C(intNF)}, Groups: metal.Size{W: intHeadRows, H: 1, D: 1}, Threads: metal.Size{W: intTG, H: 1, D: 1}})
+			idisp{K: "int_counts", Args: []iarg{B(lg), F(rawF), BO(b.tgt, 4*r0), BO(b.cnt, 24*r0), C(V),
+				C(intNF)}, Groups: isize{W: intHeadRows, H: 1, D: 1}, Threads: isize{W: intTG, H: 1, D: 1}})
 	}
 	all := append(append(ds, hds...), slowD...)
-	if err := s.constify(all); err != nil {
+	if err := s.g.dev.prepare(all, s.newBuffer); err != nil {
 		return nil, err
 	}
 	b.ds = all[:len(ds)]
@@ -184,13 +181,13 @@ func (s *intMetalState) newBatch() (*intBatch, error) {
 		b.slow, b.slowKind = append(b.slow, b.ds[i]), append(b.slowKind, b.kind[i])
 	}
 	for i := 0; i < len(hds); i += 2 {
-		b.head = append(b.head, [2]metal.Dispatch{all[len(ds)+i], all[len(ds)+i+1]})
+		b.head = append(b.head, [2]idisp{all[len(ds)+i], all[len(ds)+i+1]})
 	}
 	return b, nil
 }
 
 // feedBatch runs toks at positions pos, pos+1, ... and stores, for each, the counts of next[i] in out.
-func (s *intMetalState) feedBatch(toks, next []int, pos int, out []IntCount) error {
+func (s *intGPUState) feedBatch(toks, next []int, pos int, out []IntCount) error {
 	if s.b == nil {
 		b, err := s.newBatch()
 		if err != nil {
@@ -200,38 +197,41 @@ func (s *intMetalState) feedBatch(toks, next []int, pos int, out []IntCount) err
 	}
 	b := s.b
 	P := b.P
-	tk := unsafe.Slice((*int32)(unsafe.Pointer(unsafe.SliceData(b.toks.Bytes()))), P)
-	tg := unsafe.Slice((*int32)(unsafe.Pointer(unsafe.SliceData(b.tgt.Bytes()))), P)
-	cnt := unsafe.Slice((*int64)(unsafe.Pointer(unsafe.SliceData(b.cnt.Bytes()))), 3*P)
-	ovf := unsafe.Slice((*int32)(unsafe.Pointer(unsafe.SliceData(b.ovf.Bytes()))), 1)
-	ds := make([]metal.Dispatch, 0, len(b.ds)+2*len(b.head))
+	dev := s.g.dev
+	tkb, tgb, cntb, ovf := make([]byte, 4*P), make([]byte, 4*P), make([]byte, 24*P), make([]byte, 4)
+	ds := make([]idisp, 0, len(b.ds)+2*len(b.head))
 	for r0 := 0; r0 < len(toks); r0 += P {
 		R := min(P, len(toks)-r0)
 		for i := 0; i < R; i++ {
-			tk[i], tg[i] = int32(toks[r0+i]), int32(next[r0+i])
+			binary.LittleEndian.PutUint32(tkb[4*i:], uint32(toks[r0+i]))
+			binary.LittleEndian.PutUint32(tgb[4*i:], uint32(next[r0+i]))
 		}
-		binary.LittleEndian.PutUint32(b.params.Bytes()[0:], uint32(R))
-		binary.LittleEndian.PutUint32(b.params.Bytes()[4:], uint32(pos+r0))
+		dev.write(b.toks, 0, tkb[:4*R])
+		dev.write(b.tgt, 0, tgb[:4*R])
+		dev.write(b.params, 0, i32b(R, pos+r0))
 		nch := uint((pos+r0+R-1)/intKC + 1)
 		if err := s.runBatch(b.ds, b.kind, R, nch, ds); err != nil {
 			return err
 		}
-		intBatchGPU += s.g.dev.LastGPU
-		if ovf[0] != 0 { // a score didn't fit int32: this batch again with the attention that keeps them in registers
-			ovf[0] = 0
+		intBatchGPU += dev.lastGPU()
+		if dev.read(b.ovf, 0, ovf); binary.LittleEndian.Uint32(ovf) != 0 {
+			// a score didn't fit int32: this batch again with the attention that keeps them in registers
+			dev.write(b.ovf, 0, make([]byte, 4))
 			intBatchSlow++
 			if err := s.runBatch(b.slow, b.slowKind, R, nch, ds); err != nil {
 				return err
 			}
 		}
+		dev.read(b.cnt, 0, cntb[:24*R])
 		for i := 0; i < R; i++ {
-			out[r0+i] = IntCount{Total: cnt[3*i], High: cnt[3*i+1], Low: cnt[3*i+2]}
+			c := func(j int) int64 { return int64(binary.LittleEndian.Uint64(cntb[8*(3*i+j):])) }
+			out[r0+i] = IntCount{Total: c(0), High: c(1), Low: c(2)}
 		}
 	}
 	return nil
 }
 
-func (s *intMetalState) runBatch(list []metal.Dispatch, kind []int, R int, nch uint, ds []metal.Dispatch) error {
+func (s *intGPUState) runBatch(list []idisp, kind []int, R int, nch uint, ds []idisp) error {
 	b := s.b
 	ds = append(ds[:0], list...)
 	for i := range ds {
@@ -257,5 +257,5 @@ func (s *intMetalState) runBatch(list []metal.Dispatch, kind []int, R int, nch u
 		ct.Groups.W = uint(n)
 		ds = append(ds, gm, ct)
 	}
-	return s.g.dev.Run(ds...)
+	return s.g.dev.run(ds)
 }

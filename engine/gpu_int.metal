@@ -989,7 +989,7 @@ BSCORES(int_bscores128, 128, 64, 16)
 #define ETN 11392
 template <int HD, int KT>
 static inline void bpv(device const int *S, device const long *cmax, device const int *Vc, device const int *expa,
-                       device long *zp, device long *op, int base, constant BAttnArgs &a, uint3 tg3, uint tid,
+                       device long *zp, device long *op, int base, int R, constant BAttnArgs &a, uint3 tg3, uint tid,
                        threadgroup int *vs, threadgroup ushort *wt, threadgroup long *Ms, threadgroup long *zs,
                        threadgroup ushort *et, threadgroup int *nz, threadgroup uchar *z8) {
 	constexpr int DG = HD / 4, RG = 256 / DG, BRV = RG * 4, FK = KT < 16 ? KT : 16, RPS = 32 / KT;
@@ -1036,9 +1036,9 @@ static inline void bpv(device const int *S, device const long *cmax, device cons
 			int r = sg * RPS + lane / KT + 8 * RPS * i;
 			int t = k0 + key, p = base + t0 + r;
 			int w = 0;
-			if (t <= p) {
+			if (t <= p && t0 + r < R) { // rows past the batch's end hold stale scores: their indices could be anything
 				long d = Ms[r] - S[((long)(t0 + r) * a.nq + h) * a.smax + t];
-				if (d < ez) {
+				if (d >= 0 && d < ez) {
 					w = et[d];
 				}
 			}
@@ -1127,7 +1127,7 @@ static inline void bpv(device const int *S, device const long *cmax, device cons
 		threadgroup ushort et[ETN];                                                                                        \
 		threadgroup int nz;                                                                                                \
 		threadgroup uchar z8[(256 / (HD / 4)) / 2 * KT];                                                                   \
-		bpv<HD, KT>(S, cmax, Vc, expa, zp, op, pr->pos, a, tg3, tid, vs, wt, Ms, zs, et, &nz, z8);                         \
+		bpv<HD, KT>(S, cmax, Vc, expa, zp, op, pr->pos, pr->tok, a, tg3, tid, vs, wt, Ms, zs, et, &nz, z8);                         \
 	}
 BPV(int_bpv64, 64, 16)
 BPV(int_bpv128, 128, 8)

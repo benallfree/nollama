@@ -9,7 +9,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"github.com/benallfree/nollama/engine/internal/metal"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -302,15 +301,15 @@ func TestIntBatchBJJProfile(t *testing.T) {
 	gs := a.g
 	b := gs.b
 	pos, R := 23000, b.P
-	tk := unsafe.Slice((*int32)(unsafe.Pointer(unsafe.SliceData(b.toks.Bytes()))), R)
-	tg := unsafe.Slice((*int32)(unsafe.Pointer(unsafe.SliceData(b.tgt.Bytes()))), R)
+	tk := unsafe.Slice((*int32)(unsafe.Pointer(unsafe.SliceData(gs.g.dev.host(b.toks)))), R)
+	tg := unsafe.Slice((*int32)(unsafe.Pointer(unsafe.SliceData(gs.g.dev.host(b.tgt)))), R)
 	for i := range R {
 		tk[i], tg[i] = int32(toks[pos+i]), int32(ids[pos+i])
 	}
-	binary.LittleEndian.PutUint32(b.params.Bytes()[0:], uint32(R))
-	binary.LittleEndian.PutUint32(b.params.Bytes()[4:], uint32(pos))
+	binary.LittleEndian.PutUint32(gs.g.dev.host(b.params)[0:], uint32(R))
+	binary.LittleEndian.PutUint32(gs.g.dev.host(b.params)[4:], uint32(pos))
 	nch := uint((pos+R-1)/intKC + 1)
-	ds := append([]metal.Dispatch(nil), b.ds...)
+	ds := append([]idisp(nil), b.ds...)
 	for i := range ds {
 		switch b.kind[i] {
 		case scoreG:
@@ -322,15 +321,15 @@ func TestIntBatchBJJProfile(t *testing.T) {
 	for _, h := range b.head {
 		ds = append(ds, h[0], h[1])
 	}
-	run := func(ds []metal.Dispatch) float64 {
-		gs.g.dev.Run(ds...)
-		return float64(gs.g.dev.LastGPU.Microseconds()) / 1000
+	run := func(ds []idisp) float64 {
+		gs.g.dev.run(ds)
+		return float64(gs.g.dev.lastGPU().Microseconds()) / 1000
 	}
 	line := ""
 	for _, k := range []string{"int_gemm", "int_bscores64", "int_bpv64", "int_bcomb", "int_counts", "int_norm", "int_qkv"} {
-		var sub []metal.Dispatch
+		var sub []idisp
 		for _, d := range ds {
-			if d.P.Name == k {
+			if d.K == k {
 				sub = append(sub, d)
 			}
 		}

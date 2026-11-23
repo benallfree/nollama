@@ -59,3 +59,6 @@ type Dispatch struct {
 }
 
 func (d *Device) Run(ds ...Dispatch) error { return errors.New("metal: macOS only") }
+
+// SetRunChunk does nothing without Metal.
+func SetRunChunk(n int) int { return n }
