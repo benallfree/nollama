@@ -62,7 +62,8 @@ func openIntCUDA(m *IntModel) (intDev, ibuf, error) {
 	}
 	d := &cudaIntDev{dev: dev, mod: mod, ks: ks, rec: map[replayKey]*cuda.Graph{}}
 	if dev.Major >= 8 && os.Getenv("NOLLAMA_INT_NO_MMA") == "" {
-		names := []string{"int_dattn1_64", "int_dattn1_128", "int_dattn2_64", "int_dattn2_128", "int_matvec8"} // used by name
+		names := []string{"int_dattn1_64", "int_dattn1_128", "int_dattn2_64", "int_dattn2_128", "int_matvec8",
+			"int_dattn2a_64", "int_dattn2a_128", "int_mv2", "int_mvlog", "int_qkv2", "int_norm2", "int_mlp2", "int_mergea", "int_norm2s"} // used by name
 		for _, n := range cudaIntMMA {
 			names = append(names, n)
 		}

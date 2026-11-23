@@ -864,7 +864,7 @@ DATTN1(int_dattn1_128, 128)
 // pass 2: per (kv head, chunk): M per head from the chunk maxima; a chunk where every head's maximum is ez or more
 // below M has only zero weights (EXPA is 0 from ez on): Z and O are 0. Otherwise weights w = EXPA[min(M - s, na - 1)]
 // into planes (heads x 256 keys), Z, and O = w V on tensor cores (warp: dimension tiles; k = keys).
-template <int HD>
+template <int HD, bool ATOM>
 static __device__ __forceinline__ void dattn2(const long *S, const long *cmax, const int *expa, long *zpart, long *opart,
                                               const IntParams *pr, const AttnArgs &a, const unsigned char *Vp, int Mp, int ez,
                                               unsigned char *wp, long *Ms, int *zs, int *live) {
@@ -899,6 +899,9 @@ static __device__ __forceinline__ void dattn2(const long *S, const long *cmax, c
 	}
 	__syncthreads();
 	if (!*live) { // every weight in the chunk is 0
+		if (ATOM) {
+			return; // nothing to add
+		}
 		if (tid < (uint)grp) {
 			zpart[(j * grp + tid) * a.maxch + c] = 0;
 		}
@@ -971,25 +974,35 @@ static __device__ __forceinline__ void dattn2(const long *S, const long *cmax, c
 		for (int n = 0; n < NPW; n++) {
 			for (int e = 0; e < 2; e++) {
 				int d = (w * NPW + n) * 8 + tig * 2 + e;
-				opart[((long)(j * grp + gid) * a.maxch + c) * HD + d] = acc[n][e];
+				if (ATOM) { // the per-head totals, int_mergea's input (exact in any order)
+					atomicAdd((unsigned long long *)opart + (long)(j * grp + gid) * HD + d, (unsigned long long)acc[n][e]);
+				} else {
+					opart[((long)(j * grp + gid) * a.maxch + c) * HD + d] = acc[n][e];
+				}
 			}
 		}
 	}
 	if (tid < (uint)grp) {
-		zpart[(j * grp + tid) * a.maxch + c] = zs[tid];
+		if (ATOM) {
+			atomicAdd((unsigned long long *)zpart + j * grp + tid, (unsigned long long)zs[tid]);
+		} else {
+			zpart[(j * grp + tid) * a.maxch + c] = zs[tid];
+		}
 	}
 }
 
-#define DATTN2(NAME, HD)                                                                                                   \
+#define DATTN2(NAME, HD, ATOM)                                                                                                   \
 	extern "C" __global__ void NAME(const long *S, const long *cmax, const int *Vc, const int *expa, long *zpart,          \
 	                                long *opart, const IntParams *pr, AttnArgs a, const unsigned char *Vp, int Mp, int ez) { \
 		__shared__ __align__(16) unsigned char wp[2 * 16 * (ACH + 16)];                                                    \
 		__shared__ long Ms[16];                                                                                            \
 		__shared__ int zs[16], live;                                                                                       \
-		dattn2<HD>(S, cmax, expa, zpart, opart, pr, a, Vp, Mp, ez, wp, Ms, zs, &live);                                     \
+		dattn2<HD, ATOM>(S, cmax, expa, zpart, opart, pr, a, Vp, Mp, ez, wp, Ms, zs, &live);                                     \
 	}
-DATTN2(int_dattn2_64, 64)
-DATTN2(int_dattn2_128, 128)
+DATTN2(int_dattn2_64, 64, false)
+DATTN2(int_dattn2_128, 128, false)
+DATTN2(int_dattn2a_64, 64, true) // zpart, opart: the totals Zacc[nq], Oacc[nq * hd]
+DATTN2(int_dattn2a_128, 128, true)
 
 // int_matvec8: int_matvec (same arguments and results) with 8 lanes per row, 4 rows per warp, 32 rows a threadgroup:
 // for the many matrices with short rows, a whole warp per row leaves lanes idle and pays the reduction per row.
@@ -1024,3 +1037,5 @@ extern "C" __global__ void int_matvec8(const signed char *q, const short *s, con
 		out[row] = rsh(acc, to - (E + ex[einSlot]));
 	}
 }
+
+#include "gpu_int_step.cu"

@@ -141,7 +141,11 @@ func abs64(v int64) int64 {
 
 // TestIntGPUProfile times one token's dispatch list, whole and without each kernel type, to see where time goes.
 func TestIntGPUProfile(t *testing.T) {
-	m := loadIntDev(t, "0.5B", "auto")
+	size := os.Getenv("INTMODEL")
+	if size == "" {
+		size = "0.5B"
+	}
+	m := loadIntDev(t, size, "auto")
 	gs, err := m.gpu.newState(m, 32768)
 	if err != nil {
 		t.Fatal(err)
@@ -174,7 +178,15 @@ func TestIntGPUProfile(t *testing.T) {
 				float64(m.gpu.dev.lastGPU().Microseconds())/1000)
 		}
 	}
-	for _, k := range intKernels {
+	var names []string // the kernels this step list uses, in order of appearance
+	seen := map[string]bool{}
+	for _, d := range all {
+		if !seen[d.K] {
+			seen[d.K] = true
+			names = append(names, d.K)
+		}
+	}
+	for _, k := range names {
 		var rest []idisp
 		n := 0
 		for _, d := range all {

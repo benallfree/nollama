@@ -268,12 +268,110 @@ func (g *intGPU) newState(m *IntModel, maxlen int) (*intGPUState, error) {
 		tbl("int_table3", BO(tpart, 8*tch), BO(tpart, 16*tch), B(cum), C(V)),
 		tbl("int_table4", BO(tpart, 16*tch), B(cum), C(V)),
 	)
+	if s.kp != nil { // CUDA with tensor cores: the reference's fast step (gpu_int_step.cu) instead
+		cs, err := s.cudaSteps(stepBufs{h: h, mb: mb, ex: ex, mq: mq, shq: shq, kc: kc, vc: vc, sb: sb, cmax: cmax, o: o, p: p,
+			lg: lg, cum: cum, tpart: tpart}, qkvArgs, attnArgs, ez, tch)
+		if err != nil {
+			s.release()
+			return nil, err
+		}
+		ds = cs
+	}
 	if err := g.dev.prepare(ds, s.newBuffer); err != nil {
 		s.release()
 		return nil, err
 	}
 	s.ds = ds
 	return s, nil
+}
+
+type stepBufs struct{ h, mb, ex, mq, shq, kc, vc, sb, cmax, o, p, lg, cum, tpart ibuf }
+
+// cudaSteps is a step as the reference's fast path runs it (gpu_int_step.cu): matvecs split along K with atomic
+// partial sums, applied and zeroed by their consumers; attention into per-head totals, merged once. Same integers.
+func (s *intGPUState) cudaSteps(b stepBufs, qkvArgs, attnArgs []byte, ez, tch int) ([]idisp, error) {
+	m, g := s.m, s.g
+	D, I, V, hd, nq, nkv, L := m.D, m.I, m.V, m.hd, m.nq, m.nkv, m.L
+	qkvN := (nq + 2*nkv) * hd
+	var accQ, accO, accGU, accD, oacc, zacc, pmax ibuf
+	var err error
+	for _, x := range []struct {
+		dst *ibuf
+		n   int
+	}{{&accQ, 8 * qkvN}, {&accO, 8 * D}, {&accGU, 16 * I}, {&accD, 8 * D}, {&oacc, 8 * nq * hd}, {&zacc, 8 * nq},
+		{&pmax, 8}} {
+		if *x.dst, err = s.newBuffer(x.n); err != nil {
+			return nil, err
+		}
+	}
+	B := func(x ibuf) iarg { return iarg{Buf: x} }
+	BO := func(x ibuf, off int) iarg { return iarg{Buf: x, Offset: off} }
+	C, F := cArg, g.farg
+	null := iarg{}
+	blk := func(k string, threads int, args ...iarg) idisp {
+		return idisp{K: k, Args: args, Groups: isize{1, 1, 1}, Threads: isize{uint(threads), 1, 1}}
+	}
+	mv := func(w *intMat, x iarg, pro bool, out ibuf) idisp {
+		pa, pm := null, null
+		if pro {
+			pa, pm = B(b.p), B(pmax)
+		}
+		return idisp{K: "int_mv2", Args: []iarg{F(w.q), F(w.s), x, pa, pm, B(out), C(w.out), C(w.in)},
+			Groups: isize{uint((w.out + 63) / 64), uint(w.in / 128), 1}, Threads: isize{256, 1, 1}}
+	}
+	norm := func(acc iarg, gw []int64, E, einSlot int, pm iarg, add int) idisp {
+		k, nt := "int_norm2", 1024
+		if D <= 1024 { // small models: fewer threads, shorter reductions
+			k, nt = "int_norm2s", 256
+		}
+		return blk(k, nt, B(b.h), acc, F(gw), B(b.mb), B(b.ex), C(D), C(E), C(einSlot), pm, C(add))
+	}
+	maxch := s.maxch
+	rawA, rawF, rawS := m.g.Tensors["EXPA"].Data, m.g.Tensors["EXPF"].Data, m.g.Tensors["SIG"].Data
+	ds := []idisp{
+		{K: "int_embed", Args: []iarg{F(m.emb.q), F(m.emb.s), B(s.params), B(b.h), C(D), C(m.emb.e)},
+			Groups: isize{uint((D + 255) / 256), 1, 1}, Threads: isize{256, 1, 1}},
+		norm(null, m.layers[0].g1, 0, 0, null, 0),
+	}
+	for l := range m.layers {
+		ly := &m.layers[l]
+		next := m.gf
+		if l+1 < L {
+			next = m.layers[l+1].g1
+		}
+		kv, kpo := l*s.kvLayer, l*s.kpl
+		ds = append(ds,
+			mv(&ly.qkv, B(b.mb), false, accQ),
+			blk("int_qkv2", 256, B(accQ), F(ly.b), F(m.ropeC), F(m.ropeS), B(s.params), BO(b.kc, kv), BO(b.vc, kv),
+				BO(s.kp, kpo), BO(s.vp, kpo), C(s.mp), B(b.mq), B(b.shq), B(b.ex), iarg{Bytes: qkvArgs}, C(ly.qkv.e)),
+			idisp{K: fmt.Sprintf("int_dattn1_%d", hd), Args: []iarg{B(b.mq), B(b.shq), BO(b.kc, kv), B(b.sb), B(b.cmax),
+				B(s.params), iarg{Bytes: attnArgs}, BO(s.kp, kpo), C(s.mp)},
+				Groups: isize{uint(nkv), uint(maxch), 1}, Threads: isize{256, 1, 1}},
+			idisp{K: fmt.Sprintf("int_dattn2a_%d", hd), Args: []iarg{B(b.sb), B(b.cmax), BO(b.vc, kv), F(rawA), B(zacc),
+				B(oacc), B(s.params), iarg{Bytes: attnArgs}, BO(s.vp, kpo), C(s.mp), C(ez)},
+				Groups: isize{uint(nkv), uint(maxch), 1}, Threads: isize{256, 1, 1}},
+			blk("int_mergea", 1024, B(oacc), B(zacc), B(b.o), B(b.mb), B(b.ex), C(nq), C(hd)),
+			mv(&ly.o, B(b.mb), false, accO),
+			norm(B(accO), ly.g2, ly.o.e, 1, null, 1),
+			mv(&ly.gu, B(b.mb), false, accGU),
+			idisp{K: "int_mlp2", Args: []iarg{B(accGU), F(rawS), B(b.p), B(pmax), B(b.ex), C(I), C(ly.gu.e)},
+				Groups: isize{uint((I + 255) / 256), 1, 1}, Threads: isize{256, 1, 1}},
+			mv(&ly.d, null, true, accD),
+			norm(B(accD), next, ly.d.e, 0, B(pmax), 1),
+		)
+	}
+	tbl := func(k string, args ...iarg) idisp {
+		return idisp{K: k, Args: args, Groups: isize{uint(tch), 1, 1}, Threads: isize{256, 1, 1}}
+	}
+	ds = append(ds,
+		idisp{K: "int_mvlog", Args: []iarg{F(m.head.q), F(m.head.s), B(b.mb), B(b.lg), B(b.ex), C(V), C(D), C(m.head.e)},
+			Groups: isize{uint((V + 63) / 64), 1, 1}, Threads: isize{256, 1, 1}},
+		tbl("int_table1", B(b.lg), BO(b.tpart, 0), C(V)),
+		tbl("int_table2", B(b.lg), F(rawF), BO(b.tpart, 0), BO(b.tpart, 8*tch), B(b.cum), C(V), C(intNF)),
+		tbl("int_table3", BO(b.tpart, 8*tch), BO(b.tpart, 16*tch), B(b.cum), C(V)),
+		tbl("int_table4", BO(b.tpart, 16*tch), B(b.cum), C(V)),
+	)
+	return ds, nil
 }
 
 // kvplanes is the launch that copies rows' new keys and values (positions params.pos + row) into the planes.
