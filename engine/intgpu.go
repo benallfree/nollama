@@ -8,6 +8,8 @@ package engine
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 	"unsafe"
 )
@@ -69,7 +71,7 @@ type replayKey struct {
 
 // intGPU is a model's GPU: the device and the model file on it.
 type intGPU struct {
-	normTG int // threads for a step's norms (CUDA prefers more: shorter chains of divisions)
+	normTG int // threads for a step's norms
 	dev    intDev
 	file   ibuf
 	base   uintptr // the file's first byte in host memory
@@ -84,9 +86,6 @@ func openIntGPU(m *IntModel) (*intGPU, error) {
 		}
 	}
 	g := &intGPU{dev: dev, file: file, base: uintptr(unsafe.Pointer(unsafe.SliceData(m.g.data))), normTG: 256}
-	if dev.graphs() {
-		g.normTG = 1024
-	}
 	return g, nil
 }
 
@@ -183,9 +182,13 @@ func (g *intGPU) newState(m *IntModel, maxlen int) (*intGPUState, error) {
 			Threads: isize{W: 256, H: 1, D: 1}}
 	}
 	matvec := func(w *intMat, x ibuf, einSlot, to int, out ibuf) idisp {
-		return idisp{K: "int_matvec", Args: []iarg{F(w.q), F(w.s), B(x), B(out), B(ex),
+		d := idisp{K: "int_matvec", Args: []iarg{F(w.q), F(w.s), B(x), B(out), B(ex),
 			C(w.out), C(w.in), C(w.e), C(einSlot), C(to)},
 			Groups: isize{W: uint((w.out + 7) / 8), H: 1, D: 1}, Threads: isize{W: 256, H: 1, D: 1}}
+		if s.kp != nil && w.in <= 1024 && w.in%128 == 0 { // CUDA: short rows get 8 lanes each (int_matvec8, gpu_int_mma.cu)
+			d.K, d.Groups.W = "int_matvec8", uint((w.out+31)/32)
+		}
+		return d
 	}
 	norm := func(add int, E, einSlot int, gw []int64) idisp {
 		d := one("int_norm", B(h), B(acc), F(gw), B(mb), B(ex), C(D), C(E), C(einSlot), C(0), C(add), C(0, 0))
@@ -202,7 +205,8 @@ func (g *intGPU) newState(m *IntModel, maxlen int) (*intGPUState, error) {
 	kvLayer := 4 * nkv * maxlen * hd
 	s.kc, s.vc, s.kvLayer = kc, vc, kvLayer
 	if g.dev.planes() {
-		s.mp = (maxlen + 128 + 15) &^ 15 // tiles read up to a block's rows plus a tile past the last position
+		// a step's attention reads whole chunks; batches read up to a block's rows plus a tile past the last position
+		s.mp = (maxlen+intACH-1)/intACH*intACH + 128
 		s.kpl = nkv * 3 * s.mp * hd
 		if s.kp, err = nb(L * s.kpl); err == nil {
 			s.vp, err = nb(L * s.kpl)
@@ -213,6 +217,7 @@ func (g *intGPU) newState(m *IntModel, maxlen int) (*intGPUState, error) {
 		}
 	}
 	rawA, rawF, rawS := m.g.Tensors["EXPA"].Data, m.g.Tensors["EXPF"].Data, m.g.Tensors["SIG"].Data
+	ez := m.expaLen()
 
 	ds := []idisp{
 		grid("int_embed", D, F(m.emb.q), F(m.emb.s), B(s.params), B(h), C(D), C(m.emb.e)),
@@ -229,13 +234,20 @@ func (g *intGPU) newState(m *IntModel, maxlen int) (*intGPUState, error) {
 			one("int_qkv", B(acc), F(ly.b), F(m.ropeC), F(m.ropeS), B(s.params), BO(kc, l*kvLayer), BO(vc, l*kvLayer),
 				B(mq), B(shq), B(ex), iarg{Bytes: qkvArgs}, C(ly.qkv.e), C(0), C(0)),
 		)
-		// (the plane cache isn't kept per step: FeedBatch catches it up when it needs it)
+		var planeArgs1, planeArgs2 []iarg // the tensor-core attention reads the planes (kept per step too)
+		a1, a2 := "int_attn1", "int_attn2"
+		if s.kp != nil {
+			ds = append(ds, s.kvplanes(l, s.params, 1))
+			a1, a2 = fmt.Sprintf("int_dattn1_%d", hd), fmt.Sprintf("int_dattn2_%d", hd)
+			planeArgs1 = []iarg{BO(s.kp, l*s.kpl), C(s.mp)}
+			planeArgs2 = []iarg{BO(s.vp, l*s.kpl), C(s.mp), C(ez)}
+		}
 		ds = append(ds,
-			idisp{K: "int_attn1", Args: []iarg{B(mq), B(shq), BO(kc, l*kvLayer), B(sb), B(cmax),
-				B(s.params), iarg{Bytes: attnArgs}},
+			idisp{K: a1, Args: append([]iarg{B(mq), B(shq), BO(kc, l*kvLayer), B(sb), B(cmax),
+				B(s.params), iarg{Bytes: attnArgs}}, planeArgs1...),
 				Groups: isize{W: uint(nkv), H: uint(maxch), D: 1}, Threads: isize{W: intACH, H: 1, D: 1}},
-			idisp{K: "int_attn2", Args: []iarg{B(sb), B(cmax), BO(vc, l*kvLayer), F(rawA), B(zpart),
-				B(opart), B(s.params), iarg{Bytes: attnArgs}},
+			idisp{K: a2, Args: append([]iarg{B(sb), B(cmax), BO(vc, l*kvLayer), F(rawA), B(zpart),
+				B(opart), B(s.params), iarg{Bytes: attnArgs}}, planeArgs2...),
 				Groups: isize{W: uint(nkv), H: uint(maxch), D: 1}, Threads: isize{W: intACH, H: 1, D: 1}},
 			idisp{K: "int_attn3", Args: []iarg{B(zpart), B(opart), B(o), B(s.params),
 				iarg{Bytes: attnArgs}},
@@ -270,6 +282,20 @@ func (s *intGPUState) kvplanes(l int, params ibuf, rows int) idisp {
 	return idisp{K: "int_kvplanes", Args: []iarg{{Buf: s.kc, Offset: l * s.kvLayer}, {Buf: s.vc, Offset: l * s.kvLayer},
 		{Buf: s.kp, Offset: l * s.kpl}, {Buf: s.vp, Offset: l * s.kpl}, {Buf: params}, cArg(m.nkv), cArg(m.hd),
 		cArg(s.maxlen), cArg(s.mp)}, Groups: isize{uint(rows), 1, 1}, Threads: isize{256, 1, 1}}
+}
+
+// expaLen is where EXPA (nonincreasing) becomes 0 for good: weights from there on are 0.
+func (m *IntModel) expaLen() int {
+	ez := intNA
+	for ez > 0 && m.expA[ez-1] == 0 {
+		ez--
+	}
+	return ez
+}
+
+// attnChunked says whether a step's kernel runs a threadgroup per attention chunk (its grid follows the position).
+func attnChunked(k string) bool {
+	return k == "int_attn1" || k == "int_attn2" || strings.HasPrefix(k, "int_dattn")
 }
 
 func (s *intGPUState) newBuffer(n int) (ibuf, error) {
@@ -311,6 +337,9 @@ func (g *intGPU) farg(x any) iarg {
 func (s *intGPUState) step(tok, pos int) error {
 	s.g.dev.write(s.params, 0, i32b(tok, pos))
 	s.fresh = false
+	if s.kp != nil && s.kpTo == pos {
+		s.kpTo = pos + 1 // the step keeps the planes
+	}
 	nch := uint((pos + intACH) / intACH)
 	if s.g.dev.graphs() {
 		// a recording per power-of-two chunk count (chunks past the position return at once): few recordings, and
@@ -321,14 +350,14 @@ func (s *intGPUState) step(tok, pos int) error {
 		}
 		b = min(b, uint(s.maxch))
 		for i := range s.ds {
-			if k := s.ds[i].K; k == "int_attn1" || k == "int_attn2" {
+			if attnChunked(s.ds[i].K) {
 				s.ds[i].Groups.H = b
 			}
 		}
 		return s.g.dev.replay(replayKey{s, &s.ds[0], len(s.ds), int(b)}, s.ds)
 	}
 	for i := range s.ds { // the split-attention grids follow the position
-		if k := s.ds[i].K; k == "int_attn1" || k == "int_attn2" {
+		if attnChunked(s.ds[i].K) {
 			s.ds[i].Groups.H = nch
 		}
 	}

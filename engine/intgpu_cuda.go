@@ -62,11 +62,14 @@ func openIntCUDA(m *IntModel) (intDev, ibuf, error) {
 	}
 	d := &cudaIntDev{dev: dev, mod: mod, ks: ks, rec: map[replayKey]*cuda.Graph{}}
 	if dev.Major >= 8 && os.Getenv("NOLLAMA_INT_NO_MMA") == "" {
-		var names []string
+		names := []string{"int_dattn1_64", "int_dattn1_128", "int_dattn2_64", "int_dattn2_128", "int_matvec8"} // used by name
 		for _, n := range cudaIntMMA {
 			names = append(names, n)
 		}
 		if mm, mks, err := dev.Load(cudaIntMMAPTX, names...); err == nil {
+			for _, n := range names {
+				ks[n] = mks[n]
+			}
 			d.mma = mm
 			for k, n := range cudaIntMMA {
 				ks[k] = mks[n] // the tensor-core kernel runs under the portable one's name

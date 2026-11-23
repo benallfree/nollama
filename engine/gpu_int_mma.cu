@@ -752,3 +752,275 @@ extern "C" __global__ void int_gemm_mma(const signed char *q, const short *s, co
 		}
 	}
 }
+
+// ---- a step's attention on tensor cores (in place of int_attn1 / int_attn2, same grids and outputs) ----
+#define ACH 256
+struct AttnArgs {
+	int nq, nkv, hd, maxlen, na, maxch;
+};
+
+// pass 1: a threadgroup per (kv head, chunk of 256 positions): the grp query heads (rows of an m16 tile) against the
+// chunk's keys (warp w: keys 32w .. 32w+31), from the key planes; scores to S, the chunk's maxima to cmax.
+template <int HD>
+static __device__ __forceinline__ void dattn1(const int *mq, const int *shq, long *S, long *cmax, const IntParams *pr,
+                                              const AttnArgs &a, const unsigned char *Kp, int Mp, unsigned char *qp,
+                                              int *shs, long *pm) {
+	constexpr int LD = HD + 16;
+	int j = blockIdx.x, c = blockIdx.y, T = pr->pos + 1, grp = a.nq / a.nkv;
+	if (c * ACH >= T) {
+		return;
+	}
+	int tid = threadIdx.x, w = tid / 32, lane = tid % 32, gid = lane / 4, tig = lane % 4;
+	for (int i = tid; i < 16 * HD; i += 256) {
+		int g = i / HD, d = i % HD;
+		int q = g < grp ? mq[(j * grp + g) * HD + d] : 0;
+		qp[g * LD + d] = (unsigned char)(q & 255);
+		qp[16 * LD + g * LD + d] = (unsigned char)(q >> 8);
+	}
+	if (tid < 16) {
+		shs[tid] = tid < grp ? shq[j * grp + tid] : 0;
+	}
+	__syncthreads();
+	long acc[4][4];
+	for (int n = 0; n < 4; n++) {
+		for (int e = 0; e < 4; e++) {
+			acc[n][e] = 0;
+		}
+	}
+	int kb = c * ACH + w * 32; // this warp's first key
+#pragma unroll
+	for (int pa = 0; pa < 2; pa++) {
+#pragma unroll
+		for (int pb = 0; pb < 3; pb++) {
+			int cc[4][4] = {{0}};
+			const unsigned char *A = qp + pa * 16 * LD, *B = Kp + ((long)j * 3 + pb) * Mp * HD;
+#pragma unroll
+			for (int kd = 0; kd < HD; kd += 32) {
+				uint af[4];
+				af[0] = *(const uint *)(A + gid * LD + kd + tig * 4);
+				af[1] = *(const uint *)(A + (gid + 8) * LD + kd + tig * 4);
+				af[2] = *(const uint *)(A + gid * LD + kd + 16 + tig * 4);
+				af[3] = *(const uint *)(A + (gid + 8) * LD + kd + 16 + tig * 4);
+				for (int n = 0; n < 4; n++) {
+					const unsigned char *kr = B + (long)(kb + n * 8 + gid) * HD + kd + tig * 4;
+					uint bf[2] = {*(const uint *)kr, *(const uint *)(kr + 16)};
+					if (pa == 0 && pb < 2) {
+						mma8<false, false>(cc[n], af, bf);
+					} else if (pa == 0) {
+						mma8<false, true>(cc[n], af, bf);
+					} else if (pb < 2) {
+						mma8<true, false>(cc[n], af, bf);
+					} else {
+						mma8<true, true>(cc[n], af, bf);
+					}
+				}
+			}
+			for (int n = 0; n < 4; n++) {
+				for (int e = 0; e < 4; e++) {
+					acc[n][e] += (long)cc[n][e] << (8 * pa + 8 * pb);
+				}
+			}
+		}
+	}
+	// rows gid (heads; rows gid + 8 are padding): elements 0, 1 of each n-tile, keys kb + 8n + 2 tig + e
+	long mx = LMIN;
+	int g = gid;
+	for (int n = 0; n < 4; n++) {
+		for (int e = 0; e < 2; e++) {
+			int t = kb + n * 8 + tig * 2 + e;
+			if (g < grp && t < T) {
+				long s = rsh(acc[n][e], 42 - shs[g]);
+				S[(long)(j * grp + g) * a.maxlen + t] = s;
+				mx = max(mx, s);
+			}
+		}
+	}
+	mx = max(mx, shx(mx, 1));
+	mx = max(mx, shx(mx, 2));
+	if (tig == 0) {
+		pm[w * 8 + gid] = mx;
+	}
+	__syncthreads();
+	if (tid < (uint)grp) {
+		long m = LMIN;
+		for (int k = 0; k < 8; k++) {
+			m = max(m, pm[k * 8 + tid]);
+		}
+		cmax[(j * grp + tid) * a.maxch + c] = m;
+	}
+}
+
+#define DATTN1(NAME, HD)                                                                                                   \
+	extern "C" __global__ void NAME(const int *mq, const int *shq, const int *Kc, long *S, long *cmax, const IntParams *pr, \
+	                                AttnArgs a, const unsigned char *Kp, int Mp) {                                       \
+		__shared__ __align__(16) unsigned char qp[2 * 16 * (HD + 16)];                                                     \
+		__shared__ int shs[16];                                                                                            \
+		__shared__ long pm[64];                                                                                            \
+		dattn1<HD>(mq, shq, S, cmax, pr, a, Kp, Mp, qp, shs, pm);                                                          \
+	}
+DATTN1(int_dattn1_64, 64)
+DATTN1(int_dattn1_128, 128)
+
+// pass 2: per (kv head, chunk): M per head from the chunk maxima; a chunk where every head's maximum is ez or more
+// below M has only zero weights (EXPA is 0 from ez on): Z and O are 0. Otherwise weights w = EXPA[min(M - s, na - 1)]
+// into planes (heads x 256 keys), Z, and O = w V on tensor cores (warp: dimension tiles; k = keys).
+template <int HD>
+static __device__ __forceinline__ void dattn2(const long *S, const long *cmax, const int *expa, long *zpart, long *opart,
+                                              const IntParams *pr, const AttnArgs &a, const unsigned char *Vp, int Mp, int ez,
+                                              unsigned char *wp, long *Ms, int *zs, int *live) {
+	constexpr int LW = ACH + 16, NPW = HD / 64; // n-tiles (8 dimensions) per warp
+	int j = blockIdx.x, c = blockIdx.y, T = pr->pos + 1, grp = a.nq / a.nkv;
+	if (c * ACH >= T) {
+		return;
+	}
+	int nch = (T + ACH - 1) / ACH;
+	int tid = threadIdx.x, w = tid / 32, lane = tid % 32, gid = lane / 4, tig = lane % 4;
+	if (w < grp) {
+		long mx = LMIN;
+		for (int i = lane; i < nch; i += 32) {
+			mx = max(mx, cmax[(j * grp + w) * a.maxch + i]);
+		}
+		mx = max(mx, shx(mx, 16));
+		mx = max(mx, shx(mx, 8));
+		mx = max(mx, shx(mx, 4));
+		mx = max(mx, shx(mx, 2));
+		mx = max(mx, shx(mx, 1));
+		if (lane == 0) {
+			Ms[w] = mx;
+			zs[w] = 0;
+		}
+	}
+	if (tid == 0) {
+		*live = 0;
+	}
+	__syncthreads();
+	if (tid < (uint)grp && Ms[tid] - cmax[(j * grp + tid) * a.maxch + c] < ez) {
+		*live = 1;
+	}
+	__syncthreads();
+	if (!*live) { // every weight in the chunk is 0
+		if (tid < (uint)grp) {
+			zpart[(j * grp + tid) * a.maxch + c] = 0;
+		}
+		for (int i = tid; i < grp * HD; i += 256) {
+			opart[((long)(j * grp + i / HD) * a.maxch + c) * HD + i % HD] = 0;
+		}
+		return;
+	}
+	// weights: thread = key, all heads (rows 8..15 and heads past grp are zero)
+	int t = c * ACH + tid;
+	for (int g = 0; g < 16; g++) {
+		int wv = 0;
+		if (g < grp && t < T) {
+			long d = Ms[g] - S[(long)(j * grp + g) * a.maxlen + t];
+			if (d < ez) {
+				wv = expa[d];
+			}
+		}
+		wp[g * LW + tid] = (unsigned char)(wv & 255);
+		wp[16 * LW + g * LW + tid] = (unsigned char)(wv >> 8);
+		if (g < grp) {
+			int z = wv;
+			for (int o = 16; o > 0; o >>= 1) {
+				z += __shfl_xor_sync(0xffffffffu, z, o);
+			}
+			if (lane == 0) {
+				atomicAdd(&zs[g], z);
+			}
+		}
+	}
+	__syncthreads();
+	long acc[NPW][4];
+	for (int n = 0; n < NPW; n++) {
+		for (int e = 0; e < 4; e++) {
+			acc[n][e] = 0;
+		}
+	}
+#pragma unroll
+	for (int pa = 0; pa < 2; pa++) {
+#pragma unroll
+		for (int pb = 0; pb < 3; pb++) {
+			int cc[NPW][4] = {{0}};
+			const unsigned char *A = wp + pa * 16 * LW;
+			for (int kk = 0; kk < ACH; kk += 32) {
+				uint af[4];
+				af[0] = *(const uint *)(A + gid * LW + kk + tig * 4);
+				af[1] = *(const uint *)(A + (gid + 8) * LW + kk + tig * 4);
+				af[2] = *(const uint *)(A + gid * LW + kk + 16 + tig * 4);
+				af[3] = *(const uint *)(A + (gid + 8) * LW + kk + 16 + tig * 4);
+				for (int n = 0; n < NPW; n++) {
+					int d = (w * NPW + n) * 8 + gid;
+					const unsigned char *vr = Vp + (((long)j * 3 + pb) * HD + d) * Mp + c * ACH + kk + tig * 4;
+					uint bf[2] = {*(const uint *)vr, *(const uint *)(vr + 16)};
+					if (pb < 2) {
+						mma8<false, false>(cc[n], af, bf);
+					} else {
+						mma8<false, true>(cc[n], af, bf);
+					}
+				}
+			}
+			for (int n = 0; n < NPW; n++) {
+				for (int e = 0; e < 4; e++) {
+					acc[n][e] += (long)cc[n][e] << (8 * pa + 8 * pb);
+				}
+			}
+		}
+	}
+	// rows gid = heads: elements 0, 1 of each n-tile, dimensions (w * NPW + n) * 8 + 2 tig + e
+	if (gid < grp) {
+		for (int n = 0; n < NPW; n++) {
+			for (int e = 0; e < 2; e++) {
+				int d = (w * NPW + n) * 8 + tig * 2 + e;
+				opart[((long)(j * grp + gid) * a.maxch + c) * HD + d] = acc[n][e];
+			}
+		}
+	}
+	if (tid < (uint)grp) {
+		zpart[(j * grp + tid) * a.maxch + c] = zs[tid];
+	}
+}
+
+#define DATTN2(NAME, HD)                                                                                                   \
+	extern "C" __global__ void NAME(const long *S, const long *cmax, const int *Vc, const int *expa, long *zpart,          \
+	                                long *opart, const IntParams *pr, AttnArgs a, const unsigned char *Vp, int Mp, int ez) { \
+		__shared__ __align__(16) unsigned char wp[2 * 16 * (ACH + 16)];                                                    \
+		__shared__ long Ms[16];                                                                                            \
+		__shared__ int zs[16], live;                                                                                       \
+		dattn2<HD>(S, cmax, expa, zpart, opart, pr, a, Vp, Mp, ez, wp, Ms, zs, &live);                                     \
+	}
+DATTN2(int_dattn2_64, 64)
+DATTN2(int_dattn2_128, 128)
+
+// int_matvec8: int_matvec (same arguments and results) with 8 lanes per row, 4 rows per warp, 32 rows a threadgroup:
+// for the many matrices with short rows, a whole warp per row leaves lanes idle and pays the reduction per row.
+extern "C" __global__ void int_matvec8(const signed char *q, const short *s, const short *x, long *out, const int *ex,
+                                       int rows, int K, int E, int einSlot, int to) {
+	int lane = threadIdx.x % 32, sub = lane % 8;
+	int row = blockIdx.x * 32 + (threadIdx.x / 32) * 4 + lane / 8;
+	bool live = row < rows;
+	int ng = K / 64;
+	const signed char *qr = q + (long)min(row, rows - 1) * K;
+	const short *sr = s + (long)min(row, rows - 1) * ng;
+	long acc = 0;
+#pragma unroll 4
+	for (int col = 16 * sub; col < K; col += 128) { // 8 lanes x 16 bytes; a 64-group is 4 lanes
+		int4 xa = *(const int4 *)(x + col), xb = *(const int4 *)(x + col + 8); // 16 shorts
+		int4 w = *(const int4 *)(qr + col);                                       // 16 bytes
+		const short *xs = (const short *)&xa, *xt = (const short *)&xb;
+		const signed char *wb = (const signed char *)&w;
+		int d = 0;
+#pragma unroll
+		for (int i = 0; i < 8; i++) {
+			d += wb[i] * xs[i] + wb[8 + i] * xt[i];
+		}
+		d += __shfl_xor_sync(0xffffffffu, d, 1);
+		d += __shfl_xor_sync(0xffffffffu, d, 2);
+		if ((sub & 3) == 0) {
+			acc += (long)d * sr[col / 64];
+		}
+	}
+	acc += shx(acc, 4);
+	if (live && sub == 0) {
+		out[row] = rsh(acc, to - (E + ex[einSlot]));
+	}
+}

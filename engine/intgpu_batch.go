@@ -112,11 +112,7 @@ func (s *intGPUState) newBatch() (*intBatch, error) {
 	binary.LittleEndian.PutUint32(qkvArgs[12:], uint32(s.maxlen))
 	binary.LittleEndian.PutUint64(qkvArgs[16:], uint64(m.sc))
 	attnArgs := i32b(nq, nkv, hd, s.maxlen, intNA, 0)
-	// EXPA is nonincreasing and reaches 0: its nonzero head goes into threadgroup memory (ETN entries at most)
-	ez := intNA
-	for ez > 0 && m.expA[ez-1] == 0 {
-		ez--
-	}
+	ez := m.expaLen()
 	if ez > 11392 {
 		return nil, errors.New("intmodel: EXPA's nonzero part is longer than the batch kernels hold")
 	}
