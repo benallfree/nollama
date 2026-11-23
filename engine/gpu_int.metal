@@ -991,7 +991,7 @@ template <int HD, int KT>
 static inline void bpv(device const int *S, device const long *cmax, device const int *Vc, device const int *expa,
                        device long *zp, device long *op, int base, constant BAttnArgs &a, uint3 tg3, uint tid,
                        threadgroup int *vs, threadgroup ushort *wt, threadgroup long *Ms, threadgroup long *zs,
-                       threadgroup ushort *et, threadgroup int *nz) {
+                       threadgroup ushort *et, threadgroup int *nz, threadgroup uchar *z8) {
 	constexpr int DG = HD / 4, RG = 256 / DG, BRV = RG * 4, FK = KT < 16 ? KT : 16, RPS = 32 / KT;
 	int h = tg3.x, t0 = tg3.y * BRV, c = tg3.z, grp = a.nq / a.nkv, j = h / grp;
 	int pmax = base + t0 + BRV - 1;
@@ -1011,7 +1011,7 @@ static inline void bpv(device const int *S, device const long *cmax, device cons
 		zs[tid] = 0;
 	}
 	device const int *V = Vc + (long)j * a.maxlen * HD;
-	int rg = tid / DG, dg = tid % DG;
+	int rg = tid / DG, dg = tid % DG, g8 = rg / 2; // a simdgroup's rows lie in one 8-row group
 	long od[4][4];
 	for (int i = 0; i < 4; i++) {
 		for (int e = 0; e < 4; e++) {
@@ -1019,6 +1019,11 @@ static inline void bpv(device const int *S, device const long *cmax, device cons
 		}
 	}
 	uint sg = tid / 32, lane = tid % 32, key = lane % KT;
+	constexpr int NR = BRV / (8 * RPS); // rows per thread in the weights phase (always the same rows)
+	int zl[NR];                          // this lane's share of each row's Z, <= (KC / KT) * 2^15 < 2^31
+	for (int i = 0; i < NR; i++) {
+		zl[i] = 0;
+	}
 	for (int k0 = k0c; k0 < k1c; k0 += KT) {
 		threadgroup_barrier(mem_flags::mem_threadgroup);
 		if (tid == 0) {
@@ -1027,22 +1032,19 @@ static inline void bpv(device const int *S, device const long *cmax, device cons
 		threadgroup_barrier(mem_flags::mem_threadgroup);
 		// weights: lanes cover RPS rows x KT keys; simdgroup sg does rows sg * RPS + lane / KT + 8 * RPS * i
 		bool any = false;
-		for (int r = sg * RPS + lane / KT; r < BRV; r += 8 * RPS) {
+		for (int i = 0; i < NR; i++) {
+			int r = sg * RPS + lane / KT + 8 * RPS * i;
 			int t = k0 + key, p = base + t0 + r;
 			int w = 0;
 			if (t <= p) {
 				long d = Ms[r] - S[((long)(t0 + r) * a.nq + h) * a.smax + t];
-				w = d < ez ? et[d] : 0;
+				if (d < ez) {
+					w = et[d];
+				}
 			}
 			wt[r * KT + key] = (ushort)w;
 			any = any || w != 0;
-			int z = w; // the row's sum over its KT lanes, <= KT * 2^15
-			for (ushort x = KT / 2; x > 0; x >>= 1) {
-				z += simd_shuffle_xor(z, x);
-			}
-			if (key == 0) {
-				zs[r] += z;
-			}
+			zl[i] += w;
 		}
 		if (simd_any(any) && lane == 0) {
 			*nz = 1;
@@ -1054,6 +1056,15 @@ static inline void bpv(device const int *S, device const long *cmax, device cons
 		for (int i = tid; i < KT * HD; i += 256) {
 			vs[i] = V[(long)k0 * HD + i];
 		}
+		// z8[g * KT + k]: rows 8g .. 8g+7 all have weight 0 for key k (most weights are 0: EXPA is 0 far below the max)
+		for (int i = tid; i < (BRV / 8) * KT; i += 256) {
+			int g = i / KT, k = i % KT;
+			bool all0 = true;
+			for (int r = 8 * g; r < 8 * g + 8; r++) {
+				all0 = all0 && wt[r * KT + k] == 0;
+			}
+			z8[i] = all0;
+		}
 		threadgroup_barrier(mem_flags::mem_threadgroup);
 		for (int k1 = 0; k1 < KT; k1 += FK) {
 			int4 sh[4], sl[4];
@@ -1062,6 +1073,9 @@ static inline void bpv(device const int *S, device const long *cmax, device cons
 				sl[i] = 0;
 			}
 			for (int k = k1; k < k1 + FK; k++) {
+				if (z8[g8 * KT + k]) {
+					continue; // the same for the whole simdgroup: its rows lie in one 8-row group
+				}
 				int4 v = *(threadgroup const int4 *)(vs + k * HD + dg * 4);
 				int4 vh = v >> 11, vl = v & 0x7ff;
 				for (int i = 0; i < 4; i++) {
@@ -1075,6 +1089,16 @@ static inline void bpv(device const int *S, device const long *cmax, device cons
 					od[i][e] += ((long)sh[i][e] << 11) + sl[i][e];
 				}
 			}
+		}
+	}
+	// Z per row: sum the KT lanes that held it
+	for (int i = 0; i < NR; i++) {
+		int z = zl[i];
+		for (ushort x = KT / 2; x > 0; x >>= 1) {
+			z += simd_shuffle_xor(z, x);
+		}
+		if (key == 0) {
+			zs[sg * RPS + lane / KT + 8 * RPS * i] = z;
 		}
 	}
 	threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1102,7 +1126,8 @@ static inline void bpv(device const int *S, device const long *cmax, device cons
 		threadgroup long zs[(256 / (HD / 4)) * 4];                                                                         \
 		threadgroup ushort et[ETN];                                                                                        \
 		threadgroup int nz;                                                                                                \
-		bpv<HD, KT>(S, cmax, Vc, expa, zp, op, pr->pos, a, tg3, tid, vs, wt, Ms, zs, et, &nz);                             \
+		threadgroup uchar z8[(256 / (HD / 4)) / 2 * KT];                                                                   \
+		bpv<HD, KT>(S, cmax, Vc, expa, zp, op, pr->pos, a, tg3, tid, vs, wt, Ms, zs, et, &nz, z8);                         \
 	}
 BPV(int_bpv64, 64, 16)
 BPV(int_bpv128, 128, 8)
