@@ -26,7 +26,8 @@ var cudaIntMMAPTX string
 
 // With the byte-plane KV cache: scores (maxima only) and weights x V (recomputing scores) on tensor cores.
 // cudaIntDyn: dynamic shared memory per tensor-core kernel (EXPA's nonzero head as ushorts, ETN entries).
-var cudaIntDyn = map[string]int{"int_bpv2_mma64": 2 * 11392, "int_bpv2_mma128": 2 * 11392}
+// int_gemm_mma3: GEMM3_SMEM, 3 stages of 64 x 160 + 128 x 80 + 256 bytes.
+var cudaIntDyn = map[string]int{"int_bpv2_mma64": 2 * 11392, "int_bpv2_mma128": 2 * 11392, "int_gemm_mma3": 3 * (64*160 + 128*80 + 256)}
 
 var cudaIntMMA = map[string]string{"int_bscores64": "int_bmax_mma64", "int_bscores128": "int_bmax_mma128",
 	"int_bpv64": "int_bpv2_mma64", "int_bpv128": "int_bpv2_mma128", "int_kvplanes": "int_kvplanes",
@@ -66,7 +67,7 @@ func openIntCUDA(m *IntModel) (intDev, ibuf, error) {
 	d := &cudaIntDev{dev: dev, mod: mod, ks: ks, rec: map[replayKey]*cuda.Graph{}}
 	if dev.Major >= 8 && os.Getenv("NOLLAMA_INT_NO_MMA") == "" {
 		names := []string{"int_dattn1_64", "int_dattn1_128", "int_dattn2_64", "int_dattn2_128", "int_matvec8",
-			"int_dattn2a_64", "int_dattn2a_128", "int_mv2", "int_mvlog", "int_qkv2", "int_norm2", "int_mlp2", "int_mergea", "int_norm2s", "int_battn64", "int_battn128", "int_gemm_mma2"} // used by name
+			"int_dattn2a_64", "int_dattn2a_128", "int_mv2", "int_mvlog", "int_qkv2", "int_norm2", "int_mlp2", "int_mergea", "int_norm2s", "int_battn64", "int_battn128", "int_gemm_mma2", "int_gemm_mma3"} // used by name
 		for _, n := range cudaIntMMA {
 			names = append(names, n)
 		}

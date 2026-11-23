@@ -112,14 +112,14 @@ func (s *intGPUState) newBatch() (*intBatch, error) {
 			C(w.e), C(einSlot), C(to), C(0, mN, outS, 0)},
 			Groups:  isize{W: uint((w.out + 63) / 64), H: uint((rows + intGemmRows - 1) / intGemmRows), D: 1},
 			Threads: isize{W: 256, H: 1, D: 1}}
-		if s.kp != nil && os.Getenv("NOLLAMA_INT_GEMM2") != "" { // experiment: 128 x 64 tiles (slower so far)
-			d.K, d.Groups.W, d.Groups.H = "int_gemm_mma2", uint((w.out+127)/128), uint((rows+63)/64)
+		if k := gemm128(s); k != "" { // 128 x 64 tiles
+			d.K, d.Groups.W, d.Groups.H = k, uint((w.out+127)/128), uint((rows+63)/64)
 		}
 		return d
 	}
 	gemm := func(w *intMat, einSlot, to int, out ibuf, outS int) {
 		k := gemmH
-		if s.kp != nil && os.Getenv("NOLLAMA_INT_GEMM2") != "" {
+		if gemm128(s) != "" {
 			k = gemm2H
 		}
 		add(k, gemmD(w, B(mb), B(ex), einSlot, to, B(out), outS, P))
@@ -320,7 +320,7 @@ func (s *intGPUState) runBatch(list []idisp, kind []int, R int, nch uint, ds []i
 	for hb := 0; hb*intHeadRows < R; hb++ {
 		n := min(intHeadRows, R-hb*intHeadRows)
 		gm, ct := b.head[hb][0], b.head[hb][1]
-		if gm.K == "int_gemm_mma2" {
+		if gm.K != "int_gemm" {
 			gm.Groups.H = uint((n + 63) / 64)
 		} else {
 			gm.Groups.H = uint((n + intGemmRows - 1) / intGemmRows)
@@ -329,4 +329,17 @@ func (s *intGPUState) runBatch(list []idisp, kind []int, R int, nch uint, ds []i
 		ds = append(ds, gm, ct)
 	}
 	return s.g.dev.run(ds)
+}
+
+// gemm128 names the 128-output x 64-row GEMM kernel batches use on tensor cores: int_gemm_mma3 (pipelined), or the
+// unpipelined int_gemm_mma2 with NOLLAMA_INT_GEMM2; "" (int_gemm's 64 x 32 tiles) without planes or with
+// NOLLAMA_INT_GEMM1.
+func gemm128(s *intGPUState) string {
+	switch {
+	case s.kp == nil || os.Getenv("NOLLAMA_INT_GEMM1") != "":
+		return ""
+	case os.Getenv("NOLLAMA_INT_GEMM2") != "":
+		return "int_gemm_mma2"
+	}
+	return "int_gemm_mma3"
 }

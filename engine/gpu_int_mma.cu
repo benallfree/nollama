@@ -1309,3 +1309,136 @@ extern "C" __global__ void __launch_bounds__(256) int_gemm_mma2(const signed cha
 		}
 	}
 }
+
+// ---- int_gemm_mma3: int_gemm_mma2's tile (128 outputs x 64 rows, warp 32 x 32, planes scaled one at a time) with a
+// pipeline: raw activations (shorts) and weights stream into NST shared-memory stages by cp.async while earlier
+// groups compute; the activations' byte planes come from the raw shorts in registers (__byte_perm), so nothing is
+// converted in shared memory. Same arguments, grid and integers as int_gemm. Dynamic shared memory: GEMM3_SMEM.
+#define GEMM3_NST 3
+#define GEMM3_XLD 160 // bytes per activation row (64 shorts + 32): the 8 rows of a fragment load hit distinct banks
+#define GEMM3_WLD 80  // bytes per weight row (64 + 16)
+#define GEMM3_STAGE (64 * GEMM3_XLD + 128 * GEMM3_WLD + 128 * 2)
+#define GEMM3_SMEM (GEMM3_NST * GEMM3_STAGE)
+static __device__ __forceinline__ void cpa16(void *sm, const void *g) {
+	uint sa = (uint)__cvta_generic_to_shared(sm);
+	asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(sa), "l"(g));
+}
+static __device__ __forceinline__ void cpa_commit() { asm volatile("cp.async.commit_group;"); }
+template <int N> static __device__ __forceinline__ void cpa_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N)); }
+
+extern "C" __global__ void __launch_bounds__(256, 2) int_gemm_mma3(const signed char *q, const short *s, const short *x,
+                                                                  long *out, const int *ex, int O, int K, int E,
+                                                                  int einSlot, int to, int4 st) {
+	extern __shared__ __align__(16) unsigned char g3[];
+	int xS = st.y, outS = st.z;
+	int o0 = blockIdx.x * 128, t0 = blockIdx.y * 64;
+	int tid = threadIdx.x, w = tid / 32, lane = tid % 32, gid = lane / 4, tig = lane % 4;
+	int rw = (w % 2) * 32, ow = (w / 2) * 32;
+	int ng = K / 64;
+	// this thread's copies: activation chunks i = tid, tid + 256 (row i / 8, 16 bytes i % 8); weight chunks likewise
+	// (row i / 4, 16 bytes i % 4)
+	const short *xg[2];
+	const signed char *wg[2];
+	int xo[2], wo[2];
+	for (int u = 0; u < 2; u++) {
+		int i = tid + u * 256;
+		xg[u] = x + (long)(t0 + i / 8) * xS + (i % 8) * 8;
+		xo[u] = (i / 8) * GEMM3_XLD + (i % 8) * 16;
+		wg[u] = q + (long)min(o0 + i / 4, O - 1) * K + (i % 4) * 16;
+		wo[u] = 64 * GEMM3_XLD + (i / 4) * GEMM3_WLD + (i % 4) * 16;
+	}
+	const short *sg = s + (long)min(o0 + (tid & 127), O - 1) * ng;
+	auto issue = [&](int g) {
+		if (g < ng) {
+			unsigned char *b = g3 + (g % GEMM3_NST) * GEMM3_STAGE;
+			for (int u = 0; u < 2; u++) {
+				cpa16(b + xo[u], xg[u] + g * 64);
+				cpa16(b + wo[u], wg[u] + g * 64);
+			}
+		}
+		cpa_commit();
+	};
+	for (int g = 0; g < GEMM3_NST - 1; g++) {
+		issue(g);
+		if (tid < 128 && g < ng) {
+			((short *)(g3 + g * GEMM3_STAGE + 64 * GEMM3_XLD + 128 * GEMM3_WLD))[tid] = sg[g];
+		}
+	}
+	long acc[2][4][4];
+	for (int m = 0; m < 2; m++) {
+		for (int n = 0; n < 4; n++) {
+			for (int e = 0; e < 4; e++) {
+				acc[m][n][e] = 0;
+			}
+		}
+	}
+	for (int g = 0; g < ng; g++) {
+		int gn = g + GEMM3_NST - 1;
+		issue(gn);
+		short sv = tid < 128 && gn < ng ? sg[gn] : 0; // in flight during the compute below
+		cpa_wait<GEMM3_NST - 1>();
+		__syncthreads();
+		const unsigned char *b = g3 + (g % GEMM3_NST) * GEMM3_STAGE;
+		const unsigned char *X = b, *W = b + 64 * GEMM3_XLD;
+		const short *sc = (const short *)(b + 64 * GEMM3_XLD + 128 * GEMM3_WLD);
+#pragma unroll
+		for (int pl = 0; pl < 2; pl++) {
+			int cc[2][4][4] = {{{0}}};
+			const uint sel = pl == 0 ? 0x6420 : 0x7531; // low or high bytes of 4 shorts
+#pragma unroll
+			for (int kd = 0; kd < 64; kd += 32) {
+				uint af[2][4];
+#pragma unroll
+				for (int m = 0; m < 2; m++) {
+					int rA = rw + m * 16 + gid;
+#pragma unroll
+					for (int f = 0; f < 4; f++) {
+						int r = rA + (f & 1) * 8, k = kd + (f >> 1) * 16 + tig * 4;
+						uint2 v = *(const uint2 *)(X + r * GEMM3_XLD + k * 2);
+						af[m][f] = __byte_perm(v.x, v.y, sel);
+					}
+				}
+#pragma unroll
+				for (int n = 0; n < 4; n++) {
+					int o = ow + n * 8 + gid;
+					uint bf[2] = {*(const uint *)(W + o * GEMM3_WLD + kd + tig * 4),
+					              *(const uint *)(W + o * GEMM3_WLD + kd + 16 + tig * 4)};
+#pragma unroll
+					for (int m = 0; m < 2; m++) {
+						if (pl == 0) {
+							mma8<false, true>(cc[m][n], af[m], bf);
+						} else {
+							mma8<true, true>(cc[m][n], af[m], bf);
+						}
+					}
+				}
+			}
+#pragma unroll
+			for (int n = 0; n < 4; n++) {
+#pragma unroll
+				for (int e01 = 0; e01 < 2; e01++) {
+					int sv2 = (int)sc[ow + n * 8 + tig * 2 + e01] << (8 * pl);
+#pragma unroll
+					for (int m = 0; m < 2; m++) {
+						acc[m][n][e01] += (long)cc[m][n][e01] * sv2;
+						acc[m][n][e01 + 2] += (long)cc[m][n][e01 + 2] * sv2;
+					}
+				}
+			}
+		}
+		if (tid < 128 && gn < ng) {
+			((short *)(g3 + (gn % GEMM3_NST) * GEMM3_STAGE + 64 * GEMM3_XLD + 128 * GEMM3_WLD))[tid] = sv;
+		}
+		__syncthreads();
+	}
+	for (int m = 0; m < 2; m++) {
+		for (int n = 0; n < 4; n++) {
+			for (int e = 0; e < 4; e++) {
+				int t = t0 + rw + m * 16 + gid + (e < 2 ? 0 : 8), o = o0 + ow + n * 8 + tig * 2 + (e & 1);
+				if (o < O) {
+					out[(long)t * outS + o] = rsh(acc[m][n][e], to - (E + ex[4 * t + einSlot]));
+				}
+			}
+		}
+	}
+}
