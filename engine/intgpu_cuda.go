@@ -139,12 +139,7 @@ func (d *cudaIntDev) alloc(n int) (ibuf, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &cudaIntBuf{p, n}
-	zero := make([]byte, min(n, 64<<20))
-	for off := 0; off < n; off += len(zero) {
-		d.write(b, off, zero[:min(len(zero), n-off)])
-	}
-	return b, nil
+	return &cudaIntBuf{p, n}, nil // zeroed on the device by Alloc
 }
 
 func (d *cudaIntDev) free(b ibuf) { d.dev.Free(b.(*cudaIntBuf).p) }

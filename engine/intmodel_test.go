@@ -461,3 +461,36 @@ func TestIntBatchSparsity(t *testing.T) {
 	t.Logf("%s: weights %d, nonzero %d (%.2f%%); key tiles %d, nonzero %d (%.2f%%)", size, c[0], c[1],
 		100*float64(c[1])/float64(c[0]), c[2], c[3], 100*float64(c[3])/float64(c[2]))
 }
+
+// TestIntBatchBJJPhases: where a BJJ compression's time goes (INTMODEL): the session, then FeedBatch in 2048-token
+// chunks as signal calls it, with the batches' GPU time.
+func TestIntBatchBJJPhases(t *testing.T) {
+	size := os.Getenv("INTMODEL")
+	if size == "" {
+		size = "0.5B"
+	}
+	m := loadIntDev(t, size, "auto")
+	ids := vecIDs(t, "bjj.ids.json")
+	toks := append([]int{m.BOS()}, ids[:len(ids)-1]...)
+	for run := 0; run < 2; run++ {
+		t0 := time.Now()
+		a, err := m.NewSession(len(ids))
+		if err != nil {
+			t.Fatal(err)
+		}
+		tSes := time.Since(t0)
+		g0 := intBatchGPU
+		t1 := time.Now()
+		for k0 := 0; k0 < len(ids); k0 += 2048 {
+			k1 := min(k0+2048, len(ids))
+			if _, err := a.FeedBatch(toks[k0:k1], ids[k0:k1]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		tFeed := time.Since(t1)
+		t2 := time.Now()
+		a.Close()
+		t.Logf("%s run %d: session %v, batches %v (GPU %v), close %v", size, run, tSes.Round(time.Millisecond),
+			tFeed.Round(time.Millisecond), (intBatchGPU - g0).Round(time.Millisecond), time.Since(t2).Round(time.Millisecond))
+	}
+}
