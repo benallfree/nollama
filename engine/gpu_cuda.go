@@ -28,7 +28,7 @@ var cudaDetPTX string
 //go:embed gpu_cuda_mma.ptx
 var cudaMMAPTX string
 
-var cudaMMAKernels = []string{"quant_act_mma", "matmul_q4k_mmq"}
+var cudaMMAKernels = []string{"quant_act_mma", "matmul_q4k_mmq", "matmul_q6k_mmq"}
 
 // cudaNoMMQ keeps prompts on the half-precision tensor-core kernels even where the int8 ones load (tests compare).
 var cudaNoMMQ = false
@@ -258,12 +258,12 @@ func (b *cudaBatch) matmul(w *weight, x, out gpuRef, n int, act gpuRef) {
 		b.weightArg(w), carg(x), carg(out), cuda.Arg{Bytes: u32(uint32(w.rows), uint32(w.cols/k.step), uint32(w.rowBytes), uint32(w.cols))})
 }
 
-// mmq runs a prompt matmul on the int8 tensor cores when the GPU has them and w is Q4_K: x is quantized into
-// act (once for matmuls sharing it), then multiplied with the weights' quants. It reports false to leave the matmul
-// to the half-precision kernels.
+// mmq runs a prompt matmul on the int8 tensor cores when the GPU has them and w is Q4_K or Q6_K: x is quantized
+// into act (once for matmuls sharing it), then multiplied with the weights' quants. It reports false to leave the
+// matmul to the half-precision kernels.
 func (b *cudaBatch) mmq(w *weight, x, out gpuRef, n int, act gpuRef) bool {
-	// Q8_0 measured no faster this way on an A16; Q6_K (16-element scales, so k16 MMAs) slower.
-	kernel := map[uint32]string{typeQ4_K: "matmul_q4k_mmq"}[w.typ]
+	// Q8_0 measured no faster this way on an A16.
+	kernel := map[uint32]string{typeQ4_K: "matmul_q4k_mmq", typeQ6_K: "matmul_q6k_mmq"}[w.typ]
 	qbytes := n * w.cols // int8 quants, then a (scale, scaled sum) pair per 32
 	if b.c.mmaMod == nil || cudaNoMMQ || cudaPromptF32 || kernel == "" || w.cols%128 != 0 || act.buf == nil ||
 		act.buf.size()-act.off < qbytes+qbytes/32*8 {

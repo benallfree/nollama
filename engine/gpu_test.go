@@ -143,7 +143,7 @@ func TestGPUMatmulKQuantsSynthetic(t *testing.T) {
 		size     int
 		f16s     []int // offsets of the block's f16 scales
 		rows, nb int
-	}{{typeQ4_K, q4kBytes, []int{0, 2}, 77, 8}, {typeQ6_K, q6kBytes, []int{208}, 77, 8}, {typeF16, 512, f16Offsets(256), 77, 8}} {
+	}{{typeQ4_K, q4kBytes, []int{0, 2}, 77, 8}, {typeQ6_K, q6kBytes, []int{208}, 77, 8}, {typeQ6_K, q6kBytes, []int{208}, 77, 7}, {typeF16, 512, f16Offsets(256), 77, 8}} {
 		if !b.supports(c.typ) {
 			t.Logf("%s has no %s", b.name(), typeName(c.typ))
 			continue

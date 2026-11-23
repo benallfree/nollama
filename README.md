@@ -404,7 +404,7 @@ nollama runs the model on a GPU when it finds one that works, with no toolkit or
 - **NVIDIA cards** (compute capability 7.5 and newer: T4, RTX 20xx and later, A10, A16, A100, L4, L40S, H100) on Linux
   and Windows: CUDA, through the NVIDIA driver alone (`libcuda.so.1` or `nvcuda.dll`). The driver compiles nollama's
   kernels for the card when the model loads. The model has to fit in the card's memory. On compute 8.0 and newer, prompts
-  with Q4_K weights use the int8 tensor cores.
+  with Q4_K and Q6_K weights use the int8 tensor cores.
 
 It takes models whose weights are all Q8_0, Q4_K, Q6_K or F16 (Ollama's Q8_0 and Q4_K_M files are), with any KV cache
 type (see [Long contexts](#long-contexts-a-smaller-kv-cache)). When something doesn't fit, such as another weight type
@@ -525,9 +525,9 @@ prompt, then after the long one.
 | NVIDIA A16 (CUDA), Vultr `vcg-a16-6c-60g-16vram` | 4b Q4_K_M | 477 / 733 tok/s | 38 / 34 tok/s | 1,290 tok/s | 40 to 41 tok/s |
 
 Writing runs at 85 to 100% of Ollama's GPU speed. Reading prompts is the gap: 40 to 65% of Ollama's, so a long prompt
-takes about twice as long before the first word. The A16 rows predate copying a prompt's keys and values back through
-page-locked memory, which made reading the long prompt 5 to 8% faster there (against the previous build on the same
-machine). `go run ./engine/cmd/bench run -gguf FILE -gpu auto -prompt long`
+takes about twice as long before the first word. The A16 rows predate two later changes, each measured against the previous build on
+the same machine: copying a prompt's keys and values back through page-locked memory made reading the long prompt 5
+to 8% faster there, and int8 tensor cores for Q6_K weights made Q4_K_M prompts another 2 to 4% faster. `go run ./engine/cmd/bench run -gguf FILE -gpu auto -prompt long`
 measures one model; `-kv f16` picks the cache.
 
 ### On small cloud servers
