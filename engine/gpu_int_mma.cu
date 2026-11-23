@@ -36,6 +36,14 @@ MMA8(false, true, "u8", "s8")
 MMA8(true, false, "s8", "u8")
 MMA8(true, true, "s8", "s8")
 
+// cp.async: 16 bytes global -> shared without registers; groups committed, then waited for (all but the newest N)
+static __device__ __forceinline__ void cpa16(void *sm, const void *g) {
+	uint sa = (uint)__cvta_generic_to_shared(sm);
+	asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(sa), "l"(g));
+}
+static __device__ __forceinline__ void cpa_commit() { asm volatile("cp.async.commit_group;"); }
+template <int N> static __device__ __forceinline__ void cpa_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N)); }
+
 // Scores on tensor cores. A threadgroup per (kv head, block of QR / grp rows, key chunk), as int_bscores: QR query
 // rows (grp heads x rows) against the chunk's keys in tiles of KT. Warp w computes m-tile w % MT (16 query rows) for
 // its share of the KT / 8 n-tiles (8 keys each).
@@ -469,7 +477,7 @@ BMAX_MMA_LB(int_bmax_mma128_lb4, 128, 64, 32, 4)
 
 // pass 2: per (query head, block of BRV rows, key chunk): the scores again (tensor cores make that cheaper than
 // storing them), weights w = EXPA[min(M - s, na - 1)], the chunk's Z and O = sum w V; partials to zp, op as int_bpv.
-template <int HD, int BRV, bool CNT = false>
+template <int HD, int BRV, bool CNT = false, bool PIPE = true>
 static __device__ __forceinline__ void bpv2_mma(const long *cmax, const int *expa, long *zp, long *op, const unsigned char *Kp,
                                                 const unsigned char *Vp, int Mp, const int *mq, const int *shq, int base,
                                                 int R, const BAttnArgs &a, uint3 tg3, uint tid, unsigned char *qp,
@@ -516,16 +524,45 @@ static __device__ __forceinline__ void bpv2_mma(const long *cmax, const int *exp
 			acc[n][e] = 0;
 		}
 	}
-	for (int k0 = k0c; k0 < k1c; k0 += KT) {
-		__syncthreads();
+	// PIPE: K and V tiles by cp.async: V(k0) streams in while k0's scores compute, K(k0 + KT) while its V products do
+	auto loadK = [&](int k) {
 		for (int p = 0; p < 3; p++) {
 			for (int i = tid; i < KT * HD / 16; i += 256) {
 				int kk = i / (HD / 16), q = i % (HD / 16);
-				*(uint4 *)(kp + p * KT * LD + kk * LD + q * 16) =
-				    *(const uint4 *)(Kp + (((long)j * 3 + p) * Mp + k0 + kk) * HD + q * 16);
+				cpa16(kp + p * KT * LD + kk * LD + q * 16, Kp + (((long)j * 3 + p) * Mp + k + kk) * HD + q * 16);
 			}
 		}
+		cpa_commit();
+	};
+	auto loadV = [&](int k) {
+		for (int p = 0; p < 3; p++) {
+			for (int i = tid; i < HD * 2; i += 256) {
+				int d = i / 2, q = i % 2;
+				cpa16(vp + p * HD * LW + d * LW + q * 16, Vp + (((long)j * 3 + p) * HD + d) * Mp + k + q * 16);
+			}
+		}
+		cpa_commit();
+	};
+	if (PIPE && k0c < k1c) {
+		__syncthreads(); // the q planes' writes above are plain stores; cp.async targets other arrays
+		loadK(k0c);
+	}
+	for (int k0 = k0c; k0 < k1c; k0 += KT) {
 		__syncthreads();
+		if (PIPE) {
+			cpa_wait<0>(); // K(k0) (and any V never waited for, from a skipped tile)
+			__syncthreads();
+			loadV(k0);
+		} else {
+			for (int p = 0; p < 3; p++) {
+				for (int i = tid; i < KT * HD / 16; i += 256) {
+					int kk = i / (HD / 16), q = i % (HD / 16);
+					*(uint4 *)(kp + p * KT * LD + kk * LD + q * 16) =
+					    *(const uint4 *)(Kp + (((long)j * 3 + p) * Mp + k0 + kk) * HD + q * 16);
+				}
+			}
+			__syncthreads();
+		}
 		// one key tile (8 keys) at a time: scores (6 plane pairs, 4 int64s), then weights into the planes wp
 		int any = 0;
 		for (int n = 0; n < SNPW; n++) {
@@ -582,18 +619,29 @@ static __device__ __forceinline__ void bpv2_mma(const long *cmax, const int *exp
 				any |= wv;
 			}
 		}
-		int anyb = __syncthreads_or(any);
+		int anyb = __syncthreads_or(any); // also: every warp is done with kp
 		if (CNT && tid == 0) {
 			ntile++;
 			nztile += anyb != 0;
 		}
+		if (PIPE && k0 + KT < k1c) {
+			loadK(k0 + KT);
+		}
 		if (!anyb) {
 			continue; // every weight 0: nothing to add
 		}
-		for (int p = 0; p < 3; p++) {
-			for (int i = tid; i < HD * 2; i += 256) { // KT = 32 keys: two 16-byte pieces per dimension
-				int d = i / 2, q = i % 2;
-				*(uint4 *)(vp + p * HD * LW + d * LW + q * 16) = *(const uint4 *)(Vp + (((long)j * 3 + p) * HD + d) * Mp + k0 + q * 16);
+		if (PIPE) {
+			if (k0 + KT < k1c) {
+				cpa_wait<1>(); // V(k0); K(k0 + KT) may still be in flight
+			} else {
+				cpa_wait<0>();
+			}
+		} else {
+			for (int p = 0; p < 3; p++) {
+				for (int i = tid; i < HD * 2; i += 256) { // KT = 32 keys: two 16-byte pieces per dimension
+					int d = i / 2, q = i % 2;
+					*(uint4 *)(vp + p * HD * LW + d * LW + q * 16) = *(const uint4 *)(Vp + (((long)j * 3 + p) * HD + d) * Mp + k0 + q * 16);
+				}
 			}
 		}
 		__syncthreads();
@@ -625,6 +673,9 @@ static __device__ __forceinline__ void bpv2_mma(const long *cmax, const int *exp
 				}
 			}
 		}
+	}
+	if (PIPE) {
+		cpa_wait<0>(); // a skipped last tile's V copy
 	}
 	// Z: the 4 lanes of a group, then the warps sharing the rows
 	for (int k = 0; k < 2; k++) {
@@ -669,6 +720,20 @@ static __device__ __forceinline__ void bpv2_mma(const long *cmax, const int *exp
 		bpv2_mma<HD, BRV>(cmax, expa, zp, op, Kp, Vp, Mp, mq, shq, pr->pos, pr->tok, a,                                        \
 		             make_uint3(blockIdx.x, blockIdx.y, blockIdx.z), threadIdx.x, qp, kp, vp, wp, Ms, zs, shs, et);        \
 	}
+#define BPV2_MMA_NP(NAME, HD, BRV, MINB)                                                                                   \
+	extern "C" __global__ void __launch_bounds__(256, MINB) NAME(const int *S, const long *cmax, const int *Vc, const int *expa, long *zp, long *op,     \
+	                                const IntParams *pr, BAttnArgs a, const unsigned char *Kp, const unsigned char *Vp,  \
+	                                int Mp, const int *mq, const int *shq) {                                             \
+		__shared__ __align__(16) unsigned char qp[2 * BRV * (HD + 16)];                                                    \
+		__shared__ __align__(16) unsigned char kp[3 * 32 * (HD + 16)];                                                     \
+		__shared__ __align__(16) unsigned char vp[3 * HD * 48];                                                            \
+		__shared__ __align__(16) unsigned char wp[2 * BRV * 48];                                                           \
+		__shared__ long Ms[BRV];                                                                                           \
+		__shared__ int zs[BRV], shs[BRV];                                                                                  \
+		extern __shared__ __align__(16) ushort et[]; /* ETN entries, dynamic: the static arrays fill most of 48 KB */   \
+		bpv2_mma<HD, BRV, false, false>(cmax, expa, zp, op, Kp, Vp, Mp, mq, shq, pr->pos, pr->tok, a,                                        \
+		             make_uint3(blockIdx.x, blockIdx.y, blockIdx.z), threadIdx.x, qp, kp, vp, wp, Ms, zs, shs, et);        \
+	}
 #define BPV2_MMA_CNT(NAME, HD, BRV, MINB)                                                                                   \
 	extern "C" __global__ void __launch_bounds__(256, MINB) NAME(const int *S, const long *cmax, const int *Vc, const int *expa, long *zp, long *op,     \
 	                                const IntParams *pr, BAttnArgs a, const unsigned char *Kp, const unsigned char *Vp,  \
@@ -690,6 +755,9 @@ BPV2_MMA_LB(int_bpv2_mma64_lb1, 64, 64, 1)
 BPV2_MMA_LB(int_bpv2_mma128_lb1, 128, 32, 1)
 BPV2_MMA_LB(int_bpv2_mma64_lb4, 64, 64, 4)
 BPV2_MMA_LB(int_bpv2_mma128_lb4, 128, 32, 4)
+// without the cp.async pipeline
+BPV2_MMA_NP(int_bpv2_mma64_np, 64, 64, 3)
+BPV2_MMA_NP(int_bpv2_mma128_np, 128, 32, 3)
 // weight sparsity counters into S (4 uint64s: weights, nonzero; key tiles, nonzero): TestIntBatchSparsity
 BPV2_MMA_CNT(int_bpv2_mma64_cnt, 64, 64, 3)
 BPV2_MMA_CNT(int_bpv2_mma128_cnt, 128, 32, 3)
@@ -1363,12 +1431,6 @@ extern "C" __global__ void __launch_bounds__(256) int_gemm_mma2(const signed cha
 #define GEMM3_WLD 80  // bytes per weight row (64 + 16)
 #define GEMM3_STAGE (64 * GEMM3_XLD + 128 * GEMM3_WLD + 128 * 2)
 #define GEMM3_SMEM (GEMM3_NST * GEMM3_STAGE)
-static __device__ __forceinline__ void cpa16(void *sm, const void *g) {
-	uint sa = (uint)__cvta_generic_to_shared(sm);
-	asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(sa), "l"(g));
-}
-static __device__ __forceinline__ void cpa_commit() { asm volatile("cp.async.commit_group;"); }
-template <int N> static __device__ __forceinline__ void cpa_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N)); }
 
 template <int NST>
 static __device__ __forceinline__ void gemm3(const signed char *q, const short *s, const short *x, long *out, const int *ex,
