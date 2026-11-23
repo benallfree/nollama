@@ -19,12 +19,17 @@ const (
 	typeQ6_K = 14
 	typeQ8_K = 15
 	typeBF16 = 30
+	// plain integer tensors (the integer codec's converted models)
+	typeI8  = 24
+	typeI16 = 25
+	typeI32 = 26
+	typeI64 = 27
 )
 
 var typeNames = map[uint32]string{
 	typeF32: "F32", typeF16: "F16", typeQ4_0: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1",
 	typeQ8_0: "Q8_0", 10: "Q2_K", 11: "Q3_K", typeQ4_K: "Q4_K", typeQ5_K: "Q5_K",
-	typeQ6_K: "Q6_K", typeQ8_K: "Q8_K", typeBF16: "BF16",
+	typeQ6_K: "Q6_K", typeQ8_K: "Q8_K", typeBF16: "BF16", typeI8: "I8", typeI16: "I16", typeI32: "I32", typeI64: "I64",
 }
 
 func typeName(t uint32) string {
@@ -53,6 +58,14 @@ func blockInfo(t uint32) (int, int, bool) {
 		return 256, 210, true
 	case typeQ8_K:
 		return 256, 292, true
+	case typeI8:
+		return 1, 1, true
+	case typeI16:
+		return 1, 2, true
+	case typeI32:
+		return 1, 4, true
+	case typeI64:
+		return 1, 8, true
 	}
 	return 0, 0, false
 }
