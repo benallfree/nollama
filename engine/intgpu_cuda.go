@@ -43,6 +43,7 @@ type cudaIntDev struct {
 	mma  *cuda.Module // or nil
 	ks   map[string]*cuda.Kernel
 	ls   []cuda.Launch // run's scratch
+	pipe *cudaPipe     // pipelined decoding's buffers, made on first use
 	last time.Duration
 }
 
@@ -70,7 +71,7 @@ func openIntCUDA(m *IntModel) (intDev, ibuf, error) {
 	d := &cudaIntDev{dev: dev, mod: mod, ks: ks, rec: map[replayKey]*cuda.Graph{}}
 	if dev.Major >= 8 && os.Getenv("NOLLAMA_INT_NO_MMA") == "" {
 		names := []string{"int_dattn1_64", "int_dattn1_128", "int_dattn2_64", "int_dattn2_128", "int_matvec8",
-			"int_dattn2a_64", "int_dattn2a_128", "int_mv2", "int_mvlog", "int_qkv2", "int_norm2", "int_mlp2", "int_mergea", "int_norm2s", "int_battn64", "int_battn128", "int_gemm_mma2", "int_gemm_mma3"} // used by name
+			"int_dattn2a_64", "int_dattn2a_128", "int_mv2", "int_mvlog", "int_qkv2", "int_norm2", "int_mlp2", "int_mergea", "int_norm2s", "int_battn64", "int_battn128", "int_gemm_mma2", "int_gemm_mma3", "int_find2"} // used by name
 		alias := map[string]string{}
 		for k, n := range cudaIntMMA {
 			alias[k] = n
@@ -126,6 +127,10 @@ func (d *cudaIntDev) name() string {
 }
 
 func (d *cudaIntDev) close() {
+	if d.pipe != nil {
+		d.pipe.ev.Destroy()
+		d.dev.HostFree(d.pipe.h)
+	}
 	if d.mma != nil {
 		d.mma.Unload()
 	}
@@ -207,6 +212,53 @@ func (d *cudaIntDev) forget(owner any) {
 			delete(d.rec, k)
 		}
 	}
+}
+
+// launch queues the recorded graph for key (recording it first if new) without waiting.
+func (d *cudaIntDev) launch(key replayKey, ds []idisp) error {
+	g := d.rec[key]
+	if g == nil {
+		if err := d.launches(ds); err != nil {
+			return err
+		}
+		var err error
+		if g, err = d.dev.Record(d.ls...); err != nil {
+			return err
+		}
+		d.rec[key] = g
+	}
+	return g.Launch()
+}
+
+// queue queues ds without waiting.
+func (d *cudaIntDev) queue(ds []idisp) error {
+	if err := d.launches(ds); err != nil {
+		return err
+	}
+	return d.dev.Queue(d.ls...)
+}
+
+// cudaPipe: pipelined decoding's page-locked copies and event (findFeed).
+type cudaPipe struct {
+	h, stH, resH []byte
+	ev           *cuda.Event
+}
+
+func (d *cudaIntDev) pipeline() (*cudaPipe, error) {
+	if d.pipe != nil {
+		return d.pipe, nil
+	}
+	h, err := d.dev.HostAlloc(48)
+	if err != nil {
+		return nil, err
+	}
+	ev, err := d.dev.NewEvent()
+	if err != nil {
+		d.dev.HostFree(h)
+		return nil, err
+	}
+	d.pipe = &cudaPipe{h: h, stH: h[:16], resH: h[16:48], ev: ev}
+	return d.pipe, nil
 }
 
 func (d *cudaIntDev) run(ds []idisp) error {

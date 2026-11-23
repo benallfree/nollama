@@ -107,6 +107,8 @@ type intGPUState struct {
 	tgt    ibuf    // int_find's target and result
 	res    ibuf
 	find   []idisp
+	st     ibuf    // int_find2's decoder state (pipelined decoding, findFeed)
+	find2  []idisp // int_find2, when the device has it
 	maxch  int
 	kp, vp ibuf // the byte-plane KV cache, when planes()
 	kpTo   int  // positions the planes hold
@@ -166,6 +168,18 @@ func (g *intGPU) newState(m *IntModel, maxlen int) (*intGPUState, error) {
 	if err := g.dev.prepare(s.find, s.newBuffer); err != nil {
 		s.release()
 		return nil, err
+	}
+	if cd, ok := g.dev.(*cudaIntDev); ok && cd.ks["int_find2"] != nil && s.cumBuf != nil {
+		if s.st, err = nb(16); err != nil {
+			s.release()
+			return nil, err
+		}
+		s.find2 = []idisp{{K: "int_find2", Args: []iarg{{Buf: cum}, {Buf: s.st}, {Buf: s.res}, {Buf: s.params}, cArg(V)},
+			Groups: isize{1, 1, 1}, Threads: isize{1024, 1, 1}}}
+		if err := g.dev.prepare(s.find2, s.newBuffer); err != nil {
+			s.release()
+			return nil, err
+		}
 	}
 	B := func(b ibuf) iarg { return iarg{Buf: b} }
 	BO := func(b ibuf, off int) iarg { return iarg{Buf: b, Offset: off} }
@@ -434,11 +448,30 @@ func (g *intGPU) farg(x any) iarg {
 
 func (s *intGPUState) step(tok, pos int) error {
 	s.g.dev.write(s.params, 0, i32b(tok, pos))
+	return s.stepAt(pos, false)
+}
+
+// stepAt runs the step list for the token and position params already hold; queued only (async, CUDA graphs).
+func (s *intGPUState) stepAt(pos int, async bool) error {
 	s.fresh = false
 	if s.kp != nil && s.kpTo == pos {
 		s.kpTo = pos + 1 // the step keeps the planes
 	}
 	nch := uint((pos + intACH) / intACH)
+	if async {
+		d := s.g.dev.(*cudaIntDev)
+		b := uint(1)
+		for b < nch {
+			b *= 2
+		}
+		b = min(b, uint(s.maxch))
+		for i := range s.ds {
+			if attnChunked(s.ds[i].K) {
+				s.ds[i].Groups.H = b
+			}
+		}
+		return d.launch(replayKey{s, &s.ds[0], len(s.ds), int(b)}, s.ds)
+	}
 	if s.g.dev.graphs() {
 		// a recording per power-of-two chunk count (chunks past the position return at once): few recordings, and
 		// at most half the attention blocks idle
@@ -472,6 +505,52 @@ func (s *intGPUState) table() []int64 {
 }
 
 // find returns the first t with cum[t] > target(total) and t's counts, searching on the GPU when the table is there.
+// findFeed: the token the last step's table gives for target = (num * total - 1) / den (as findTok), then, when
+// feed, a step for it at pos. With int_find2 (CUDA): the decoder state goes to the device, the search runs there and
+// writes the token into params, the result is copied back and the next step queued behind it, and only the copy is
+// waited for, so the step runs while the caller updates its decoder.
+func (s *intGPUState) findFeed(num, den uint64, feed bool, pos int) (int, IntCount, error) {
+	d, ok := s.g.dev.(*cudaIntDev)
+	if !ok || s.find2 == nil || s.fresh {
+		t, c, err := s.findTok(func(total int64) int64 { return int64((num*uint64(total) - 1) / den) })
+		if err == nil && feed {
+			err = s.step(t, pos)
+		}
+		return t, c, err
+	}
+	p, err := d.pipeline()
+	if err != nil {
+		return 0, IntCount{}, err
+	}
+	binary.LittleEndian.PutUint64(p.stH, num)
+	binary.LittleEndian.PutUint64(p.stH[8:], den)
+	if err := d.dev.WriteAsync(s.st.(*cudaIntBuf).p, p.stH); err != nil {
+		return 0, IntCount{}, err
+	}
+	if err := d.queue(s.find2); err != nil {
+		return 0, IntCount{}, err
+	}
+	if err := d.dev.ReadAsync(s.res.(*cudaIntBuf).p, p.resH); err != nil {
+		return 0, IntCount{}, err
+	}
+	if err := p.ev.Record(); err != nil {
+		return 0, IntCount{}, err
+	}
+	if feed {
+		if err := s.stepAt(pos, true); err != nil {
+			return 0, IntCount{}, err
+		}
+	}
+	if err := p.ev.Wait(); err != nil {
+		return 0, IntCount{}, err
+	}
+	r := func(i int) int64 { return int64(binary.LittleEndian.Uint64(p.resH[8*i:])) }
+	if r(0) >= int64(len(s.cum)) {
+		return 0, IntCount{}, errBadTarget
+	}
+	return int(r(0)), IntCount{Total: r(3), High: r(1), Low: r(2)}, nil
+}
+
 func (s *intGPUState) findTok(target func(total int64) int64) (int, IntCount, error) {
 	if s.cumBuf == nil || s.fresh {
 		return findIn(s.table(), target)

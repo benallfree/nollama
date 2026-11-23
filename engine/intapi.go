@@ -147,6 +147,42 @@ func (s *IntSession) FeedFind(tok int, target func(total int64) int64) (int, Int
 	return s.g.findTok(target)
 }
 
+// Start adds a token without reading the next distribution: the first token of pipelined decoding (FindFeed).
+func (s *IntSession) Start(tok int) error {
+	if s.pos >= s.maxlen {
+		return errors.New("intmodel: context full")
+	}
+	s.pos++
+	if s.g != nil {
+		return s.g.step(tok, s.pos-1)
+	}
+	s.s.step(tok)
+	return nil
+}
+
+// FindFeed is an arithmetic decoder's step: it finds the next token in the distribution the last token added gives,
+// by the count c = (num * total - 1) / den (uint64; the token t has cum[t-1] <= c < cum[t]), returns it with its
+// counts, and, when feed, adds it to the context. On CUDA the search runs on the GPU and hands the token straight to
+// the next step, which runs while the caller updates its decoder; elsewhere it is FeedFind's search, then Start.
+func (s *IntSession) FindFeed(num, den uint64, feed bool) (int, IntCount, error) {
+	if feed && s.pos >= s.maxlen {
+		return 0, IntCount{}, errors.New("intmodel: context full")
+	}
+	target := func(total int64) int64 { return int64((num*uint64(total) - 1) / den) }
+	if s.g != nil {
+		if feed {
+			s.pos++
+		}
+		return s.g.findFeed(num, den, feed, s.pos-1)
+	}
+	t, c, err := findIn(s.s.cum, target)
+	if err == nil && feed {
+		s.pos++
+		s.s.step(t)
+	}
+	return t, c, err
+}
+
 func findIn(cum []int64, target func(total int64) int64) (int, IntCount, error) {
 	c := target(cum[len(cum)-1])
 	t := sort.Search(len(cum), func(i int) bool { return cum[i] > c })

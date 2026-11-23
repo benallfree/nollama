@@ -41,6 +41,12 @@ var (
 	cuMemcpyHtoD              func(dst uint64, src unsafe.Pointer, n uint64) result
 	cuMemcpyDtoH              func(dst unsafe.Pointer, src uint64, n uint64) result
 	cuMemsetD8                func(dst uint64, v uint8, n uint64) result
+	cuMemcpyHtoDAsync         func(dst uint64, src unsafe.Pointer, n uint64, s uintptr) result
+	cuMemcpyDtoHAsync         func(dst unsafe.Pointer, src uint64, n uint64, s uintptr) result
+	cuEventCreate             func(e *uintptr, flags uint32) result
+	cuEventRecord             func(e uintptr, s uintptr) result
+	cuEventSynchronize        func(e uintptr) result
+	cuEventDestroy            func(e uintptr) result
 	cuMemAllocHost            func(p *unsafe.Pointer, n uint64) result
 	cuMemFreeHost             func(p unsafe.Pointer) result
 	cuStreamCreate            func(s *uintptr, flags uint32) result
@@ -96,6 +102,9 @@ func load() error {
 			{&cuModuleGetFunction, "cuModuleGetFunction"}, {&cuFuncSetAttribute, "cuFuncSetAttribute"},
 			{&cuMemAlloc, "cuMemAlloc_v2"}, {&cuMemFree, "cuMemFree_v2"},
 			{&cuMemcpyHtoD, "cuMemcpyHtoD_v2"}, {&cuMemcpyDtoH, "cuMemcpyDtoH_v2"}, {&cuMemsetD8, "cuMemsetD8_v2"},
+			{&cuMemcpyHtoDAsync, "cuMemcpyHtoDAsync_v2"}, {&cuMemcpyDtoHAsync, "cuMemcpyDtoHAsync_v2"},
+			{&cuEventCreate, "cuEventCreate"}, {&cuEventRecord, "cuEventRecord"},
+			{&cuEventSynchronize, "cuEventSynchronize"}, {&cuEventDestroy, "cuEventDestroy_v2"},
 			{&cuMemAllocHost, "cuMemAllocHost_v2"}, {&cuMemFreeHost, "cuMemFreeHost"},
 			{&cuStreamCreate, "cuStreamCreate"}, {&cuStreamDestroy, "cuStreamDestroy_v2"},
 			{&cuStreamSynchronize, "cuStreamSynchronize"}, {&cuLaunchKernel, "cuLaunchKernel"},
@@ -441,6 +450,60 @@ func (d *Device) enqueue(ls []Launch) error {
 		}
 	}
 	return nil
+}
+
+// Queue runs the launches on the device's stream without waiting for them.
+func (d *Device) Queue(ls ...Launch) error {
+	return d.do(func() error { return d.enqueue(ls) })
+}
+
+// Launch runs the graph without waiting for it.
+func (g *Graph) Launch() error {
+	return g.d.do(func() error { return errorOf("cuGraphLaunch", cuGraphLaunch(g.exec, g.d.stream)) })
+}
+
+// WriteAsync queues a copy of src (page-locked, from HostAlloc) to dst on the stream; src must stay unchanged until
+// the stream has run it.
+func (d *Device) WriteAsync(dst Ptr, src []byte) error {
+	return d.do(func() error {
+		return errorOf("cuMemcpyHtoDAsync", cuMemcpyHtoDAsync(uint64(dst), unsafe.Pointer(unsafe.SliceData(src)), uint64(len(src)), d.stream))
+	})
+}
+
+// ReadAsync queues a copy of src into dst (page-locked, from HostAlloc) on the stream: dst holds it once an event
+// recorded after it has completed.
+func (d *Device) ReadAsync(src Ptr, dst []byte) error {
+	return d.do(func() error {
+		return errorOf("cuMemcpyDtoHAsync", cuMemcpyDtoHAsync(unsafe.Pointer(unsafe.SliceData(dst)), uint64(src), uint64(len(dst)), d.stream))
+	})
+}
+
+// Event marks a point in the stream's queued work.
+type Event struct {
+	d *Device
+	e uintptr
+}
+
+// NewEvent makes an event (without timing).
+func (d *Device) NewEvent() (*Event, error) {
+	ev := &Event{d: d}
+	err := d.do(func() error { return errorOf("cuEventCreate", cuEventCreate(&ev.e, 2 /* CU_EVENT_DISABLE_TIMING */)) })
+	return ev, err
+}
+
+// Record marks the work queued so far.
+func (e *Event) Record() error {
+	return e.d.do(func() error { return errorOf("cuEventRecord", cuEventRecord(e.e, e.d.stream)) })
+}
+
+// Wait waits until the work queued before the last Record has run (not what was queued after it).
+func (e *Event) Wait() error {
+	return e.d.do(func() error { return errorOf("cuEventSynchronize", cuEventSynchronize(e.e)) })
+}
+
+// Destroy frees the event.
+func (e *Event) Destroy() {
+	e.d.do(func() error { cuEventDestroy(e.e); return nil })
 }
 
 // Profile starts (on) or stops collection for a profiler started with collection off (ncu --profile-from-start off).

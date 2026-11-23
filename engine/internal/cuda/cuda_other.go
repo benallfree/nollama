@@ -57,3 +57,15 @@ func (g *Graph) Replay() error                        { return errNo }
 func (g *Graph) Destroy()                             {}
 
 func (d *Device) Profile(on bool) {}
+
+func (d *Device) Queue(ls ...Launch) error             { return errNo }
+func (g *Graph) Launch() error                         { return errNo }
+func (d *Device) WriteAsync(dst Ptr, src []byte) error { return errNo }
+func (d *Device) ReadAsync(src Ptr, dst []byte) error  { return errNo }
+
+type Event struct{}
+
+func (d *Device) NewEvent() (*Event, error) { return nil, errNo }
+func (e *Event) Record() error              { return errNo }
+func (e *Event) Wait() error                { return errNo }
+func (e *Event) Destroy()                   {}

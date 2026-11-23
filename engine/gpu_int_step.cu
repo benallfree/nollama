@@ -345,3 +345,33 @@ extern "C" __global__ void __launch_bounds__(1024) int_mergea(ull *Oacc, ull *Za
 		ex[1] = sh - 24;
 	}
 }
+
+// int_find2: an arithmetic decoder's search, on the device, for pipelined decoding. st = (num, den): the target count
+// is (num * total - 1) / den (unsigned, as the decoder computes it), total = cum[V - 1]; the token is the first t
+// with cum[t] > target (V: none). res = (t, cum[t], cum[t - 1], total), and params (the step's int32 token and
+// position) become (t, position + 1), so the next step can start without the host. One block of 1024 threads, two
+// rounds: segments of S = ceil(V / 1024) (cum is nondecreasing: the count of segment ends <= target is the segment
+// holding t), then that segment's elements.
+extern "C" __global__ void __launch_bounds__(1024) int_find2(const long *cum, const unsigned long long *st, long *res,
+                                                             int *params, int V) {
+	int tid = threadIdx.x;
+	long total = cum[V - 1];
+	long target = (long)(((unsigned long long)st[0] * (unsigned long long)total - 1ULL) / st[1]);
+	int S = (V + 1023) / 1024;
+	int e = min((tid + 1) * S, V) - 1;
+	int c = __syncthreads_count(tid * S < V && cum[e] <= target); // whole segments below t
+	int t = V;
+	if (c * S < V) {
+		int i = c * S + tid;
+		int n = __syncthreads_count(tid < S && i < V && cum[i] <= target);
+		t = c * S + n;
+	}
+	if (tid == 0) {
+		res[0] = t;
+		res[1] = t < V ? cum[t] : 0;
+		res[2] = t > 0 && t <= V ? cum[t - 1] : 0;
+		res[3] = total;
+		params[0] = t < V ? t : 0;
+		params[1] += 1;
+	}
+}
