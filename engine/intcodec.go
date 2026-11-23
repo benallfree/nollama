@@ -278,21 +278,38 @@ func (m *IntModel) matvec(w *intMat, x []int16, e, to int, out []int64) {
 	n := to - (w.e + e)
 	m.pool.parallelFor(w.out, 16, func(lo, hi int) {
 		for j := lo; j < hi; j++ {
-			q := w.q[j*w.in : (j+1)*w.in]
-			s := w.s[j*ng : (j+1)*ng]
-			var acc int64
-			for gi := 0; gi < ng; gi++ {
-				qg := q[gi*64 : gi*64+64]
-				xg := x[gi*64 : gi*64+64]
-				var d int32
-				for k := 0; k < 64; k++ {
-					d += int32(qg[k]) * int32(xg[k])
-				}
-				acc += int64(d) * int64(s[gi])
-			}
-			out[j] = irsh(acc, n)
+			out[j] = irsh(intDotRow(w.q[j*w.in:(j+1)*w.in], x, w.s[j*ng:(j+1)*ng]), n)
 		}
 	})
+}
+
+// intDotRowGo is the reference for intDotRow: sum_g s[g] * sum_{k<64} q[64g+k]*x[64g+k].
+func intDotRowGo(q []int8, x []int16, s []int16) int64 {
+	var acc int64
+	for gi := range s {
+		qg := q[gi*64 : gi*64+64]
+		xg := x[gi*64 : gi*64+64]
+		var d int32
+		for k := 0; k < 64; k++ {
+			d += int32(qg[k]) * int32(xg[k])
+		}
+		acc += int64(d) * int64(s[gi])
+	}
+	return acc
+}
+
+func intDotQKGo(q, k []int32) int64 {
+	var acc int64
+	for i, v := range q {
+		acc += int64(v) * int64(k[i])
+	}
+	return acc
+}
+
+func intAxpyGo(o []int64, w int64, v []int32) {
+	for i, x := range v[:len(o)] {
+		o[i] += w * int64(x)
+	}
 }
 
 // rmsnorm returns the mantissas (in xm) and their exponent.
@@ -329,7 +346,7 @@ type intState struct {
 	lg, cum []int64
 	scores  [][]int64 // per q head
 	headO   [][]int64 // per q head [hd]
-	headMQ  [][]int64
+	headMQ  [][]int32
 	headSh  []int
 }
 
@@ -341,12 +358,12 @@ func (m *IntModel) newState(maxlen int) *intState {
 	s.xm, s.om, s.pm = make([]int16, m.D), make([]int16, m.D), make([]int16, m.I)
 	s.gu, s.qkv, s.o = make([]int64, 2*m.I), make([]int64, (m.nq+2*m.nkv)*m.hd), make([]int64, m.D)
 	s.lg, s.cum = make([]int64, m.V), make([]int64, m.V)
-	s.scores, s.headO, s.headMQ = make([][]int64, m.nq), make([][]int64, m.nq), make([][]int64, m.nq)
+	s.scores, s.headO, s.headMQ = make([][]int64, m.nq), make([][]int64, m.nq), make([][]int32, m.nq)
 	s.headSh = make([]int, m.nq)
 	for i := range s.scores {
 		s.scores[i] = make([]int64, maxlen)
 		s.headO[i] = make([]int64, m.hd)
-		s.headMQ[i] = make([]int64, m.hd)
+		s.headMQ[i] = make([]int32, m.hd)
 	}
 	return s
 }
@@ -411,7 +428,6 @@ func (s *intState) step(tok int) {
 				var mx int64
 				for d := 0; d < hd; d++ {
 					v := qs[d] * m.sc
-					mq[d] = v
 					if v < 0 {
 						v = -v
 					}
@@ -419,19 +435,14 @@ func (s *intState) step(tok int) {
 				}
 				sh := max(0, bitlen(mx)-15)
 				for d := range mq {
-					mq[d] = min(max(irsh(mq[d], sh), -32767), 32767)
+					mq[d] = int32(min(max(irsh(qs[d]*m.sc, sh), -32767), 32767))
 				}
 				n := 42 - sh
 				sc := s.scores[i][:T]
 				kb := (l*nkv + j) * s.maxlen * hd
 				M := int64(math.MinInt64)
 				for t := 0; t < T; t++ {
-					kr := s.K[kb+t*hd : kb+(t+1)*hd]
-					var acc int64
-					for d := 0; d < hd; d++ {
-						acc += mq[d] * int64(kr[d])
-					}
-					v := irsh(acc, n)
+					v := irsh(intDotQK(mq, s.K[kb+t*hd:kb+(t+1)*hd]), n)
 					sc[t] = v
 					M = max(M, v)
 				}
@@ -444,10 +455,7 @@ func (s *intState) step(tok int) {
 						continue
 					}
 					Z += w
-					vr := s.Vc[kb+t*hd : kb+(t+1)*hd]
-					for d := 0; d < hd; d++ {
-						O[d] += w * int64(vr[d])
-					}
+					intAxpy(O, w, s.Vc[kb+t*hd:kb+(t+1)*hd])
 				}
 				for d := 0; d < hd; d++ {
 					a := O[d]

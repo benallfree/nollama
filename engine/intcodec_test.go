@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -142,4 +143,63 @@ func TestIntArchiveLong(t *testing.T) {
 		t.Skip("NOLLAMA_INTCODEC_LONG not set")
 	}
 	checkArchive(t, 1, "bjj.html", "m1-bjj.13k", false)
+}
+
+func TestIntDotRow(t *testing.T) {
+	r := rand.New(rand.NewSource(1))
+	for _, ng := range []int{1, 2, 14, 76, 296} {
+		q, x, s := make([]int8, 64*ng), make([]int16, 64*ng), make([]int16, ng)
+		for trial := 0; trial < 50; trial++ {
+			for i := range q {
+				q[i] = int8(r.Intn(255) - 127)
+				x[i] = int16(r.Intn(65535) - 32767)
+			}
+			for i := range s {
+				s[i] = int16(r.Intn(32767) + 1)
+			}
+			if trial == 0 { // extremes
+				for i := range q {
+					q[i], x[i] = -127, 32767
+				}
+				for i := range s {
+					s[i] = 32767
+				}
+			}
+			if got, want := intDotRow(q, x, s), intDotRowGo(q, x, s); got != want {
+				t.Fatalf("ng %d trial %d: %d, want %d", ng, trial, got, want)
+			}
+		}
+	}
+}
+
+func TestIntAttnKernels(t *testing.T) {
+	r := rand.New(rand.NewSource(2))
+	for _, n := range []int{8, 64, 128} {
+		q, k := make([]int32, n), make([]int32, n)
+		o1, o2 := make([]int64, n), make([]int64, n)
+		for trial := 0; trial < 100; trial++ {
+			for i := range q {
+				q[i] = int32(r.Intn(65535) - 32767)
+				k[i] = int32(r.Intn(1<<23-1) - (1<<22 - 1))
+				o1[i] = r.Int63n(1<<52) - 1<<51
+				o2[i] = o1[i]
+			}
+			if trial == 0 {
+				for i := range q {
+					q[i], k[i] = -32767, 1<<22-1
+				}
+			}
+			if got, want := intDotQK(q, k), intDotQKGo(q, k); got != want {
+				t.Fatalf("intDotQK n %d trial %d: %d, want %d", n, trial, got, want)
+			}
+			w := int64(r.Intn(32769))
+			intAxpy(o1, w, k)
+			intAxpyGo(o2, w, k)
+			for i := range o1 {
+				if o1[i] != o2[i] {
+					t.Fatalf("intAxpy n %d trial %d lane %d: %d, want %d", n, trial, i, o1[i], o2[i])
+				}
+			}
+		}
+	}
 }
