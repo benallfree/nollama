@@ -53,6 +53,9 @@ type intDev interface {
 	replay(key replayKey, ds []idisp) error
 	graphs() bool
 	forget(owner any)
+	// planes says whether attention reads a byte-plane copy of the KV cache (CUDA's tensor-core kernels): then
+	// int_kvplanes keeps it, and the attention launches get it as extra arguments.
+	planes() bool
 	lastGPU() time.Duration // the last run's GPU time, when the backend knows it
 }
 
@@ -101,6 +104,9 @@ type intGPUState struct {
 	res    ibuf
 	find   []idisp
 	maxch  int
+	kp, vp ibuf // the byte-plane KV cache, when planes()
+	mp     int  // positions per plane
+	kpl    int  // bytes per layer
 	ds     []idisp
 	bufs   []ibuf
 	// kept for batches (intgpu_batch.go)
@@ -189,6 +195,17 @@ func (g *intGPU) newState(m *IntModel, maxlen int) (*intGPUState, error) {
 	attnArgs := i32b(nq, nkv, hd, maxlen, intNA, maxch)
 	kvLayer := 4 * nkv * maxlen * hd
 	s.kc, s.vc, s.kvLayer = kc, vc, kvLayer
+	if g.dev.planes() {
+		s.mp = (maxlen + 128 + 15) &^ 15 // tiles read up to a block's rows plus a tile past the last position
+		s.kpl = nkv * 3 * s.mp * hd
+		if s.kp, err = nb(L * s.kpl); err == nil {
+			s.vp, err = nb(L * s.kpl)
+		}
+		if err != nil {
+			s.release()
+			return nil, err
+		}
+	}
 	rawA, rawF, rawS := m.g.Tensors["EXPA"].Data, m.g.Tensors["EXPF"].Data, m.g.Tensors["SIG"].Data
 
 	ds := []idisp{
@@ -206,6 +223,9 @@ func (g *intGPU) newState(m *IntModel, maxlen int) (*intGPUState, error) {
 			one("int_qkv", B(acc), F(ly.b), F(m.ropeC), F(m.ropeS), B(s.params), BO(kc, l*kvLayer), BO(vc, l*kvLayer),
 				B(mq), B(shq), B(ex), iarg{Bytes: qkvArgs}, C(ly.qkv.e), C(0), C(0)),
 		)
+		if s.kp != nil {
+			ds = append(ds, s.kvplanes(l, s.params, 1))
+		}
 		ds = append(ds,
 			idisp{K: "int_attn1", Args: []iarg{B(mq), B(shq), BO(kc, l*kvLayer), B(sb), B(cmax),
 				B(s.params), iarg{Bytes: attnArgs}},
@@ -239,6 +259,14 @@ func (g *intGPU) newState(m *IntModel, maxlen int) (*intGPUState, error) {
 	}
 	s.ds = ds
 	return s, nil
+}
+
+// kvplanes is the launch that copies rows' new keys and values (positions params.pos + row) into the planes.
+func (s *intGPUState) kvplanes(l int, params ibuf, rows int) idisp {
+	m := s.m
+	return idisp{K: "int_kvplanes", Args: []iarg{{Buf: s.kc, Offset: l * s.kvLayer}, {Buf: s.vc, Offset: l * s.kvLayer},
+		{Buf: s.kp, Offset: l * s.kpl}, {Buf: s.vp, Offset: l * s.kpl}, {Buf: params}, cArg(m.nkv), cArg(m.hd),
+		cArg(s.maxlen), cArg(s.mp)}, Groups: isize{uint(rows), 1, 1}, Threads: isize{256, 1, 1}}
 }
 
 func (s *intGPUState) newBuffer(n int) (ibuf, error) {

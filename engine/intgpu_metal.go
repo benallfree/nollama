@@ -142,3 +142,4 @@ func (d *metalIntDev) run(ds []idisp) error {
 	}
 	return d.dev.Run(d.buf...)
 }
+func (d *metalIntDev) planes() bool { return false }

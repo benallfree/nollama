@@ -24,8 +24,10 @@ var cudaIntPTX string
 //go:embed gpu_int_mma.ptx
 var cudaIntMMAPTX string
 
-var cudaIntMMA = map[string]string{"int_bscores64": "int_bscores_mma64", "int_bscores128": "int_bscores_mma128",
-	"int_bpv64": "int_bpv_mma64", "int_bpv128": "int_bpv_mma128"}
+// With the byte-plane KV cache: scores (maxima only) and weights x V (recomputing scores) on tensor cores.
+var cudaIntMMA = map[string]string{"int_bscores64": "int_bmax_mma64", "int_bscores128": "int_bmax_mma128",
+	"int_bpv64": "int_bpv2_mma64", "int_bpv128": "int_bpv2_mma128", "int_kvplanes": "int_kvplanes",
+	"int_gemm": "int_gemm_mma"}
 
 type cudaIntDev struct {
 	rec  map[replayKey]*cuda.Graph // replay's recordings
@@ -147,6 +149,7 @@ func (d *cudaIntDev) prepare(ds []idisp, _ func(int) (ibuf, error)) error {
 }
 
 func (d *cudaIntDev) graphs() bool { return true }
+func (d *cudaIntDev) planes() bool { return d.mma != nil }
 
 // replay records ds as a CUDA graph the first time (per key) and replays it: one launch instead of one per kernel.
 func (d *cudaIntDev) replay(key replayKey, ds []idisp) error {

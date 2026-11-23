@@ -51,6 +51,10 @@ func (s *intGPUState) newBatch() (*intBatch, error) {
 	D, I, V, hd, nq, nkv := m.D, m.I, m.V, m.hd, m.nq, m.nkv
 	// rows per batch: the stored scores (rows x heads x context, int32) stay within intScoreMem
 	P := min(intBatchRows, max(intHeadRows, intScoreMem/(4*nq*s.maxlen))/intHeadRows*intHeadRows)
+	scoreN := 4 * P * nq * s.maxlen
+	if s.kp != nil { // the tensor-core attention recomputes scores instead of storing them
+		P, scoreN = intBatchRows, 16
+	}
 	nchmax := (s.maxlen + intKC - 1) / intKC
 	qkvN := (nq + 2*nkv) * hd
 	accN := max(qkvN, D, 2*I)
@@ -70,7 +74,7 @@ func (s *intGPUState) newBatch() (*intBatch, error) {
 		n   int
 	}{{&b.params, 8}, {&b.toks, 4 * P}, {&b.tgt, 4 * P}, {&b.cnt, 8 * 3 * P}, {&h, 8 * P * D}, {&mb, 2 * P * mN},
 		{&ex, 16 * P}, {&acc, 8 * P * accN}, {&mq, 4 * P * nq * hd}, {&shq, 4 * P * nq}, {&o, 8 * P * nq * hd},
-		{&p, 8 * P * I}, {&lg, 8 * intHeadRows * V}, {&b.ovf, 4}, {&sc, 4 * P * nq * s.maxlen},
+		{&p, 8 * P * I}, {&lg, 8 * intHeadRows * V}, {&b.ovf, 4}, {&sc, scoreN},
 		{&cmax, 8 * P * nq * nchmax}, {&zp, 8 * P * nq * nchmax}, {&op, 8 * P * nq * nchmax * hd}} {
 		if *x.dst, err = s.newBuffer(x.n); err != nil {
 			return nil, err
@@ -132,15 +136,23 @@ func (s *intGPUState) newBatch() (*intBatch, error) {
 		gemm(&ly.qkv, 0, -24, acc, accN)
 		perRow("int_qkv", intTG, B(acc), F(ly.b), F(m.ropeC), F(m.ropeS), B(b.params), BO(s.kc, kv), BO(s.vc, kv),
 			B(mq), B(shq), B(ex), iarg{Bytes: qkvArgs}, C(ly.qkv.e), C(0), C(accN))
+		var planeArgs []iarg // the plane cache, for the tensor-core attention
+		if s.kp != nil {
+			add(rowsW, s.kvplanes(l, b.params, P))
+			planeArgs = []iarg{BO(s.kp, l*s.kpl), BO(s.vp, l*s.kpl), C(s.mp)}
+		}
 		slowAt = append(slowAt, len(ds))
 		slowD = append(slowD, idisp{K: attnK, Args: []iarg{B(mq), B(shq), BO(s.kc, kv), BO(s.vc, kv),
 			F(rawA), B(o), B(b.params), iarg{Bytes: attnArgs}},
 			Groups: isize{W: uint(nq), H: uint(P / b.attnBR), D: 1}, Threads: isize{W: 256, H: 1, D: 1}})
-		add(scoreG, idisp{K: scoreK, Args: []iarg{B(mq), B(shq), BO(s.kc, kv), B(sc), B(cmax),
-			B(b.ovf), B(b.params), iarg{Bytes: battnArgs}},
+		add(scoreG, idisp{K: scoreK, Args: append([]iarg{B(mq), B(shq), BO(s.kc, kv), B(sc), B(cmax),
+			B(b.ovf), B(b.params), iarg{Bytes: battnArgs}}, planeArgs...),
 			Groups: isize{W: uint(nkv), H: 1, D: 1}, Threads: isize{W: 256, H: 1, D: 1}})
-		add(pvG, idisp{K: pvK, Args: []iarg{B(sc), B(cmax), BO(s.vc, kv), F(rawA), B(zp), B(op),
-			B(b.params), iarg{Bytes: battnArgs}},
+		pvArgs := []iarg{B(sc), B(cmax), BO(s.vc, kv), F(rawA), B(zp), B(op), B(b.params), iarg{Bytes: battnArgs}}
+		if planeArgs != nil {
+			pvArgs = append(append(pvArgs, planeArgs...), B(mq), B(shq))
+		}
+		add(pvG, idisp{K: pvK, Args: pvArgs,
 			Groups: isize{W: uint(nq), H: 1, D: 1}, Threads: isize{W: 256, H: 1, D: 1}})
 		add(rowsH, idisp{K: "int_bcomb", Args: []iarg{B(zp), B(op), B(o), B(b.params),
 			iarg{Bytes: battnArgs}},
