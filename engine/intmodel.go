@@ -1,10 +1,13 @@
 package engine
 
-// The integer codec (compress13k spec v1): a Qwen2.5 forward pass in integer arithmetic only, so every machine
-// computes the same next-token frequency table, bit for bit, and an arithmetic-coded archive made on one machine
-// decodes on any other. The model is a converted GGUF ("qwen2-intcodec": int8 weights with an integer scale per 64
-// inputs, integer biases and norms, frozen lookup tables, and the tokenizer). The spec, the Python reference and the
-// conformance vectors live in the compress13k repository (SPEC.md); testdata/intcodec holds the vectors.
+// Integer models: a Qwen2.5 forward pass in integer arithmetic only. Every step's result is independent of the order
+// of operations, the instruction set and the thread count, so every machine computes the same next-token
+// distribution, bit for bit, as exact integer counts. That is what an arithmetic coder needs to decode on one machine
+// what another encoded (github.com/benallfree/compress13k's signal uses it), and it gives sampling that matches
+// across machines. The model is a converted GGUF (architecture "qwen2-intcodec": int8 weights with an integer scale
+// per 64 inputs, integer biases and norms, lookup tables, and the tokenizer); ConvertIntModel makes it from the
+// official bf16 weights, deterministically. The arithmetic is defined in compress13k's SPEC.md, whose reference
+// implementation produced the conformance data in testdata/intmodel.
 
 import (
 	"errors"
@@ -91,7 +94,7 @@ func i32to64(a []int32) []int64 {
 // LoadIntModel opens a converted model (GGUF, architecture "qwen2-intcodec"). threads <= 0 means all CPUs.
 func LoadIntModel(path string, threads int) (*IntModel, error) {
 	if !littleEndian() {
-		return nil, errors.New("intcodec: needs a little-endian CPU")
+		return nil, errors.New("intmodel: needs a little-endian CPU")
 	}
 	g, err := openGGUF(path)
 	if err != nil {
@@ -112,27 +115,27 @@ func littleEndian() bool {
 
 func newIntModel(g *ggufFile, path string, threads int) (*IntModel, error) {
 	if a := g.getString("general.architecture"); a != "qwen2-intcodec" {
-		return nil, fmt.Errorf("intcodec: %s is not a converted model (architecture %q)", filepath.Base(path), a)
+		return nil, fmt.Errorf("intmodel: %s is not a converted model (architecture %q)", filepath.Base(path), a)
 	}
 	if v, _ := g.getInt("intcodec.spec_version"); v != 1 {
-		return nil, fmt.Errorf("intcodec: spec version %d, want 1", v)
+		return nil, fmt.Errorf("intmodel: spec version %d, want 1", v)
 	}
 	m := &IntModel{g: g, path: path}
 	geti := func(k string) int { v, _ := g.getInt("intcodec." + k); return v }
 	m.D, m.I, m.L = geti("hidden_size"), geti("intermediate_size"), geti("num_hidden_layers")
 	m.nq, m.nkv, m.V, m.bos = geti("num_attention_heads"), geti("num_key_value_heads"), geti("vocab_size"), geti("bos_token_id")
 	if m.D == 0 || m.nq == 0 || m.nkv == 0 || m.L == 0 {
-		return nil, errors.New("intcodec: incomplete config")
+		return nil, errors.New("intmodel: incomplete config")
 	}
 	m.hd = m.D / m.nq
 	m.sc = int64(math.Round(65536 / math.Sqrt(float64(m.hd))))
 	tensor := func(name string, typ uint32) (*tensorInfo, error) {
 		t := g.Tensors[name]
 		if t == nil {
-			return nil, fmt.Errorf("intcodec: missing tensor %s", name)
+			return nil, fmt.Errorf("intmodel: missing tensor %s", name)
 		}
 		if t.Type != typ || t.Data == nil {
-			return nil, fmt.Errorf("intcodec: tensor %s has type %s", name, typeName(t.Type))
+			return nil, fmt.Errorf("intmodel: tensor %s has type %s", name, typeName(t.Type))
 		}
 		return t, nil
 	}
@@ -147,11 +150,11 @@ func newIntModel(g *ggufFile, path string, threads int) (*IntModel, error) {
 		}
 		e, ok := g.getInt("intcodec.exp." + name)
 		if !ok {
-			return intMat{}, fmt.Errorf("intcodec: missing exponent for %s", name)
+			return intMat{}, fmt.Errorf("intmodel: missing exponent for %s", name)
 		}
 		in, out := int(q.Dims[0]), q.rows()
 		if in%128 != 0 || len(s.Data)/2 != out*in/64 {
-			return intMat{}, fmt.Errorf("intcodec: bad shape for %s", name)
+			return intMat{}, fmt.Errorf("intmodel: bad shape for %s", name)
 		}
 		return intMat{q: viewI8(q.Data), s: viewI16(s.Data), e: e, out: out, in: in}, nil
 	}
@@ -389,7 +392,7 @@ func (s *intState) rope(x []int64, nh int) {
 func (s *intState) step(tok int) {
 	m := s.m
 	if s.pos >= s.maxlen {
-		panic("intcodec: context full")
+		panic("intmodel: context full")
 	}
 	D, hd, nq, nkv := m.D, m.hd, m.nq, m.nkv
 	grp := nq / nkv

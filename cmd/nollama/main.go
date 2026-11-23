@@ -6,8 +6,6 @@
 //	nollama list               the models downloaded
 //	nollama rm qwen3-1.7b      delete a downloaded model
 //	nollama bundle -o myai qwen3-0.6b   a copy of nollama with the model inside, so it downloads nothing
-//	nollama pack notes.txt     compress a file to notes.txt.13k (the integer codec; same result on every machine)
-//	nollama unpack notes.txt.13k
 package main
 
 import (
@@ -43,13 +41,6 @@ Usage:
                                  write a copy of nollama (or -exe, any program built
                                  with nollama) with the models inside it
   nollama bundle -check <file>   list the models inside a file and check their SHA-256
-  nollama pack [--profile good|better|best] [file]
-                                 compress text to file.13k with a converted model; any
-                                 machine with nollama and that model unpacks it exactly
-  nollama unpack file.13k        decompress (the archive names the model it needs)
-  nollama convert --profile good|better|best
-                                 make pack/unpack's model from the official Qwen2.5
-                                 weights (downloaded once; sha256 checked)
   nollama version
 
 Models: %s, hf:<org>/<repo>/<file>.gguf, or a path to a .gguf file.
@@ -90,12 +81,6 @@ func main() {
 		err = cmdRm(args)
 	case "bundle":
 		err = cmdBundle(args)
-	case "pack":
-		err = cmdPack(args)
-	case "unpack":
-		err = cmdUnpack(args)
-	case "convert":
-		err = cmdConvert(args)
 	case "version", "--version", "-v":
 		fmt.Println("nollama", version)
 	case "help", "-h", "--help":

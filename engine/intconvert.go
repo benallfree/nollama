@@ -43,7 +43,7 @@ func openSafetensors(dir string) (*stSet, error) {
 	paths, _ := filepath.Glob(filepath.Join(dir, "*.safetensors"))
 	sort.Strings(paths)
 	if len(paths) == 0 {
-		return nil, fmt.Errorf("intcodec: no .safetensors in %s", dir)
+		return nil, fmt.Errorf("intmodel: no .safetensors in %s", dir)
 	}
 	s := &stSet{t: map[string]stTensor{}}
 	for i, p := range paths {
@@ -81,7 +81,7 @@ func openSafetensors(dir string) (*stSet, error) {
 			}
 			if v.Dtype != "BF16" {
 				s.close()
-				return nil, fmt.Errorf("intcodec: %s is %s, want BF16", k, v.Dtype)
+				return nil, fmt.Errorf("intmodel: %s is %s, want BF16", k, v.Dtype)
 			}
 			s.t[k] = stTensor{file: i, off: 8 + int64(n) + v.Offsets[0], shape: v.Shape}
 		}
@@ -102,7 +102,7 @@ func (s *stSet) close() {
 func (s *stSet) get(name string) (rows, cols int, at func(r, c int) float64, err error) {
 	t, ok := s.t[name]
 	if !ok {
-		return 0, 0, nil, fmt.Errorf("intcodec: missing tensor %s", name)
+		return 0, 0, nil, fmt.Errorf("intmodel: missing tensor %s", name)
 	}
 	rows, cols = 1, t.shape[len(t.shape)-1]
 	for _, d := range t.shape[:len(t.shape)-1] {
@@ -140,7 +140,7 @@ func (m *convMat) at(s *stSet) (func(r, c int) float64, error) {
 		if r0 == 0 {
 			m.cols = cols
 		} else if cols != m.cols {
-			return nil, fmt.Errorf("intcodec: %s: column mismatch", m.name)
+			return nil, fmt.Errorf("intmodel: %s: column mismatch", m.name)
 		}
 		ps = append(ps, part{r0, at})
 		r0 += rows
@@ -186,7 +186,7 @@ func (m *convMat) exponent(s *stSet) error {
 		return err
 	}
 	if m.cols%128 != 0 {
-		return fmt.Errorf("intcodec: %s: %d columns, want a multiple of 128", m.name, m.cols)
+		return fmt.Errorf("intmodel: %s: %d columns, want a multiple of 128", m.name, m.cols)
 	}
 	ng := m.cols / 64
 	mxs := make([]float64, 16)
@@ -291,7 +291,7 @@ func intTables(hd int) (map[string][]byte, error) {
 	for k, b := range t {
 		h := sha256.Sum256(b)
 		if want := intTableSHA[k]; hex.EncodeToString(h[:])[:16] != want {
-			return nil, fmt.Errorf("intcodec: this platform computes table %s differently (sha %x, want %s); "+
+			return nil, fmt.Errorf("intmodel: this platform computes table %s differently (sha %x, want %s); "+
 				"converting here would not give the manifest's file", k, h[:8], want)
 		}
 	}
@@ -379,7 +379,7 @@ func ConvertIntModel(srcDir, dst string, logf func(format string, args ...any)) 
 	num := func(k string) (json.Number, error) {
 		n, ok := cfg[k].(json.Number)
 		if !ok {
-			return "", fmt.Errorf("intcodec: config.json: %s missing", k)
+			return "", fmt.Errorf("intmodel: config.json: %s missing", k)
 		}
 		return n, nil
 	}
@@ -391,10 +391,10 @@ func ConvertIntModel(srcDir, dst string, logf func(format string, args ...any)) 
 	D, L := ival("hidden_size"), ival("num_hidden_layers")
 	nq, V := ival("num_attention_heads"), ival("vocab_size")
 	if th, _ := num("rope_theta"); th.String() != "1000000.0" && th.String() != "1000000" {
-		return fmt.Errorf("intcodec: rope_theta %s, the tables cover 1e6 only", th)
+		return fmt.Errorf("intmodel: rope_theta %s, the tables cover 1e6 only", th)
 	}
 	if ival("max_position_embeddings") != 32768 {
-		return errors.New("intcodec: the tables cover 32,768 positions only")
+		return errors.New("intmodel: the tables cover 32,768 positions only")
 	}
 	tie, _ := cfg["tie_word_embeddings"].(bool)
 	hd := D / nq
@@ -510,7 +510,7 @@ func ConvertIntModel(srcDir, dst string, logf func(format string, args ...any)) 
 				kv.kvU32("intcodec."+k, uint32(n))
 			}
 		default:
-			return fmt.Errorf("intcodec: config.json: %s missing", k)
+			return fmt.Errorf("intmodel: config.json: %s missing", k)
 		}
 		count()
 	}
@@ -565,7 +565,7 @@ func ConvertIntModel(srcDir, dst string, logf func(format string, args ...any)) 
 				return err
 			}
 			if int64(len(b)) != t.size {
-				return fmt.Errorf("intcodec: %s: %d bytes, want %d", t.name, len(b), t.size)
+				return fmt.Errorf("intmodel: %s: %d bytes, want %d", t.name, len(b), t.size)
 			}
 			if _, err := bw.Write(b); err != nil {
 				return err

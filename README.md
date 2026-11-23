@@ -322,37 +322,31 @@ Qwen3-1.7B, an M1 Max writes about 40 to 50 tokens/s and reads prompts at about 
 of its default GPU kernels; an A16 writes about 31 tokens/s (its default kernels: about 60) and reads about 550
 tokens/s.
 
-## Compress text with a model (pack, unpack)
+## Integer models: the same distribution on every machine
 
-`nollama pack` compresses text with a language model driving an arithmetic coder. Any machine with nollama unpacks
-the archive (`.13k`) exactly: an M1 Mac, an Intel server, an NVIDIA GPU running the reference code. That holds because
-the model runs in integer arithmetic only. Every step gives the same result whatever the CPU, the instruction set or
-the thread count, so every machine computes the same next-token probabilities, bit for bit.
+An integer model runs the forward pass in integer arithmetic only, so the next-token distribution is the same exact
+integers on every machine: arm64 or amd64, any thread count, NEON kernels or plain Go. An arithmetic coder can
+therefore decode on one machine what another encoded. [signal](https://github.com/benallfree/compress13k), a
+compressor that uses nollama, is built on this. The deterministic float mode above matches only across nollama's own
+CPU and GPU kernels; integer models also match other implementations of the same spec.
 
-```bash
-nollama convert --profile best      # once: download Qwen2.5-Coder-7B and convert it (sha256 checked)
-nollama pack notes.md               # notes.md.13k
-nollama unpack notes.md.13k         # notes.md, byte for byte
+```go
+m, _ := engine.LoadIntModel("qwen2.5-coder-0.5b-int-v1.gguf", 0)
+s := m.NewSession(4096)
+cum := s.Feed(m.BOS()) // the next token's distribution: cumulative integer counts, cum[len-1] is the total
 ```
 
-| profile | model | converted file | a 55,854-byte minified HTML game |
-|---|---|---:|---:|
-| good | Qwen2.5-Coder-0.5B | 520 MB | 7,186 bytes |
-| better | Qwen2.5-Coder-1.5B | 1.6 GB | 5,856 bytes |
-| best (default) | Qwen2.5-Coder-7B | 7.9 GB | 4,970 bytes |
-
-For comparison, the best zip of that file is about 23 KB.
-
-- **The converted model** is the official Qwen2.5-Coder with every weight rounded to 8 bits, plus lookup tables, in a
-  GGUF (architecture `qwen2-intcodec`). `nollama convert` downloads the official weights at a pinned revision,
-  converts them, and installs the file only if its SHA-256 matches the published one. The conversion is
-  deterministic, so everyone's file is the same.
-- **An archive names its model** in a 2-byte header, so `unpack` knows which profile it needs.
-- **It is slow on a CPU:** each token is a full forward pass. On an M1 Max (NEON kernels), the 0.5B packs or unpacks
-  about 30–60 tokens/s on short texts, and the 7B about 8. A short message takes seconds; a 50 KB file takes
-  minutes to hours.
-- **It is defined by a spec** with conformance vectors (`engine/testdata/intcodec`). `go test ./engine -run TestInt`
-  checks them, given `NOLLAMA_INTCODEC_DIR` pointing at the converted models.
+- **The model** is a converted GGUF (architecture `qwen2-intcodec`): the official Qwen2.5 weights rounded to 8 bits
+  with an integer scale per 64, plus lookup tables and the tokenizer.
+- **Conversion:** `engine.ConvertIntModel(snapshotDir, out, logf)` makes it from the official bf16 safetensors. It is
+  deterministic, so the same source gives the same file, byte for byte, on any machine.
+  - Qwen2.5-Coder-0.5B: 2 s, 520 MB.
+  - Qwen2.5-Coder-7B: 41 s, 7.9 GB.
+- **API:** `Tokenize`, `TokenBytes`, `ByteToken`; `NewSession`, `Feed`, `Reset`.
+- **Speed (M1 Max, NEON):** about 16–40 ms per token for the 0.5B, rising as the context grows, and about 120 ms for
+  the 7B.
+- **Conformance:** `go test ./engine -run TestInt` compares the tokenizer, 330 distributions and the converter with
+  the reference implementation, given `NOLLAMA_INTMODEL_DIR` (and `NOLLAMA_INTMODEL_SRC` for the converter).
 
 ## Test without a model
 
