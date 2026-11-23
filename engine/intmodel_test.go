@@ -425,3 +425,39 @@ func TestIntBatchNcu(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestIntBatchSparsity: how many of the batch attention's weights (and 32-key tiles) are nonzero over BJJ, from
+// int_bpv2_mma*_cnt's counters (INTMODEL; CUDA with tensor cores only).
+func TestIntBatchSparsity(t *testing.T) {
+	size := os.Getenv("INTMODEL")
+	if size == "" {
+		size = "0.5B"
+	}
+	t.Setenv("NOLLAMA_INT_ALIAS", "int_bpv64=int_bpv2_mma64_cnt,int_bpv128=int_bpv2_mma128_cnt")
+	m := loadIntDev(t, size, "auto")
+	ids := vecIDs(t, "bjj.ids.json")
+	if n, _ := strconv.Atoi(os.Getenv("INTN")); n > 0 {
+		ids = ids[:n]
+	}
+	toks := append([]int{m.BOS()}, ids[:len(ids)-1]...)
+	a, err := m.NewSession(len(ids))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if _, err := a.FeedBatch(toks, ids); err != nil {
+		t.Fatal(err)
+	}
+	if a.g == nil || a.g.b == nil {
+		t.Skip("no tensor-core batches")
+	}
+	buf := make([]byte, 32)
+	a.g.g.dev.read(a.g.b.sc, 0, buf)
+	c := make([]uint64, 4)
+	for i := range c {
+		c[i] = binary.LittleEndian.Uint64(buf[8*i:])
+	}
+	t.Logf("raw %x", buf)
+	t.Logf("%s: weights %d, nonzero %d (%.2f%%); key tiles %d, nonzero %d (%.2f%%)", size, c[0], c[1],
+		100*float64(c[1])/float64(c[0]), c[2], c[3], 100*float64(c[3])/float64(c[2]))
+}

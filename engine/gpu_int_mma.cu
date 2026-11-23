@@ -448,8 +448,9 @@ static __device__ __forceinline__ void bmax_mma(const int *mq, const int *shq, l
 }
 
 // arguments: int_bscores's, then the planes (Kp, Vp at the layer), Mp
-#define BMAX_MMA(NAME, HD, QR, KT)                                                                                         \
-	extern "C" __global__ void NAME(const int *mq, const int *shq, const int *Kc, int *S, long *cmax, int *ovf,            \
+#define BMAX_MMA(NAME, HD, QR, KT) BMAX_MMA_LB(NAME, HD, QR, KT, 3) // 3 blocks an SM (faster than more registers)
+#define BMAX_MMA_LB(NAME, HD, QR, KT, MINB)                                                                                \
+	extern "C" __global__ void __launch_bounds__(256, MINB) NAME(const int *mq, const int *shq, const int *Kc, int *S, long *cmax, int *ovf,            \
 	                                const IntParams *pr, BAttnArgs a, const unsigned char *Kp, const unsigned char *Vp,  \
 	                                int Mp) {                                                                            \
 		__shared__ __align__(16) unsigned char qp[2 * QR * (HD + 16)];                                                     \
@@ -461,15 +462,20 @@ static __device__ __forceinline__ void bmax_mma(const int *mq, const int *shq, l
 	}
 BMAX_MMA(int_bmax_mma64, 64, 128, 64)
 BMAX_MMA(int_bmax_mma128, 128, 64, 32)
+// variants (NOLLAMA_INT_ALIAS): register caps
+BMAX_MMA_LB(int_bmax_mma64_lb1, 64, 128, 64, 1)
+BMAX_MMA_LB(int_bmax_mma128_lb1, 128, 64, 32, 1)
+BMAX_MMA_LB(int_bmax_mma128_lb4, 128, 64, 32, 4)
 
 // pass 2: per (query head, block of BRV rows, key chunk): the scores again (tensor cores make that cheaper than
 // storing them), weights w = EXPA[min(M - s, na - 1)], the chunk's Z and O = sum w V; partials to zp, op as int_bpv.
-template <int HD, int BRV>
+template <int HD, int BRV, bool CNT = false>
 static __device__ __forceinline__ void bpv2_mma(const long *cmax, const int *expa, long *zp, long *op, const unsigned char *Kp,
                                                 const unsigned char *Vp, int Mp, const int *mq, const int *shq, int base,
                                                 int R, const BAttnArgs &a, uint3 tg3, uint tid, unsigned char *qp,
                                                 unsigned char *kp, unsigned char *vp, unsigned char *wp, long *Ms, int *zs,
-                                                int *shs, ushort *et) {
+                                                int *shs, ushort *et, unsigned long long *cnt = nullptr) {
+	uint nval = 0, nnz = 0, ntile = 0, nztile = 0; // CNT: weights counted (causal), nonzero; key tiles, nonzero
 	constexpr int KT = 32, MT = BRV / 16, NW = 8 / MT;
 	constexpr int LD = HD + 16, LW = KT + 16;
 	constexpr int SNT = KT / 8, SNPW = SNT / NW; // score n-tiles (keys) per warp
@@ -566,13 +572,22 @@ static __device__ __forceinline__ void bpv2_mma(const long *cmax, const int *exp
 						wv = expa[d];
 					}
 				}
+				if (CNT) {
+					nval += t0 + r < R && t <= base + t0 + r;
+					nnz += wv != 0;
+				}
 				wp[r * LW + kk] = (unsigned char)(wv & 255);
 				wp[BRV * LW + r * LW + kk] = (unsigned char)(wv >> 8);
 				zl[e >> 1] += wv;
 				any |= wv;
 			}
 		}
-		if (!__syncthreads_or(any)) {
+		int anyb = __syncthreads_or(any);
+		if (CNT && tid == 0) {
+			ntile++;
+			nztile += anyb != 0;
+		}
+		if (!anyb) {
 			continue; // every weight 0: nothing to add
 		}
 		for (int p = 0; p < 3; p++) {
@@ -630,6 +645,12 @@ static __device__ __forceinline__ void bpv2_mma(const long *cmax, const int *exp
 	if (tid < (uint)BRV) {
 		zp[((long)(t0 + tid) * a.nq + h) * a.nchmax + c] = zs[tid];
 	}
+	if (CNT) {
+		atomicAdd(cnt, (unsigned long long)nval);
+		atomicAdd(cnt + 1, (unsigned long long)nnz);
+		atomicAdd(cnt + 2, (unsigned long long)ntile);
+		atomicAdd(cnt + 3, (unsigned long long)nztile);
+	}
 }
 
 // arguments: int_bpv's, then the planes (Kp, Vp at the layer), Mp, the query mantissas and shifts
@@ -648,6 +669,20 @@ static __device__ __forceinline__ void bpv2_mma(const long *cmax, const int *exp
 		bpv2_mma<HD, BRV>(cmax, expa, zp, op, Kp, Vp, Mp, mq, shq, pr->pos, pr->tok, a,                                        \
 		             make_uint3(blockIdx.x, blockIdx.y, blockIdx.z), threadIdx.x, qp, kp, vp, wp, Ms, zs, shs, et);        \
 	}
+#define BPV2_MMA_CNT(NAME, HD, BRV, MINB)                                                                                   \
+	extern "C" __global__ void __launch_bounds__(256, MINB) NAME(const int *S, const long *cmax, const int *Vc, const int *expa, long *zp, long *op,     \
+	                                const IntParams *pr, BAttnArgs a, const unsigned char *Kp, const unsigned char *Vp,  \
+	                                int Mp, const int *mq, const int *shq) {                                             \
+		__shared__ __align__(16) unsigned char qp[2 * BRV * (HD + 16)];                                                    \
+		__shared__ __align__(16) unsigned char kp[3 * 32 * (HD + 16)];                                                     \
+		__shared__ __align__(16) unsigned char vp[3 * HD * 48];                                                            \
+		__shared__ __align__(16) unsigned char wp[2 * BRV * 48];                                                           \
+		__shared__ long Ms[BRV];                                                                                           \
+		__shared__ int zs[BRV], shs[BRV];                                                                                  \
+		extern __shared__ __align__(16) ushort et[]; /* ETN entries, dynamic: the static arrays fill most of 48 KB */   \
+		bpv2_mma<HD, BRV, true>(cmax, expa, zp, op, Kp, Vp, Mp, mq, shq, pr->pos, pr->tok, a,                                        \
+		             make_uint3(blockIdx.x, blockIdx.y, blockIdx.z), threadIdx.x, qp, kp, vp, wp, Ms, zs, shs, et, (unsigned long long *)S);        \
+	}
 BPV2_MMA(int_bpv2_mma64, 64, 64)
 BPV2_MMA(int_bpv2_mma128, 128, 32)
 // variants (NOLLAMA_INT_ALIAS): no register cap; 4 blocks an SM
@@ -655,6 +690,9 @@ BPV2_MMA_LB(int_bpv2_mma64_lb1, 64, 64, 1)
 BPV2_MMA_LB(int_bpv2_mma128_lb1, 128, 32, 1)
 BPV2_MMA_LB(int_bpv2_mma64_lb4, 64, 64, 4)
 BPV2_MMA_LB(int_bpv2_mma128_lb4, 128, 32, 4)
+// weight sparsity counters into S (4 uint64s: weights, nonzero; key tiles, nonzero): TestIntBatchSparsity
+BPV2_MMA_CNT(int_bpv2_mma64_cnt, 64, 64, 3)
+BPV2_MMA_CNT(int_bpv2_mma128_cnt, 128, 32, 3)
 
 // int_gemm on tensor cores, same arguments, grid (64 outputs x 32 rows a threadgroup) and results: per 64-group the
 // activations' two byte planes (x = xh * 2^8 + xl) times the int8 weights, each an exact int32 mma sum, combined as

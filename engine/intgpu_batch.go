@@ -45,6 +45,7 @@ var errUnsupportedHD = errors.New("intmodel: batches on the GPU need a head size
 type intBatch struct {
 	P                           int // rows per batch
 	params, toks, tgt, cnt, ovf ibuf
+	sc                          ibuf    // scores (without planes); with them, 64 bytes (int_bpv2_mma*_cnt's counters)
 	ds, slow                    []idisp // slow: the same with int_attnb* (when a score overflows int32)
 	kind, slowKind              []int
 	head                        [][2]idisp // per head block: the head GEMM and the counts
@@ -61,7 +62,7 @@ func (s *intGPUState) newBatch() (*intBatch, error) {
 	partN := P * nq * nchmax
 	oneKernel := s.kp != nil && os.Getenv("NOLLAMA_INT_BATTN") != "" // experiment: int_battn* (slower so far)
 	if s.kp != nil {
-		P, scoreN = intBatchRows, 16 // tensor-core attention recomputes scores instead of storing them
+		P, scoreN = intBatchRows, 64 // tensor-core attention recomputes scores instead of storing them
 		if v, err := strconv.Atoi(os.Getenv("NOLLAMA_INT_BATCH")); err == nil && v >= intHeadRows {
 			P = v / intHeadRows * intHeadRows
 		}
@@ -94,6 +95,7 @@ func (s *intGPUState) newBatch() (*intBatch, error) {
 			return nil, err
 		}
 	}
+	b.sc = sc
 	B := func(b ibuf) iarg { return iarg{Buf: b} }
 	BO := func(b ibuf, off int) iarg { return iarg{Buf: b, Offset: off} }
 	C, F := cArg, g.farg

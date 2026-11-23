@@ -30,7 +30,7 @@ var cudaIntMMAPTX string
 // int_gemm_mma3: GEMM3_SMEM, 3 stages of 64 x 160 + 128 x 80 + 256 bytes.
 var cudaIntDyn = map[string]int{"int_bpv2_mma64": 2 * 11392, "int_bpv2_mma128": 2 * 11392, "int_gemm_mma3": 3 * (64*160 + 128*80 + 256),
 	"int_gemm_mma3_4": 4 * (64*160 + 128*80 + 256), "int_bpv2_mma64_lb1": 2 * 11392, "int_bpv2_mma128_lb1": 2 * 11392,
-	"int_bpv2_mma64_lb4": 2 * 11392, "int_bpv2_mma128_lb4": 2 * 11392}
+	"int_bpv2_mma64_cnt": 2 * 11392, "int_bpv2_mma128_cnt": 2 * 11392, "int_bpv2_mma64_lb4": 2 * 11392, "int_bpv2_mma128_lb4": 2 * 11392}
 
 var cudaIntMMA = map[string]string{"int_bscores64": "int_bmax_mma64", "int_bscores128": "int_bmax_mma128",
 	"int_bpv64": "int_bpv2_mma64", "int_bpv128": "int_bpv2_mma128", "int_kvplanes": "int_kvplanes",
@@ -84,7 +84,12 @@ func openIntCUDA(m *IntModel) (intDev, ibuf, error) {
 		for _, n := range alias {
 			names = append(names, n)
 		}
-		if mm, mks, err := dev.Load(cudaIntMMAPTX, names...); err == nil {
+		mm, mks, err := dev.Load(cudaIntMMAPTX, names...)
+		if err != nil { // a kernel missing from the PTX (a build mistake): loud, not a silent fallback
+			d.close()
+			return nil, nil, fmt.Errorf("cuda: tensor-core kernels: %w (NOLLAMA_INT_NO_MMA=1 runs without them)", err)
+		}
+		{
 			for _, n := range names {
 				ks[n] = mks[n]
 			}
