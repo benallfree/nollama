@@ -7,6 +7,7 @@ package engine
 import (
 	_ "embed"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/benallfree/nollama/engine/internal/cuda"
@@ -17,9 +18,20 @@ import (
 //go:embed gpu_int_cuda.ptx
 var cudaIntPTX string
 
+// gpu_int_mma.ptx is gpu_int_mma.cu for compute 8.0+: kernels on int8 tensor cores that stand in for gpu_int.cu's
+// (same arguments, grid and results), loaded where they work unless NOLLAMA_INT_NO_MMA is set.
+//
+//go:embed gpu_int_mma.ptx
+var cudaIntMMAPTX string
+
+var cudaIntMMA = map[string]string{"int_bscores64": "int_bscores_mma64", "int_bscores128": "int_bscores_mma128",
+	"int_bpv64": "int_bpv_mma64", "int_bpv128": "int_bpv_mma128"}
+
 type cudaIntDev struct {
+	rec  map[replayKey]*cuda.Graph // replay's recordings
 	dev  *cuda.Device
 	mod  *cuda.Module
+	mma  *cuda.Module // or nil
 	ks   map[string]*cuda.Kernel
 	ls   []cuda.Launch // run's scratch
 	last time.Duration
@@ -46,7 +58,19 @@ func openIntCUDA(m *IntModel) (intDev, ibuf, error) {
 		dev.Close()
 		return nil, nil, err
 	}
-	d := &cudaIntDev{dev: dev, mod: mod, ks: ks}
+	d := &cudaIntDev{dev: dev, mod: mod, ks: ks, rec: map[replayKey]*cuda.Graph{}}
+	if dev.Major >= 8 && os.Getenv("NOLLAMA_INT_NO_MMA") == "" {
+		var names []string
+		for _, n := range cudaIntMMA {
+			names = append(names, n)
+		}
+		if mm, mks, err := dev.Load(cudaIntMMAPTX, names...); err == nil {
+			d.mma = mm
+			for k, n := range cudaIntMMA {
+				ks[k] = mks[n] // the tensor-core kernel runs under the portable one's name
+			}
+		}
+	}
 	f, err := d.alloc(len(m.g.data))
 	if err != nil {
 		d.close()
@@ -57,10 +81,17 @@ func openIntCUDA(m *IntModel) (intDev, ibuf, error) {
 }
 
 func (d *cudaIntDev) name() string {
-	return fmt.Sprintf("cuda (%s, compute %d.%d)", d.dev.Name, d.dev.Major, d.dev.Minor)
+	tc := ""
+	if d.mma != nil {
+		tc = ", tensor cores"
+	}
+	return fmt.Sprintf("cuda (%s, compute %d.%d%s)", d.dev.Name, d.dev.Major, d.dev.Minor, tc)
 }
 
 func (d *cudaIntDev) close() {
+	if d.mma != nil {
+		d.mma.Unload()
+	}
 	d.mod.Unload()
 	d.dev.Close()
 }
@@ -115,7 +146,48 @@ func (d *cudaIntDev) prepare(ds []idisp, _ func(int) (ibuf, error)) error {
 	return nil
 }
 
+func (d *cudaIntDev) graphs() bool { return true }
+
+// replay records ds as a CUDA graph the first time (per key) and replays it: one launch instead of one per kernel.
+func (d *cudaIntDev) replay(key replayKey, ds []idisp) error {
+	g := d.rec[key]
+	if g == nil {
+		if err := d.launches(ds); err != nil {
+			return err
+		}
+		var err error
+		if g, err = d.dev.Record(d.ls...); err != nil {
+			return err
+		}
+		d.rec[key] = g
+	}
+	t0 := time.Now()
+	err := g.Replay()
+	d.last = time.Since(t0)
+	return err
+}
+
+func (d *cudaIntDev) forget(owner any) {
+	for k, g := range d.rec {
+		if k.owner == owner {
+			g.Destroy()
+			delete(d.rec, k)
+		}
+	}
+}
+
 func (d *cudaIntDev) run(ds []idisp) error {
+	if err := d.launches(ds); err != nil {
+		return err
+	}
+	t0 := time.Now()
+	err := d.dev.Run(d.ls...)
+	d.last = time.Since(t0)
+	return err
+}
+
+// launches converts ds into d.ls.
+func (d *cudaIntDev) launches(ds []idisp) error {
 	d.ls = d.ls[:0]
 	for _, x := range ds {
 		args, ok := x.pre.([]cuda.Arg)
@@ -132,8 +204,5 @@ func (d *cudaIntDev) run(ds []idisp) error {
 		d.ls = append(d.ls, cuda.Launch{K: k, Args: args, Grid: [3]uint32{uint32(x.Groups.W), uint32(x.Groups.H), uint32(x.Groups.D)},
 			Block: [3]uint32{uint32(x.Threads.W), uint32(x.Threads.H), uint32(x.Threads.D)}})
 	}
-	t0 := time.Now()
-	err := d.dev.Run(d.ls...)
-	d.last = time.Since(t0)
-	return err
+	return nil
 }

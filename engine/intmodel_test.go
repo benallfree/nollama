@@ -15,7 +15,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unsafe"
 )
 
 // The integer model's conformance tests need the converted models (GGUF, 0.5 to 8 GB): set NOLLAMA_INTMODEL_DIR to
@@ -301,13 +300,14 @@ func TestIntBatchBJJProfile(t *testing.T) {
 	gs := a.g
 	b := gs.b
 	pos, R := 23000, b.P
-	tk := unsafe.Slice((*int32)(unsafe.Pointer(unsafe.SliceData(gs.g.dev.host(b.toks)))), R)
-	tg := unsafe.Slice((*int32)(unsafe.Pointer(unsafe.SliceData(gs.g.dev.host(b.tgt)))), R)
+	tkb, tgb := make([]byte, 4*R), make([]byte, 4*R)
 	for i := range R {
-		tk[i], tg[i] = int32(toks[pos+i]), int32(ids[pos+i])
+		binary.LittleEndian.PutUint32(tkb[4*i:], uint32(toks[pos+i]))
+		binary.LittleEndian.PutUint32(tgb[4*i:], uint32(ids[pos+i]))
 	}
-	binary.LittleEndian.PutUint32(gs.g.dev.host(b.params)[0:], uint32(R))
-	binary.LittleEndian.PutUint32(gs.g.dev.host(b.params)[4:], uint32(pos))
+	gs.g.dev.write(b.toks, 0, tkb)
+	gs.g.dev.write(b.tgt, 0, tgb)
+	gs.g.dev.write(b.params, 0, i32b(R, pos))
 	nch := uint((pos+R-1)/intKC + 1)
 	ds := append([]idisp(nil), b.ds...)
 	for i := range ds {

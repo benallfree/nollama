@@ -217,7 +217,7 @@ func TestIntGPUFloor(t *testing.T) {
 		}
 		return r
 	}
-	for _, k := range []string{"int_blockf", "int_norm", "int_qkv", "int_table1", "int_table2", "int_table3", "int_table4", "int_attn2"} {
+	for _, k := range []string{"int_blockf", "int_norm", "int_qkv", "int_mlp", "int_table1", "int_table2", "int_table3", "int_table4", "int_attn1", "int_attn2", "int_attn3"} {
 		d := byName[k][0]
 		t.Logf("%-12s x200: %.1f us each", k, tm(rep(d, 200))/200)
 	}

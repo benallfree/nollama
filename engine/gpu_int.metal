@@ -158,13 +158,21 @@ kernel void int_norm(device long *h [[buffer(0)]], device const long *acc [[buff
 	}
 	long ms = udivx(tgn_sum(ss, tg, tid, nt), D) + udivx(1L << max(0, 48 - 2 * sh), 1000000);
 	long r = max(1L, isqrt_exact(ms));
+	// y = x * g * 16384 / r, kept for the second pass (the division is the costly part); NY per thread at most
+	const int NY = 16; // D <= 16 * threads
+	long y[NY];
 	int ym = 0;
-	for (int i = tid; i < D; i += nt) {
-		ym = max(ym, bitlen(iabs(sdivx(rsh(h[i], sh) * g[i] * 16384, r))));
+	for (int j = 0; j < NY; j++) {
+		int i = tid + j * nt;
+		y[j] = i < D ? sdivx(rsh(h[i], sh) * g[i] * 16384, r) : 0;
+		ym = max(ym, bitlen(iabs(y[j])));
 	}
 	int sh2 = max(0, (int)tgn_max(ym, tg, tid, nt) - 15);
-	for (int i = tid; i < D; i += nt) {
-		m[i] = (short)clamp(rsh(sdivx(rsh(h[i], sh) * g[i] * 16384, r), sh2), -32767L, 32767L);
+	for (int j = 0; j < NY; j++) {
+		int i = tid + j * nt;
+		if (i < D) {
+			m[i] = (short)clamp(rsh(y[j], sh2), -32767L, 32767L);
+		}
 	}
 	if (tid == 0) {
 		ex[eoutSlot] = sh2 - 30;
@@ -436,8 +444,10 @@ kernel void int_attn1(device const int *mq [[buffer(0)]], device const int *shq 
                       device const IntParams *pr [[buffer(5)]], constant AttnArgs &a [[buffer(6)]],
                       uint2 tg2 [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
 	threadgroup int qs[GMAX * HDMAX];
-	threadgroup long tg[32];
 	int j = tg2.x, c = tg2.y, T = pr->pos + 1, hd = a.hd, grp = a.nq / a.nkv;
+	if (c * ACH >= T) {
+		return; // a chunk past the position (a recorded launch list covers every chunk)
+	}
 	for (int i = tid; i < grp * hd; i += ACH) {
 		qs[i] = mq[j * grp * hd + i];
 	}
@@ -505,6 +515,9 @@ kernel void int_attn2(device const long *S [[buffer(0)]], device const long *cma
 	threadgroup int w[GMAX][ACH]; // weights, <= 2^15
 	threadgroup long red[GMAX][ACH]; // O partials: (ACH / hd - 1) slices x hd lanes per head
 	int j = tg2.x, c = tg2.y, T = pr->pos + 1, hd = a.hd, grp = a.nq / a.nkv;
+	if (c * ACH >= T) {
+		return;
+	}
 	int nch = (T + ACH - 1) / ACH;
 	int t = c * ACH + tid;
 	// M per head: simdgroup g reduces head g's chunk maxima (ACH / 32 = 8 simdgroups >= grp)
@@ -1146,4 +1159,27 @@ kernel void int_bcomb(device const long *zp [[buffer(0)]], device const long *op
 	long aO = iabs(O), hi = udivx(aO, Z);
 	long r = (hi << 12) + udivx((aO - hi * Z) << 12, Z);
 	o[((long)row * a.nq + h) * a.hd + d] = O < 0 ? -r : r;
+}
+
+// int_find: decoding's search, on the GPU so the table needn't be copied back: the first t with cum[t] > *tgt, and
+// res = (t, cum[t], cum[t-1] (0 for t = 0), cum[V-1]); t = V if there is none.
+kernel void int_find(device const long *cum [[buffer(0)]], device const long *tgt [[buffer(1)]], device long *res [[buffer(2)]],
+                     constant int &V [[buffer(3)]], uint tid [[thread_index_in_threadgroup]]) {
+	if (tid != 0) {
+		return;
+	}
+	long target = *tgt;
+	int lo = 0, hi = V;
+	while (lo < hi) {
+		int mid = (lo + hi) / 2;
+		if (cum[mid] > target) {
+			hi = mid;
+		} else {
+			lo = mid + 1;
+		}
+	}
+	res[0] = lo;
+	res[1] = lo < V ? cum[lo] : 0;
+	res[2] = lo > 0 ? cum[lo - 1] : 0;
+	res[3] = cum[V - 1];
 }

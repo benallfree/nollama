@@ -17,7 +17,7 @@ var metalIntSource string
 // intKernels are the integer models' kernels, the same names in gpu_int.metal and gpu_int.cu.
 var intKernels = []string{"int_embed", "int_norm", "int_matvec", "int_qkv", "int_blockf", "int_mlp", "int_table1",
 	"int_table2", "int_table3", "int_table4", "int_attn1", "int_attn2", "int_attn3", "int_gemm", "int_attnb64", "int_attnb128",
-	"int_counts", "int_bscores64", "int_bscores128", "int_bpv64", "int_bpv128", "int_bcomb"}
+	"int_counts", "int_bscores64", "int_bscores128", "int_bpv64", "int_bpv128", "int_bcomb", "int_find"}
 
 type metalIntDev struct {
 	dev *metal.Device
@@ -75,8 +75,11 @@ func (d *metalIntDev) write(dst ibuf, off int, src []byte) {
 func (d *metalIntDev) read(src ibuf, off int, dst []byte) {
 	copy(dst, src.(*metalIntBuf).b.Bytes()[off:])
 }
-func (d *metalIntDev) host(b ibuf) []byte     { return b.(*metalIntBuf).b.Bytes() }
-func (d *metalIntDev) lastGPU() time.Duration { return d.dev.LastGPU }
+func (d *metalIntDev) host(b ibuf) []byte                   { return b.(*metalIntBuf).b.Bytes() }
+func (d *metalIntDev) lastGPU() time.Duration               { return d.dev.LastGPU }
+func (d *metalIntDev) replay(_ replayKey, ds []idisp) error { return d.run(ds) }
+func (d *metalIntDev) graphs() bool                         { return false }
+func (d *metalIntDev) forget(any)                           {}
 
 func (d *metalIntDev) arg(a iarg) metal.Arg {
 	if a.Buf == nil {

@@ -1,6 +1,9 @@
 package engine
 
-import "errors"
+import (
+	"errors"
+	"sort"
+)
 
 // The integer model's public API: load, tokenize, and a session that feeds one token at a time and returns the
 // next-token distribution as cumulative integer counts.
@@ -117,8 +120,38 @@ func (s *IntSession) Feed(tok int) ([]int64, error) {
 		if err := s.g.step(tok, s.pos-1); err != nil {
 			return nil, err
 		}
-		return s.g.cum, nil
+		return s.g.table(), nil
 	}
 	s.s.step(tok)
 	return s.s.cum, nil
+}
+
+// FeedFind adds a token and finds the next one by a count, as an arithmetic decoder does: target gets the table's
+// total and returns a count c; FeedFind returns the token t with cum[t-1] <= c < cum[t] and t's counts. Feed would
+// give the same answer; on a GPU without shared memory, FeedFind searches there and copies back only the result.
+func (s *IntSession) FeedFind(tok int, target func(total int64) int64) (int, IntCount, error) {
+	if s.pos >= s.maxlen {
+		return 0, IntCount{}, errors.New("intmodel: context full")
+	}
+	if s.g == nil {
+		cum, err := s.Feed(tok)
+		if err != nil {
+			return 0, IntCount{}, err
+		}
+		return findIn(cum, target)
+	}
+	s.pos++
+	if err := s.g.step(tok, s.pos-1); err != nil {
+		return 0, IntCount{}, err
+	}
+	return s.g.findTok(target)
+}
+
+func findIn(cum []int64, target func(total int64) int64) (int, IntCount, error) {
+	c := target(cum[len(cum)-1])
+	t := sort.Search(len(cum), func(i int) bool { return cum[i] > c })
+	if t >= len(cum) {
+		return 0, IntCount{}, errBadTarget
+	}
+	return t, countOf(cum, t), nil
 }

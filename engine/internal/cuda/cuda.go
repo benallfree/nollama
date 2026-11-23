@@ -48,6 +48,12 @@ var (
 	cuStreamSynchronize       func(s uintptr) result
 	cuLaunchKernel            func(fn uintptr, gx, gy, gz, bx, by, bz, shared uint32, stream uintptr, params unsafe.Pointer, extra unsafe.Pointer) result
 	cuGetErrorString          func(r result, s **byte) result
+	cuStreamBeginCapture      func(s uintptr, mode int32) result
+	cuStreamEndCapture        func(s uintptr, graph *uintptr) result
+	cuGraphInstantiate        func(exec *uintptr, graph uintptr, flags uint64) result
+	cuGraphLaunch             func(exec uintptr, s uintptr) result
+	cuGraphExecDestroy        func(exec uintptr) result
+	cuGraphDestroy            func(graph uintptr) result
 )
 
 const (
@@ -92,6 +98,9 @@ func load() error {
 			{&cuStreamCreate, "cuStreamCreate"}, {&cuStreamDestroy, "cuStreamDestroy_v2"},
 			{&cuStreamSynchronize, "cuStreamSynchronize"}, {&cuLaunchKernel, "cuLaunchKernel"},
 			{&cuGetErrorString, "cuGetErrorString"},
+			{&cuStreamBeginCapture, "cuStreamBeginCapture_v2"}, {&cuStreamEndCapture, "cuStreamEndCapture"},
+			{&cuGraphInstantiate, "cuGraphInstantiateWithFlags"}, {&cuGraphLaunch, "cuGraphLaunch"},
+			{&cuGraphExecDestroy, "cuGraphExecDestroy"}, {&cuGraphDestroy, "cuGraphDestroy"},
 		} {
 			sym, err := symbol(lib, f.name)
 			if err != nil {
@@ -337,29 +346,91 @@ type Launch struct {
 // Run queues the launches in order on the device's stream and waits for them.
 func (d *Device) Run(ls ...Launch) error {
 	return d.do(func() error {
-		var pin runtime.Pinner
-		defer pin.Unpin()
-		for _, l := range ls {
-			// kernelParams: an array of pointers, each to one argument's value.
-			vals := make([]uint64, len(l.Args))
-			params := make([]unsafe.Pointer, len(l.Args))
-			pin.Pin(&vals[0])
-			for i, a := range l.Args {
-				if a.Bytes != nil {
-					pin.Pin(&a.Bytes[0])
-					params[i] = unsafe.Pointer(&a.Bytes[0])
-				} else {
-					vals[i] = uint64(a.Ptr)
-					params[i] = unsafe.Pointer(&vals[i])
-				}
-			}
-			pin.Pin(&params[0])
-			r := cuLaunchKernel(l.K.fn, l.Grid[0], l.Grid[1], l.Grid[2], l.Block[0], l.Block[1], l.Block[2],
-				uint32(l.SharedB), d.stream, unsafe.Pointer(&params[0]), nil)
-			if r != 0 {
-				return errorOf("cuLaunchKernel "+l.K.Name, r)
-			}
+		if err := d.enqueue(ls); err != nil {
+			return err
 		}
 		return errorOf("cuStreamSynchronize", cuStreamSynchronize(d.stream))
 	})
+}
+
+// Graph is a recorded list of launches (a CUDA graph): replaying it costs one launch, not one per kernel. Kernel
+// arguments are fixed when it is recorded; what the kernels read from device memory may change between replays.
+type Graph struct {
+	d           *Device
+	graph, exec uintptr
+}
+
+// Record captures the launches as a graph (nothing runs).
+func (d *Device) Record(ls ...Launch) (*Graph, error) {
+	g := &Graph{d: d}
+	err := d.do(func() error {
+		if r := cuStreamBeginCapture(d.stream, 2 /* relaxed */); r != 0 {
+			return errorOf("cuStreamBeginCapture", r)
+		}
+		err := d.enqueue(ls)
+		if r := cuStreamEndCapture(d.stream, &g.graph); r != 0 && err == nil {
+			err = errorOf("cuStreamEndCapture", r)
+		}
+		if err != nil {
+			return err
+		}
+		return errorOf("cuGraphInstantiate", cuGraphInstantiate(&g.exec, g.graph, 0))
+	})
+	if err != nil {
+		g.Destroy()
+		return nil, err
+	}
+	return g, nil
+}
+
+// Replay runs the graph and waits for it.
+func (g *Graph) Replay() error {
+	return g.d.do(func() error {
+		if r := cuGraphLaunch(g.exec, g.d.stream); r != 0 {
+			return errorOf("cuGraphLaunch", r)
+		}
+		return errorOf("cuStreamSynchronize", cuStreamSynchronize(g.d.stream))
+	})
+}
+
+// Destroy frees the graph.
+func (g *Graph) Destroy() {
+	g.d.do(func() error {
+		if g.exec != 0 {
+			cuGraphExecDestroy(g.exec)
+		}
+		if g.graph != 0 {
+			cuGraphDestroy(g.graph)
+		}
+		g.exec, g.graph = 0, 0
+		return nil
+	})
+}
+
+// enqueue queues the launches on the stream (the caller holds the context).
+func (d *Device) enqueue(ls []Launch) error {
+	var pin runtime.Pinner
+	defer pin.Unpin()
+	for _, l := range ls {
+		// kernelParams: an array of pointers, each to one argument's value.
+		vals := make([]uint64, len(l.Args))
+		params := make([]unsafe.Pointer, len(l.Args))
+		pin.Pin(&vals[0])
+		for i, a := range l.Args {
+			if a.Bytes != nil {
+				pin.Pin(&a.Bytes[0])
+				params[i] = unsafe.Pointer(&a.Bytes[0])
+			} else {
+				vals[i] = uint64(a.Ptr)
+				params[i] = unsafe.Pointer(&vals[i])
+			}
+		}
+		pin.Pin(&params[0])
+		r := cuLaunchKernel(l.K.fn, l.Grid[0], l.Grid[1], l.Grid[2], l.Block[0], l.Block[1], l.Block[2],
+			uint32(l.SharedB), d.stream, unsafe.Pointer(&params[0]), nil)
+		if r != 0 {
+			return errorOf("cuLaunchKernel "+l.K.Name, r)
+		}
+	}
+	return nil
 }

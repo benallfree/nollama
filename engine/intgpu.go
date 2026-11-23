@@ -12,6 +12,8 @@ import (
 	"unsafe"
 )
 
+var errBadTarget = errors.New("intmodel: target count past the table's total")
+
 const intTG = 1024 // threads per threadgroup int_qkv, int_blockf and int_counts assume
 
 // isize, iarg and idisp describe kernel launches independently of the GPU API.
@@ -45,8 +47,21 @@ type intDev interface {
 	host(b ibuf) []byte // the buffer's memory as the CPU sees it (unified memory), or nil
 	// prepare readies a launch list once (Metal moves constants into a buffer); alloc's buffers live with the list.
 	prepare(ds []idisp, alloc func(int) (ibuf, error)) error
-	run(ds []idisp) error   // in order, each launch seeing the ones before; returns when they're done
+	run(ds []idisp) error // in order, each launch seeing the ones before; returns when they're done
+	// replay runs a list the same way, possibly recorded once (CUDA graphs) under key: then the list, grids
+	// included, must not change between calls. graphs says whether it records; forget drops an owner's recordings.
+	replay(key replayKey, ds []idisp) error
+	graphs() bool
+	forget(owner any)
 	lastGPU() time.Duration // the last run's GPU time, when the backend knows it
+}
+
+// replayKey names a recorded launch list: its owner (forget drops an owner's recordings) and the list itself.
+type replayKey struct {
+	owner any
+	first *idisp
+	n     int
+	v     int // a variant of the list (the attention chunk count it covers)
 }
 
 // intGPU is a model's GPU: the device and the model file on it.
@@ -81,6 +96,11 @@ type intGPUState struct {
 	params ibuf    // tok, pos
 	cum    []int64 // the table, as the CPU sees it
 	cumBuf ibuf    // where it is on the GPU, when the CPU can't see GPU memory
+	fresh  bool    // cum holds the last step's table (cumBuf's copy has been read)
+	tgt    ibuf    // int_find's target and result
+	res    ibuf
+	find   []idisp
+	maxch  int
 	ds     []idisp
 	bufs   []ibuf
 	// kept for batches (intgpu_batch.go)
@@ -103,6 +123,7 @@ func (g *intGPU) newState(m *IntModel, maxlen int) (*intGPUState, error) {
 	accN := max(qkvN, D, 2*I, V)
 	var err error
 	maxch := (maxlen + intACH - 1) / intACH
+	s.maxch = maxch
 	tch := (V + intTCH - 1) / intTCH
 	var h, mb, ex, acc, mq, shq, kc, vc, sb, o, p, lg, cum, cmax, zpart, opart, tpart ibuf
 	for _, x := range []struct {
@@ -120,7 +141,20 @@ func (g *intGPU) newState(m *IntModel, maxlen int) (*intGPUState, error) {
 	if hb := g.dev.host(cum); hb != nil {
 		s.cum = unsafe.Slice((*int64)(unsafe.Pointer(unsafe.SliceData(hb))), V)
 	} else {
-		s.cum, s.cumBuf = make([]int64, V), cum // read back after each step
+		s.cum, s.cumBuf = make([]int64, V), cum // read back when asked for
+	}
+	if s.tgt, err = nb(8); err == nil {
+		s.res, err = nb(32)
+	}
+	if err != nil {
+		s.release()
+		return nil, err
+	}
+	s.find = []idisp{{K: "int_find", Args: []iarg{{Buf: cum}, {Buf: s.tgt}, {Buf: s.res}, cArg(V)},
+		Groups: isize{1, 1, 1}, Threads: isize{32, 1, 1}}}
+	if err := g.dev.prepare(s.find, s.newBuffer); err != nil {
+		s.release()
+		return nil, err
 	}
 	B := func(b ibuf) iarg { return iarg{Buf: b} }
 	BO := func(b ibuf, off int) iarg { return iarg{Buf: b, Offset: off} }
@@ -175,10 +209,10 @@ func (g *intGPU) newState(m *IntModel, maxlen int) (*intGPUState, error) {
 		ds = append(ds,
 			idisp{K: "int_attn1", Args: []iarg{B(mq), B(shq), BO(kc, l*kvLayer), B(sb), B(cmax),
 				B(s.params), iarg{Bytes: attnArgs}},
-				Groups: isize{W: uint(nkv), H: 1, D: 1}, Threads: isize{W: intACH, H: 1, D: 1}},
+				Groups: isize{W: uint(nkv), H: uint(maxch), D: 1}, Threads: isize{W: intACH, H: 1, D: 1}},
 			idisp{K: "int_attn2", Args: []iarg{B(sb), B(cmax), BO(vc, l*kvLayer), F(rawA), B(zpart),
 				B(opart), B(s.params), iarg{Bytes: attnArgs}},
-				Groups: isize{W: uint(nkv), H: 1, D: 1}, Threads: isize{W: intACH, H: 1, D: 1}},
+				Groups: isize{W: uint(nkv), H: uint(maxch), D: 1}, Threads: isize{W: intACH, H: 1, D: 1}},
 			idisp{K: "int_attn3", Args: []iarg{B(zpart), B(opart), B(o), B(s.params),
 				iarg{Bytes: attnArgs}},
 				Groups: isize{W: uint(nq), H: 1, D: 1}, Threads: isize{W: uint(hd), H: 1, D: 1}},
@@ -245,22 +279,63 @@ func (g *intGPU) farg(x any) iarg {
 
 func (s *intGPUState) step(tok, pos int) error {
 	s.g.dev.write(s.params, 0, i32b(tok, pos))
+	s.fresh = false
 	nch := uint((pos + intACH) / intACH)
+	if s.g.dev.graphs() {
+		// a recording per power-of-two chunk count (chunks past the position return at once): few recordings, and
+		// at most half the attention blocks idle
+		b := uint(1)
+		for b < nch {
+			b *= 2
+		}
+		b = min(b, uint(s.maxch))
+		for i := range s.ds {
+			if k := s.ds[i].K; k == "int_attn1" || k == "int_attn2" {
+				s.ds[i].Groups.H = b
+			}
+		}
+		return s.g.dev.replay(replayKey{s, &s.ds[0], len(s.ds), int(b)}, s.ds)
+	}
 	for i := range s.ds { // the split-attention grids follow the position
 		if k := s.ds[i].K; k == "int_attn1" || k == "int_attn2" {
 			s.ds[i].Groups.H = nch
 		}
 	}
-	if err := s.g.dev.run(s.ds); err != nil {
-		return err
-	}
-	if s.cumBuf != nil {
+	return s.g.dev.run(s.ds)
+}
+
+// table returns the last step's table, copying it back if the CPU can't see it.
+func (s *intGPUState) table() []int64 {
+	if s.cumBuf != nil && !s.fresh {
 		s.g.dev.read(s.cumBuf, 0, unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(s.cum))), 8*len(s.cum)))
 	}
-	return nil
+	s.fresh = true
+	return s.cum
+}
+
+// find returns the first t with cum[t] > target(total) and t's counts, searching on the GPU when the table is there.
+func (s *intGPUState) findTok(target func(total int64) int64) (int, IntCount, error) {
+	if s.cumBuf == nil || s.fresh {
+		return findIn(s.table(), target)
+	}
+	V := len(s.cum)
+	b := make([]byte, 32)
+	s.g.dev.read(s.cumBuf, 8*(V-1), b[:8])
+	binary.LittleEndian.PutUint64(b, uint64(target(int64(binary.LittleEndian.Uint64(b)))))
+	s.g.dev.write(s.tgt, 0, b[:8])
+	if err := s.g.dev.run(s.find); err != nil {
+		return 0, IntCount{}, err
+	}
+	s.g.dev.read(s.res, 0, b)
+	r := func(i int) int64 { return int64(binary.LittleEndian.Uint64(b[8*i:])) }
+	if r(0) >= int64(V) {
+		return 0, IntCount{}, errBadTarget
+	}
+	return int(r(0)), IntCount{Total: r(3), High: r(1), Low: r(2)}, nil
 }
 
 func (s *intGPUState) release() {
+	s.g.dev.forget(s)
 	for _, b := range s.bufs {
 		s.g.dev.free(b)
 	}
