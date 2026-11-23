@@ -25,6 +25,9 @@ var cudaIntPTX string
 var cudaIntMMAPTX string
 
 // With the byte-plane KV cache: scores (maxima only) and weights x V (recomputing scores) on tensor cores.
+// cudaIntDyn: dynamic shared memory per tensor-core kernel (EXPA's nonzero head as ushorts, ETN entries).
+var cudaIntDyn = map[string]int{"int_bpv2_mma64": 2 * 11392, "int_bpv2_mma128": 2 * 11392}
+
 var cudaIntMMA = map[string]string{"int_bscores64": "int_bmax_mma64", "int_bscores128": "int_bmax_mma128",
 	"int_bpv64": "int_bpv2_mma64", "int_bpv128": "int_bpv2_mma128", "int_kvplanes": "int_kvplanes",
 	"int_gemm": "int_gemm_mma"}
@@ -72,6 +75,12 @@ func openIntCUDA(m *IntModel) (intDev, ibuf, error) {
 				ks[n] = mks[n]
 			}
 			d.mma = mm
+			for n, b := range cudaIntDyn {
+				if err := dev.SetMaxShared(mks[n], b); err != nil {
+					d.close()
+					return nil, nil, err
+				}
+			}
 			for k, n := range cudaIntMMA {
 				ks[k] = mks[n] // the tensor-core kernel runs under the portable one's name
 			}
@@ -209,7 +218,7 @@ func (d *cudaIntDev) launches(ds []idisp) error {
 			return fmt.Errorf("cuda: no kernel %s", x.K)
 		}
 		d.ls = append(d.ls, cuda.Launch{K: k, Args: args, Grid: [3]uint32{uint32(x.Groups.W), uint32(x.Groups.H), uint32(x.Groups.D)},
-			Block: [3]uint32{uint32(x.Threads.W), uint32(x.Threads.H), uint32(x.Threads.D)}})
+			Block: [3]uint32{uint32(x.Threads.W), uint32(x.Threads.H), uint32(x.Threads.D)}, SharedB: cudaIntDyn[k.Name]})
 	}
 	return nil
 }

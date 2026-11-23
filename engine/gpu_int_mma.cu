@@ -469,7 +469,7 @@ static __device__ __forceinline__ void bpv2_mma(const long *cmax, const int *exp
                                                 const unsigned char *Vp, int Mp, const int *mq, const int *shq, int base,
                                                 int R, const BAttnArgs &a, uint3 tg3, uint tid, unsigned char *qp,
                                                 unsigned char *kp, unsigned char *vp, unsigned char *wp, long *Ms, int *zs,
-                                                int *shs) {
+                                                int *shs, ushort *et) {
 	constexpr int KT = 32, MT = BRV / 16, NW = 8 / MT;
 	constexpr int LD = HD + 16, LW = KT + 16;
 	constexpr int SNT = KT / 8, SNPW = SNT / NW; // score n-tiles (keys) per warp
@@ -477,7 +477,10 @@ static __device__ __forceinline__ void bpv2_mma(const long *cmax, const int *exp
 	int h = tg3.x, t0 = tg3.y * BRV, c = tg3.z, grp = a.nq / a.nkv, j = h / grp;
 	int pmax = base + t0 + BRV - 1;
 	int k0c = c * KC, k1c = min(k0c + KC, pmax + 1);
-	int ez = a.ez;
+	int ez = a.ez, ezs = min(ez, ETN);
+	for (int i = tid; i < ezs; i += 256) {
+		et[i] = (ushort)expa[i];
+	}
 	for (int i = tid; i < BRV * HD; i += 256) {
 		int r = i / HD, d = i % HD;
 		int q = t0 + r < R ? mq[((long)(t0 + r) * a.nq + h) * HD + d] : 0;
@@ -557,7 +560,9 @@ static __device__ __forceinline__ void bpv2_mma(const long *cmax, const int *exp
 				int wv = 0;
 				if (t0 + r < R && t <= base + t0 + r) {
 					long d = Ms[r] - rsh(a4[e], 42 - shs[r]);
-					if (d >= 0 && d < ez) {
+					if (d >= 0 && d < ezs) {
+						wv = et[d];
+					} else if (d >= ezs && d < ez) {
 						wv = expa[d];
 					}
 				}
@@ -638,8 +643,9 @@ static __device__ __forceinline__ void bpv2_mma(const long *cmax, const int *exp
 		__shared__ __align__(16) unsigned char wp[2 * BRV * 48];                                                           \
 		__shared__ long Ms[BRV];                                                                                           \
 		__shared__ int zs[BRV], shs[BRV];                                                                                  \
+		extern __shared__ __align__(16) ushort et[]; /* ETN entries, dynamic: the static arrays fill most of 48 KB */   \
 		bpv2_mma<HD, BRV>(cmax, expa, zp, op, Kp, Vp, Mp, mq, shq, pr->pos, pr->tok, a,                                        \
-		             make_uint3(blockIdx.x, blockIdx.y, blockIdx.z), threadIdx.x, qp, kp, vp, wp, Ms, zs, shs);            \
+		             make_uint3(blockIdx.x, blockIdx.y, blockIdx.z), threadIdx.x, qp, kp, vp, wp, Ms, zs, shs, et);        \
 	}
 BPV2_MMA(int_bpv2_mma64, 64, 64)
 BPV2_MMA(int_bpv2_mma128, 128, 32)
