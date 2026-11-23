@@ -633,8 +633,9 @@ static __device__ __forceinline__ void bpv2_mma(const long *cmax, const int *exp
 }
 
 // arguments: int_bpv's, then the planes (Kp, Vp at the layer), Mp, the query mantissas and shifts
-#define BPV2_MMA(NAME, HD, BRV)                                                                                            \
-	extern "C" __global__ void NAME(const int *S, const long *cmax, const int *Vc, const int *expa, long *zp, long *op,     \
+#define BPV2_MMA(NAME, HD, BRV) BPV2_MMA_LB(NAME, HD, BRV, 3) // 3 blocks an SM: occupancy over registers (faster)
+#define BPV2_MMA_LB(NAME, HD, BRV, MINB)                                                                                   \
+	extern "C" __global__ void __launch_bounds__(256, MINB) NAME(const int *S, const long *cmax, const int *Vc, const int *expa, long *zp, long *op,     \
 	                                const IntParams *pr, BAttnArgs a, const unsigned char *Kp, const unsigned char *Vp,  \
 	                                int Mp, const int *mq, const int *shq) {                                             \
 		__shared__ __align__(16) unsigned char qp[2 * BRV * (HD + 16)];                                                    \
@@ -649,6 +650,11 @@ static __device__ __forceinline__ void bpv2_mma(const long *cmax, const int *exp
 	}
 BPV2_MMA(int_bpv2_mma64, 64, 64)
 BPV2_MMA(int_bpv2_mma128, 128, 32)
+// variants (NOLLAMA_INT_ALIAS): no register cap; 4 blocks an SM
+BPV2_MMA_LB(int_bpv2_mma64_lb1, 64, 64, 1)
+BPV2_MMA_LB(int_bpv2_mma128_lb1, 128, 32, 1)
+BPV2_MMA_LB(int_bpv2_mma64_lb4, 64, 64, 4)
+BPV2_MMA_LB(int_bpv2_mma128_lb4, 128, 32, 4)
 
 // int_gemm on tensor cores, same arguments, grid (64 outputs x 32 rows a threadgroup) and results: per 64-group the
 // activations' two byte planes (x = xh * 2^8 + xl) times the int8 weights, each an exact int32 mma sum, combined as
@@ -1326,9 +1332,9 @@ static __device__ __forceinline__ void cpa16(void *sm, const void *g) {
 static __device__ __forceinline__ void cpa_commit() { asm volatile("cp.async.commit_group;"); }
 template <int N> static __device__ __forceinline__ void cpa_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N)); }
 
-extern "C" __global__ void __launch_bounds__(256, 2) int_gemm_mma3(const signed char *q, const short *s, const short *x,
-                                                                  long *out, const int *ex, int O, int K, int E,
-                                                                  int einSlot, int to, int4 st) {
+template <int NST>
+static __device__ __forceinline__ void gemm3(const signed char *q, const short *s, const short *x, long *out, const int *ex,
+                                             int O, int K, int E, int einSlot, int to, int4 st) {
 	extern __shared__ __align__(16) unsigned char g3[];
 	int xS = st.y, outS = st.z;
 	int o0 = blockIdx.x * 128, t0 = blockIdx.y * 64;
@@ -1350,7 +1356,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) int_gemm_mma3(const signed 
 	const short *sg = s + (long)min(o0 + (tid & 127), O - 1) * ng;
 	auto issue = [&](int g) {
 		if (g < ng) {
-			unsigned char *b = g3 + (g % GEMM3_NST) * GEMM3_STAGE;
+			unsigned char *b = g3 + (g % NST) * GEMM3_STAGE;
 			for (int u = 0; u < 2; u++) {
 				cpa16(b + xo[u], xg[u] + g * 64);
 				cpa16(b + wo[u], wg[u] + g * 64);
@@ -1358,7 +1364,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) int_gemm_mma3(const signed 
 		}
 		cpa_commit();
 	};
-	for (int g = 0; g < GEMM3_NST - 1; g++) {
+	for (int g = 0; g < NST - 1; g++) {
 		issue(g);
 		if (tid < 128 && g < ng) {
 			((short *)(g3 + g * GEMM3_STAGE + 64 * GEMM3_XLD + 128 * GEMM3_WLD))[tid] = sg[g];
@@ -1373,12 +1379,12 @@ extern "C" __global__ void __launch_bounds__(256, 2) int_gemm_mma3(const signed 
 		}
 	}
 	for (int g = 0; g < ng; g++) {
-		int gn = g + GEMM3_NST - 1;
+		int gn = g + NST - 1;
 		issue(gn);
 		short sv = tid < 128 && gn < ng ? sg[gn] : 0; // in flight during the compute below
-		cpa_wait<GEMM3_NST - 1>();
+		cpa_wait<NST - 1>();
 		__syncthreads();
-		const unsigned char *b = g3 + (g % GEMM3_NST) * GEMM3_STAGE;
+		const unsigned char *b = g3 + (g % NST) * GEMM3_STAGE;
 		const unsigned char *X = b, *W = b + 64 * GEMM3_XLD;
 		const short *sc = (const short *)(b + 64 * GEMM3_XLD + 128 * GEMM3_WLD);
 #pragma unroll
@@ -1427,7 +1433,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) int_gemm_mma3(const signed 
 			}
 		}
 		if (tid < 128 && gn < ng) {
-			((short *)(g3 + (gn % GEMM3_NST) * GEMM3_STAGE + 64 * GEMM3_XLD + 128 * GEMM3_WLD))[tid] = sv;
+			((short *)(g3 + (gn % NST) * GEMM3_STAGE + 64 * GEMM3_XLD + 128 * GEMM3_WLD))[tid] = sv;
 		}
 		__syncthreads();
 	}
@@ -1441,4 +1447,15 @@ extern "C" __global__ void __launch_bounds__(256, 2) int_gemm_mma3(const signed 
 			}
 		}
 	}
+}
+extern "C" __global__ void __launch_bounds__(256, 2) int_gemm_mma3(const signed char *q, const short *s, const short *x,
+                                                                  long *out, const int *ex, int O, int K, int E,
+                                                                  int einSlot, int to, int4 st) {
+	gemm3<3>(q, s, x, out, ex, O, K, E, einSlot, to, st);
+}
+// variant (NOLLAMA_INT_ALIAS=int_gemm_mma3=int_gemm_mma3_4): 4 stages
+extern "C" __global__ void __launch_bounds__(256, 2) int_gemm_mma3_4(const signed char *q, const short *s, const short *x,
+                                                                    long *out, const int *ex, int O, int K, int E,
+                                                                    int einSlot, int to, int4 st) {
+	gemm3<4>(q, s, x, out, ex, O, K, E, einSlot, to, st);
 }

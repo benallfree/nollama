@@ -8,6 +8,7 @@ import (
 	_ "embed"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/benallfree/nollama/engine/internal/cuda"
@@ -27,7 +28,9 @@ var cudaIntMMAPTX string
 // With the byte-plane KV cache: scores (maxima only) and weights x V (recomputing scores) on tensor cores.
 // cudaIntDyn: dynamic shared memory per tensor-core kernel (EXPA's nonzero head as ushorts, ETN entries).
 // int_gemm_mma3: GEMM3_SMEM, 3 stages of 64 x 160 + 128 x 80 + 256 bytes.
-var cudaIntDyn = map[string]int{"int_bpv2_mma64": 2 * 11392, "int_bpv2_mma128": 2 * 11392, "int_gemm_mma3": 3 * (64*160 + 128*80 + 256)}
+var cudaIntDyn = map[string]int{"int_bpv2_mma64": 2 * 11392, "int_bpv2_mma128": 2 * 11392, "int_gemm_mma3": 3 * (64*160 + 128*80 + 256),
+	"int_gemm_mma3_4": 4 * (64*160 + 128*80 + 256), "int_bpv2_mma64_lb1": 2 * 11392, "int_bpv2_mma128_lb1": 2 * 11392,
+	"int_bpv2_mma64_lb4": 2 * 11392, "int_bpv2_mma128_lb4": 2 * 11392}
 
 var cudaIntMMA = map[string]string{"int_bscores64": "int_bmax_mma64", "int_bscores128": "int_bmax_mma128",
 	"int_bpv64": "int_bpv2_mma64", "int_bpv128": "int_bpv2_mma128", "int_kvplanes": "int_kvplanes",
@@ -68,7 +71,17 @@ func openIntCUDA(m *IntModel) (intDev, ibuf, error) {
 	if dev.Major >= 8 && os.Getenv("NOLLAMA_INT_NO_MMA") == "" {
 		names := []string{"int_dattn1_64", "int_dattn1_128", "int_dattn2_64", "int_dattn2_128", "int_matvec8",
 			"int_dattn2a_64", "int_dattn2a_128", "int_mv2", "int_mvlog", "int_qkv2", "int_norm2", "int_mlp2", "int_mergea", "int_norm2s", "int_battn64", "int_battn128", "int_gemm_mma2", "int_gemm_mma3"} // used by name
-		for _, n := range cudaIntMMA {
+		alias := map[string]string{}
+		for k, n := range cudaIntMMA {
+			alias[k] = n
+		}
+		// NOLLAMA_INT_ALIAS="int_bpv64=int_bpv2_mma64_lb3,...": run another tensor-core kernel under a name (experiments)
+		for _, kv := range strings.Split(os.Getenv("NOLLAMA_INT_ALIAS"), ",") {
+			if k, n, ok := strings.Cut(kv, "="); ok {
+				alias[k] = n
+			}
+		}
+		for _, n := range alias {
 			names = append(names, n)
 		}
 		if mm, mks, err := dev.Load(cudaIntMMAPTX, names...); err == nil {
@@ -77,12 +90,15 @@ func openIntCUDA(m *IntModel) (intDev, ibuf, error) {
 			}
 			d.mma = mm
 			for n, b := range cudaIntDyn {
+				if mks[n] == nil {
+					continue // a variant not loaded
+				}
 				if err := dev.SetMaxShared(mks[n], b); err != nil {
 					d.close()
 					return nil, nil, err
 				}
 			}
-			for k, n := range cudaIntMMA {
+			for k, n := range alias {
 				ks[k] = mks[n] // the tensor-core kernel runs under the portable one's name
 			}
 		}
