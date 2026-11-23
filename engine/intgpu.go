@@ -356,7 +356,7 @@ func (s *intGPUState) cudaSteps(b stepBufs, qkvArgs, attnArgs []byte, ez, tch in
 		kv, kpo := l*s.kvLayer, l*s.kpl
 		ds = append(ds,
 			mv(&ly.qkv, B(b.mb), false, accQ),
-			blk("int_qkv2", 256, B(accQ), F(ly.b), F(m.ropeC), F(m.ropeS), B(s.params), BO(b.kc, kv), BO(b.vc, kv),
+			blk("int_qkv2", 1024, B(accQ), F(ly.b), F(m.ropeC), F(m.ropeS), B(s.params), BO(b.kc, kv), BO(b.vc, kv),
 				BO(s.kp, kpo), BO(s.vp, kpo), C(s.mp), B(b.mq), B(b.shq), B(b.ex), iarg{Bytes: qkvArgs}, C(ly.qkv.e)),
 			idisp{K: fmt.Sprintf("int_dattn1_%d", hd), Args: []iarg{B(b.mq), B(b.shq), BO(b.kc, kv), B(b.sb), B(b.cmax),
 				B(s.params), iarg{Bytes: attnArgs}, BO(s.kp, kpo), C(s.mp)},

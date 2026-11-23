@@ -424,3 +424,42 @@ func TestIntBatchSteps(t *testing.T) {
 		}
 	}
 }
+
+// TestIntStepNcu runs one step at position INTNCU (INTMODEL; the cache holds zeros, which doesn't change the work)
+// with the CUDA profiler collecting, for ncu --profile-from-start off.
+func TestIntStepNcu(t *testing.T) {
+	at, err := strconv.Atoi(os.Getenv("INTNCU"))
+	if err != nil {
+		t.Skip("set INTNCU=<position>")
+	}
+	size := os.Getenv("INTMODEL")
+	if size == "" {
+		size = "0.5B"
+	}
+	m := loadIntDev(t, size, "auto")
+	cd, ok := m.gpu.dev.(*cudaIntDev)
+	if !ok {
+		t.Skip("CUDA only")
+	}
+	gs, err := m.gpu.newState(m, at+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gs.release()
+	m.gpu.dev.write(gs.params, 0, i32b(m.BOS(), at))
+	for i := range gs.ds {
+		if attnChunked(gs.ds[i].K) {
+			gs.ds[i].Groups.H = uint((at + intACH) / intACH)
+		}
+	}
+	if err := m.gpu.dev.run(gs.ds); err != nil { // warm
+		t.Fatal(err)
+	}
+	cd.dev.Profile(true)
+	err = m.gpu.dev.run(gs.ds)
+	cd.dev.Profile(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("step at %d: %d dispatches, %v", at, len(gs.ds), m.gpu.dev.lastGPU())
+}

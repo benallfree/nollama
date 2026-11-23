@@ -158,16 +158,16 @@ struct QKVArgs {
 };
 
 // int_qkv2: int_qkv from raw sums (x = rshift(acc, -24 - (E + ex[0])) + b), also writing the key and value planes,
-// then zeroing the sums. One threadgroup of 256.
-extern "C" __global__ void int_qkv2(ull *acc, const long *b, const short *rc, const short *rs, const IntParams *pr, int *Kc,
+// then zeroing the sums. One threadgroup (1024: each part one round; a warp per q head).
+extern "C" __global__ void __launch_bounds__(1024) int_qkv2(ull *acc, const long *b, const short *rc, const short *rs, const IntParams *pr, int *Kc,
                                     int *Vc, unsigned char *Kp, unsigned char *Vp, int Mp, int *mq, int *shq, const int *ex,
                                     QKVArgs a, int E) {
-	int tid = threadIdx.x, w = tid / 32, lane = tid % 32;
+	int tid = threadIdx.x, w = tid / 32, lane = tid % 32, NT = blockDim.x, NW = NT / 32;
 	int pos = pr->pos, hh2 = a.hd / 2, n = -24 - (E + ex[0]), hd = a.hd;
 	const short *c = rc + pos * hh2, *sn = rs + pos * hh2;
 	const long LIM = (1L << 22) - 1;
 #define X(i) (rsh((long)acc[i], n) + b[i])
-	for (int i = tid; i < a.nkv * hh2; i += 256) {
+	for (int i = tid; i < a.nkv * hh2; i += NT) {
 		int h = i / hh2, j = i % hh2, base = (a.nq + h) * hd;
 		long x1 = X(base + j), x2 = X(base + j + hh2), cj = c[j], sj = sn[j];
 		long k1 = clamp(rsh(rsh(x1 * cj - x2 * sj, 14), 12), -LIM, LIM), k2 = clamp(rsh(rsh(x2 * cj + x1 * sj, 14), 12), -LIM, LIM);
@@ -180,7 +180,7 @@ extern "C" __global__ void int_qkv2(ull *acc, const long *b, const short *rc, co
 			Kp[pb + j + hh2] = (unsigned char)(pl < 2 ? (k2 >> (8 * pl)) & 255 : k2 >> 16);
 		}
 	}
-	for (int i = tid; i < a.nkv * hd; i += 256) {
+	for (int i = tid; i < a.nkv * hd; i += NT) {
 		int h = i / hd, d = i % hd;
 		long v = clamp(rsh(X((a.nq + a.nkv) * hd + i), 12), -LIM, LIM);
 		Vc[((long)h * a.maxlen + pos) * hd + d] = (int)v;
@@ -188,7 +188,7 @@ extern "C" __global__ void int_qkv2(ull *acc, const long *b, const short *rc, co
 			Vp[(((long)h * 3 + pl) * hd + d) * Mp + pos] = (unsigned char)(pl < 2 ? (v >> (8 * pl)) & 255 : v >> 16);
 		}
 	}
-	for (int h = w; h < a.nq; h += 8) { // warp per q head; lanes over its pairs (hh2 <= 64: 2 per lane)
+	for (int h = w; h < a.nq; h += NW) { // warp per q head; lanes over its pairs (hh2 <= 64: 2 per lane)
 		long qv[2][2], mx = 0;
 		for (int t = 0; t < 2; t++) {
 			int j = lane + 32 * t;
@@ -217,7 +217,7 @@ extern "C" __global__ void int_qkv2(ull *acc, const long *b, const short *rc, co
 	}
 #undef X
 	__syncthreads();
-	for (int i = tid; i < (a.nq + 2 * a.nkv) * hd; i += 256) {
+	for (int i = tid; i < (a.nq + 2 * a.nkv) * hd; i += NT) {
 		acc[i] = 0;
 	}
 }
@@ -225,50 +225,97 @@ extern "C" __global__ void int_qkv2(ull *acc, const long *b, const short *rc, co
 // int_norm2: h += rshift(acc, -24 - (E + ein)) (add; acc zeroed), ein = ex[einSlot] or, when pmax is given, the
 // exponent of the MLP's block-floated p (-16 + its shift; pmax reset); then rmsnorm as int_norm -> m, ex[0]. One
 // threadgroup of 256 (D <= 4096).
+// one-sync block reductions for norm2: each warp's partial to its own slot of a (fresh) array, then every thread
+// reduces the NT / 32 partials itself
+template <int NT> static __device__ __forceinline__ long red_max(long v, long *arr) {
+	for (int o = 16; o > 0; o >>= 1) {
+		v = max(v, shx(v, o));
+	}
+	if (threadIdx.x % 32 == 0) {
+		arr[threadIdx.x / 32] = v;
+	}
+	__syncthreads();
+	long r = arr[0];
+#pragma unroll
+	for (int k = 1; k < NT / 32; k++) {
+		r = max(r, arr[k]);
+	}
+	return r;
+}
+template <int NT> static __device__ __forceinline__ long red_sum(long v, long *arr) {
+	for (int o = 16; o > 0; o >>= 1) {
+		v += shx(v, o);
+	}
+	if (threadIdx.x % 32 == 0) {
+		arr[threadIdx.x / 32] = v;
+	}
+	__syncthreads();
+	long r = 0;
+#pragma unroll
+	for (int k = 0; k < NT / 32; k++) {
+		r += arr[k];
+	}
+	return r;
+}
+
+// each thread's (up to 4) elements stay in registers: h, acc and g are read once, up front
 template <int NT>
 static __device__ __forceinline__ void norm2(long *h, ull *acc, const long *g, short *m, int *ex, int D, int E, int einSlot,
                                              long *pmax, int add) {
-	__shared__ long sm[32];
+	__shared__ long r1[NT / 32], r2[NT / 32], r3[NT / 32];
 	int tid = threadIdx.x;
+	long hv[4], gv[4], av[4];
+	long pm = add && pmax ? *pmax : 0;
+	int es = add && !pmax ? ex[einSlot] : 0;
+#pragma unroll
+	for (int k = 0; k < 4; k++) {
+		int i = tid + NT * k;
+		hv[k] = i < D ? h[i] : 0;
+		gv[k] = i < D ? g[i] : 0;
+		av[k] = add && i < D ? (long)acc[i] : 0;
+	}
 	if (add) {
-		int ein;
-		if (pmax) {
-			ein = max(bitlen64(*pmax) - 15, 0) - 16;
-		} else {
-			ein = ex[einSlot];
-		}
+		int ein = pmax ? max(bitlen64(pm) - 15, 0) - 16 : es;
 		int n = -24 - (E + ein);
-		for (int i = tid; i < D; i += NT) {
-			h[i] += rsh((long)acc[i], n);
-			acc[i] = 0;
-		}
-		__syncthreads();
-		if (pmax && tid == 0) {
-			*pmax = 0;
+#pragma unroll
+		for (int k = 0; k < 4; k++) {
+			int i = tid + NT * k;
+			if (i < D) {
+				hv[k] += rsh(av[k], n);
+				h[i] = hv[k];
+				acc[i] = 0;
+			}
 		}
 	}
 	long mx = 0;
-	for (int i = tid; i < D; i += NT) {
-		mx = max(mx, labs64(h[i]));
+#pragma unroll
+	for (int k = 0; k < 4; k++) {
+		mx = max(mx, labs64(hv[k]));
 	}
-	int sh = max(0, bitlen64(blk_max(mx, sm)) - 20);
+	int sh = max(0, bitlen64(red_max<NT>(mx, r1)) - 20);
+	if (add && pmax && tid == 0) {
+		*pmax = 0; // every thread has read it (before the barrier in red_max)
+	}
 	long ss = 0;
-	for (int i = tid; i < D; i += NT) {
-		long x = rsh(h[i], sh);
+#pragma unroll
+	for (int k = 0; k < 4; k++) {
+		long x = rsh(hv[k], sh);
 		ss += x * x;
 	}
-	long ms = udiv64(blk_sum(ss, sm), D) + udiv64(1L << max(0, 48 - 2 * sh), 1000000);
+	long ms = udiv64(red_sum<NT>(ss, r2), D) + udiv64(1L << max(0, 48 - 2 * sh), 1000000);
 	long r = max(1L, isqrt64(ms));
 	long y[4];
 	long ym = 0;
 	double inv = 1.0 / (double)r;
+#pragma unroll
 	for (int k = 0; k < 4; k++) {
 		int i = tid + NT * k;
-		long a = i < D ? rsh(h[i], sh) * g[i] * 16384 : 0, qa = udivr(labs64(a), r, inv);
+		long a = i < D ? rsh(hv[k], sh) * gv[k] * 16384 : 0, qa = udivr(labs64(a), r, inv);
 		y[k] = a < 0 ? -qa : qa;
 		ym = max(ym, labs64(y[k]));
 	}
-	int sh2 = max(0, bitlen64(blk_max(ym, sm)) - 15);
+	int sh2 = max(0, bitlen64(red_max<NT>(ym, r3)) - 15);
+#pragma unroll
 	for (int k = 0; k < 4; k++) {
 		int i = tid + NT * k;
 		if (i < D) {
