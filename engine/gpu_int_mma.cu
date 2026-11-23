@@ -1038,4 +1038,208 @@ extern "C" __global__ void int_matvec8(const signed char *q, const short *s, con
 	}
 }
 
+
 #include "gpu_int_step.cu"
+
+// ---- batched attention in one kernel, as the reference's k_rattn5: a threadgroup per (8 rows, kv head) covering
+// every query head of the kv head (64 query rows: row r, head g at r * 8 + g; heads past grp are padding); pass 1
+// the row maxima over all keys, pass 2 the scores again, the weights, Z and O; then o = O / Z. Keys and values come
+// straight from the planes as mma fragments. The integers of int_bscores + int_bpv + int_bcomb.
+template <int HD, int KT>
+static __device__ __forceinline__ void battn(const int *mq, const int *shq, long *o, const int *expa, const IntParams *pr,
+                                             const BAttnArgs &a, const unsigned char *Kp, const unsigned char *Vp, int Mp,
+                                             unsigned char *qp, unsigned char *wp, long *Ms, long *pm, int *zs, int *shs) {
+	constexpr int LD = HD + 16, LW = KT + 16, NR = 8, MR = 64;
+	constexpr int SNPW = KT / 8 / 2;  // score n-tiles per warp (4 m-tiles x 2 warps each)
+	constexpr int ONPW = HD / 8 / 2;  // output n-tiles per warp
+	int j = blockIdx.y, t0 = blockIdx.x * NR, grp = a.nq / a.nkv, base = pr->pos, R = pr->tok;
+	int ez = a.ez;
+	int tid = threadIdx.x, w = tid / 32, lane = tid % 32, gid = lane / 4, tig = lane % 4;
+	int mt = w % 4, nh = w / 4;
+	int last = base + min(t0 + NR, R) - 1; // the block's last position
+	for (int i = tid; i < MR * HD; i += 256) {
+		int qr = i / HD, d = i % HD, r = qr / 8, g = qr % 8;
+		int q = g < grp && t0 + r < R ? mq[((long)(t0 + r) * a.nq + j * grp + g) * HD + d] : 0;
+		qp[qr * LD + d] = (unsigned char)(q & 255);
+		qp[MR * LD + qr * LD + d] = (unsigned char)(q >> 8);
+	}
+	if (tid < MR) {
+		int r = tid / 8, g = tid % 8;
+		shs[tid] = g < grp && t0 + r < R ? shq[(t0 + r) * a.nq + j * grp + g] : 0;
+		zs[tid] = 0;
+	}
+	__syncthreads();
+	int rA = mt * 16 + gid, rB = rA + 8; // this thread's query rows
+	const unsigned char *Kb = Kp + (long)j * 3 * Mp * HD;
+	const unsigned char *Vb = Vp + (long)j * 3 * HD * Mp;
+	// scores for the warp's rows x keys k0 + (nh * SNPW + n) * 8 + ..., from the planes
+	auto scores = [&](int k0, long sc[SNPW][4]) {
+		for (int n = 0; n < SNPW; n++) {
+			for (int e = 0; e < 4; e++) {
+				sc[n][e] = 0;
+			}
+		}
+#pragma unroll
+		for (int pa = 0; pa < 2; pa++) {
+#pragma unroll
+			for (int pb = 0; pb < 3; pb++) {
+				int cc[SNPW][4] = {{0}};
+				const unsigned char *A = qp + pa * MR * LD;
+#pragma unroll
+				for (int kd = 0; kd < HD; kd += 32) {
+					uint af[4];
+					af[0] = *(const uint *)(A + rA * LD + kd + tig * 4);
+					af[1] = *(const uint *)(A + rB * LD + kd + tig * 4);
+					af[2] = *(const uint *)(A + rA * LD + kd + 16 + tig * 4);
+					af[3] = *(const uint *)(A + rB * LD + kd + 16 + tig * 4);
+					for (int n = 0; n < SNPW; n++) {
+						const unsigned char *kr = Kb + ((long)pb * Mp + k0 + (nh * SNPW + n) * 8 + gid) * HD + kd + tig * 4;
+						uint bf[2] = {*(const uint *)kr, *(const uint *)(kr + 16)};
+						if (pa == 0 && pb < 2) {
+							mma8<false, false>(cc[n], af, bf);
+						} else if (pa == 0) {
+							mma8<false, true>(cc[n], af, bf);
+						} else if (pb < 2) {
+							mma8<true, false>(cc[n], af, bf);
+						} else {
+							mma8<true, true>(cc[n], af, bf);
+						}
+					}
+				}
+				for (int n = 0; n < SNPW; n++) {
+					for (int e = 0; e < 4; e++) {
+						sc[n][e] += (long)cc[n][e] << (8 * pa + 8 * pb);
+					}
+				}
+			}
+		}
+	};
+	auto valid = [&](int qr, int t) {
+		int r = qr / 8, g = qr % 8;
+		return g < grp && t0 + r < R && t <= base + t0 + r;
+	};
+	// pass 1: row maxima
+	long mx[2] = {LMIN, LMIN};
+	for (int k0 = 0; k0 <= last; k0 += KT) {
+		long sc[SNPW][4];
+		scores(k0, sc);
+		for (int n = 0; n < SNPW; n++) {
+			for (int e = 0; e < 4; e++) {
+				int qr = e < 2 ? rA : rB, t = k0 + (nh * SNPW + n) * 8 + tig * 2 + (e & 1);
+				if (valid(qr, t)) {
+					mx[e >> 1] = max(mx[e >> 1], rsh(sc[n][e], 42 - shs[qr]));
+				}
+			}
+		}
+	}
+	for (int h = 0; h < 2; h++) {
+		mx[h] = max(mx[h], shx(mx[h], 1));
+		mx[h] = max(mx[h], shx(mx[h], 2));
+	}
+	if (tig == 0) {
+		pm[nh * MR + rA] = mx[0];
+		pm[nh * MR + rB] = mx[1];
+	}
+	__syncthreads();
+	if (tid < MR) {
+		Ms[tid] = max(pm[tid], pm[MR + tid]);
+	}
+	__syncthreads();
+	// pass 2: weights and O
+	long acc[ONPW][4];
+	for (int n = 0; n < ONPW; n++) {
+		for (int e = 0; e < 4; e++) {
+			acc[n][e] = 0;
+		}
+	}
+	int zl[2] = {0, 0};
+	for (int k0 = 0; k0 <= last; k0 += KT) {
+		long sc[SNPW][4];
+		scores(k0, sc);
+		int any = 0;
+		for (int n = 0; n < SNPW; n++) {
+			for (int e = 0; e < 4; e++) {
+				int qr = e < 2 ? rA : rB, kk = (nh * SNPW + n) * 8 + tig * 2 + (e & 1), t = k0 + kk;
+				int wv = 0;
+				if (valid(qr, t)) {
+					long d = Ms[qr] - rsh(sc[n][e], 42 - shs[qr]);
+					if (d < ez) {
+						wv = expa[d];
+					}
+				}
+				wp[qr * LW + kk] = (unsigned char)(wv & 255);
+				wp[MR * LW + qr * LW + kk] = (unsigned char)(wv >> 8);
+				zl[e >> 1] += wv;
+				any |= wv;
+			}
+		}
+		if (!__syncthreads_or(any)) {
+			continue; // every weight 0
+		}
+#pragma unroll
+		for (int pa = 0; pa < 2; pa++) {
+			const unsigned char *A = wp + pa * MR * LW;
+#pragma unroll
+			for (int kk = 0; kk < KT; kk += 32) {
+				uint af[4];
+				af[0] = *(const uint *)(A + rA * LW + kk + tig * 4);
+				af[1] = *(const uint *)(A + rB * LW + kk + tig * 4);
+				af[2] = *(const uint *)(A + rA * LW + kk + 16 + tig * 4);
+				af[3] = *(const uint *)(A + rB * LW + kk + 16 + tig * 4);
+#pragma unroll
+				for (int pb = 0; pb < 3; pb++) {
+					for (int n = 0; n < ONPW; n++) {
+						int d = (nh * ONPW + n) * 8 + gid;
+						const unsigned char *vr = Vb + ((long)pb * HD + d) * Mp + k0 + kk + tig * 4;
+						uint bf[2] = {*(const uint *)vr, *(const uint *)(vr + 16)};
+						int cc[4] = {0, 0, 0, 0};
+						if (pb < 2) {
+							mma8<false, false>(cc, af, bf);
+						} else {
+							mma8<false, true>(cc, af, bf);
+						}
+						for (int e = 0; e < 4; e++) {
+							acc[n][e] += (long)cc[e] << (8 * pa + 8 * pb);
+						}
+					}
+				}
+			}
+		}
+		__syncthreads(); // wp is rewritten next tile
+	}
+	for (int h = 0; h < 2; h++) {
+		int z = zl[h];
+		z += __shfl_xor_sync(0xffffffffu, z, 1);
+		z += __shfl_xor_sync(0xffffffffu, z, 2);
+		if (tig == 0) {
+			atomicAdd(&zs[h == 0 ? rA : rB], z);
+		}
+	}
+	__syncthreads();
+	for (int n = 0; n < ONPW; n++) {
+		for (int e = 0; e < 4; e++) {
+			int qr = e < 2 ? rA : rB, r = qr / 8, g = qr % 8, d = (nh * ONPW + n) * 8 + tig * 2 + (e & 1);
+			if (g < grp && t0 + r < R) {
+				long O = acc[n][e], Z = zs[qr];
+				long aO = labs64(O), hi = udiv64(aO, Z);
+				long v = (hi << 12) + udiv64((aO - hi * Z) << 12, Z);
+				o[((long)(t0 + r) * a.nq + j * grp + g) * HD + d] = O < 0 ? -v : v;
+			}
+		}
+	}
+}
+
+// arguments: mq, shq, o, EXPA, params (tok = rows, pos), BAttnArgs, the planes at the layer, Mp. Grid (ceil(R / 8),
+// nkv), 256 threads.
+#define BATTN(NAME, HD, KT)                                                                                                \
+	extern "C" __global__ void __launch_bounds__(256) NAME(const int *mq, const int *shq, long *o, const int *expa,         \
+	                                                      const IntParams *pr, BAttnArgs a, const unsigned char *Kp,        \
+	                                                      const unsigned char *Vp, int Mp) {                                \
+		__shared__ __align__(16) unsigned char qp[2 * 64 * (HD + 16)];                                                     \
+		__shared__ __align__(16) unsigned char wp[2 * 64 * (KT + 16)];                                                     \
+		__shared__ long Ms[64], pm[128];                                                                                   \
+		__shared__ int zs[64], shs[64];                                                                                    \
+		battn<HD, KT>(mq, shq, o, expa, pr, a, Kp, Vp, Mp, qp, wp, Ms, pm, zs, shs);                                       \
+	}
+BATTN(int_battn64, 64, 64)
+BATTN(int_battn128, 128, 64)

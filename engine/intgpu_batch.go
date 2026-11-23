@@ -7,6 +7,9 @@ package engine
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"os"
+	"strconv"
 	"time"
 )
 
@@ -26,6 +29,7 @@ const (
 	attnH           // Groups.H = ceil(rows / attention block) (the fallback attention)
 	scoreG          // int_bscores*: H = ceil(rows / rows per block), D = chunks
 	pvG             // int_bpv*: H = ceil(rows / BRV), D = chunks
+	battnG          // int_battn*: W = ceil(rows / 8)
 	fixedDim        // no change
 )
 
@@ -52,10 +56,19 @@ func (s *intGPUState) newBatch() (*intBatch, error) {
 	// rows per batch: the stored scores (rows x heads x context, int32) stay within intScoreMem
 	P := min(intBatchRows, max(intHeadRows, intScoreMem/(4*nq*s.maxlen))/intHeadRows*intHeadRows)
 	scoreN := 4 * P * nq * s.maxlen
-	if s.kp != nil { // the tensor-core attention recomputes scores instead of storing them
-		P, scoreN = intBatchRows, 16
-	}
 	nchmax := (s.maxlen + intKC - 1) / intKC
+	partN := P * nq * nchmax
+	oneKernel := s.kp != nil && os.Getenv("NOLLAMA_INT_BATTN") != "" // experiment: int_battn* (slower so far)
+	if s.kp != nil {
+		P, scoreN = intBatchRows, 16 // tensor-core attention recomputes scores instead of storing them
+		if v, err := strconv.Atoi(os.Getenv("NOLLAMA_INT_BATCH")); err == nil && v >= intHeadRows {
+			P = v / intHeadRows * intHeadRows
+		}
+		partN = P * nq * nchmax
+		if oneKernel {
+			partN = 2
+		}
+	}
 	qkvN := (nq + 2*nkv) * hd
 	accN := max(qkvN, D, 2*I)
 	mN := max(D, I, nq*hd)
@@ -75,7 +88,7 @@ func (s *intGPUState) newBatch() (*intBatch, error) {
 	}{{&b.params, 8}, {&b.toks, 4 * P}, {&b.tgt, 4 * P}, {&b.cnt, 8 * 3 * P}, {&h, 8 * P * D}, {&mb, 2 * P * mN},
 		{&ex, 16 * P}, {&acc, 8 * P * accN}, {&mq, 4 * P * nq * hd}, {&shq, 4 * P * nq}, {&o, 8 * P * nq * hd},
 		{&p, 8 * P * I}, {&lg, 8 * intHeadRows * V}, {&b.ovf, 4}, {&sc, scoreN},
-		{&cmax, 8 * P * nq * nchmax}, {&zp, 8 * P * nq * nchmax}, {&op, 8 * P * nq * nchmax * hd}} {
+		{&cmax, 8 * partN}, {&zp, 8 * partN}, {&op, 8 * partN * hd}} {
 		if *x.dst, err = s.newBuffer(x.n); err != nil {
 			return nil, err
 		}
@@ -132,6 +145,23 @@ func (s *intGPUState) newBatch() (*intBatch, error) {
 		gemm(&ly.qkv, 0, -24, acc, accN)
 		perRow("int_qkv", intTG, B(acc), F(ly.b), F(m.ropeC), F(m.ropeS), B(b.params), BO(s.kc, kv), BO(s.vc, kv),
 			B(mq), B(shq), B(ex), iarg{Bytes: qkvArgs}, C(ly.qkv.e), C(0), C(accN))
+		if oneKernel { // the plane cache and the one-kernel tensor-core attention (gpu_int_mma.cu)
+			add(rowsW, s.kvplanes(l, b.params, P))
+			add(battnG, idisp{K: fmt.Sprintf("int_battn%d", hd), Args: []iarg{B(mq), B(shq), B(o), F(rawA), B(b.params),
+				iarg{Bytes: battnArgs}, BO(s.kp, l*s.kpl), BO(s.vp, l*s.kpl), C(s.mp)},
+				Groups: isize{W: uint((P + 7) / 8), H: uint(nkv), D: 1}, Threads: isize{W: 256, H: 1, D: 1}})
+			perRow("int_blockf", intTG, B(o), B(mb), B(ex), C(nq*hd), C(-24), C(1), C(nq*hd, mN))
+			gemm(&ly.o, 1, -24, acc, accN)
+			norm(1, ly.o.e, 1, ly.g2)
+			gemm(&ly.gu, 0, -16, acc, accN)
+			add(rowsH, idisp{K: "int_mlp", Args: []iarg{B(acc), F(rawS), B(p), B(ex), C(I), C(ly.gu.e),
+				C(0), C(accN, I)}, Groups: isize{W: uint((I + 255) / 256), H: uint(P), D: 1},
+				Threads: isize{W: 256, H: 1, D: 1}})
+			perRow("int_blockf", intTG, B(p), B(mb), B(ex), C(I), C(-16), C(2), C(I, mN))
+			gemm(&ly.d, 2, -24, acc, accN)
+			norm(1, ly.d.e, 2, next)
+			continue
+		}
 		var planeArgs []iarg // the plane cache, for the tensor-core attention
 		if s.kp != nil {
 			add(rowsW, s.kvplanes(l, b.params, P))
@@ -272,6 +302,8 @@ func (s *intGPUState) runBatch(list []idisp, kind []int, R int, nch uint, ds []i
 			ds[i].Groups.H, ds[i].Groups.D = uint((R+b.scoreBR-1)/b.scoreBR), nch
 		case pvG:
 			ds[i].Groups.H, ds[i].Groups.D = uint((R+b.pvBR-1)/b.pvBR), nch
+		case battnG:
+			ds[i].Groups.W = uint((R + 7) / 8)
 		}
 	}
 	for hb := 0; hb*intHeadRows < R; hb++ {

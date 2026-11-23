@@ -286,7 +286,11 @@ func TestIntBatchBJJ(t *testing.T) {
 
 // TestIntBatchBJJProfile: after BJJ's batches, one batch at position 23000 (real keys and values), kernel by kernel.
 func TestIntBatchBJJProfile(t *testing.T) {
-	m := loadIntDev(t, "0.5B", "auto")
+	size := os.Getenv("INTMODEL")
+	if size == "" {
+		size = "0.5B"
+	}
+	m := loadIntDev(t, size, "auto")
 	ids := vecIDs(t, "bjj.ids.json")
 	toks := append([]int{m.BOS()}, ids[:len(ids)-1]...)
 	a, err := m.NewSession(len(ids))
@@ -326,7 +330,15 @@ func TestIntBatchBJJProfile(t *testing.T) {
 		return float64(gs.g.dev.lastGPU().Microseconds()) / 1000
 	}
 	line := ""
-	for _, k := range []string{"int_gemm", "int_bscores64", "int_bpv64", "int_bcomb", "int_counts", "int_norm", "int_qkv"} {
+	var names []string
+	seen := map[string]bool{}
+	for _, d := range ds {
+		if !seen[d.K] {
+			seen[d.K] = true
+			names = append(names, d.K)
+		}
+	}
+	for _, k := range names {
 		var sub []idisp
 		for _, d := range ds {
 			if d.K == k {
