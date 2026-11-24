@@ -27,7 +27,7 @@ import (
 	"time"
 
 	"github.com/benallfree/nollama/engine"
-	"github.com/benallfree/nollama/engine/internal/benchhooks"
+	"github.com/benallfree/nollama/internal/benchhooks"
 )
 
 var ollamaURL = "http://127.0.0.1:11434"

@@ -129,12 +129,12 @@ Or call the engine directly, with no HTTP at all:
 ```go
 import (
 	"github.com/benallfree/nollama/engine"
-	"github.com/benallfree/nollama/models"
-	"github.com/benallfree/nollama/schema"
+	"github.com/benallfree/nollama/catalog"
+	"github.com/benallfree/nollama/engine/schema"
 )
 
-src, _ := models.Resolve("qwen3-1.7b", models.DefaultDir())
-_ = models.Fetch(src, nil, nil) // downloads once, checks the SHA-256
+src, _ := catalog.Resolve("qwen3-1.7b", catalog.DefaultDir())
+_ = catalog.Fetch(src, nil, nil) // downloads once, checks the SHA-256
 m, _ := engine.Load(src.Path, engine.LoadOptions{}) // a downloaded file, or a model built into the binary
 defer m.Close()
 
@@ -357,10 +357,10 @@ nollama bundle -check myapp                         # list what's inside and che
 ```
 
 The copy finds its models by name: `mytool run qwen3-0.6b`, `/api/tags` and `/v1/models` list them, and in your own
-program `models.Resolve("tagger", dir)` returns them before any download. Each model sits on a 64 KiB boundary and is
+program `catalog.Resolve("tagger", dir)` returns them before any download. Each model sits on a 64 KiB boundary and is
 mmapped straight from the executable, so it loads as fast as a separate file (tens of milliseconds). Catalog models are
 checked against their SHA-256 as they're copied in, and the bundle records every model's SHA-256 for `-check` and
-`models.Verify`. On macOS the result runs with the linker's ad-hoc signature, but `codesign` can't sign a file with
+`catalog.Verify`. On macOS the result runs with the linker's ad-hoc signature, but `codesign` can't sign a file with
 data after its end: bundle before shipping only if you don't need a Developer ID signature, and use `go:embed` (below)
 if you do. On Windows, sign after bundling; nollama still finds the models. macOS checks a new executable the
 first time it runs, which takes a few seconds for one this size; after that it starts at once.
@@ -371,14 +371,14 @@ first time it runs, which takes a few seconds for one this size; after that it s
 //go:embed qwen3-0.6b.gguf
 var qwen []byte
 
-func init() { models.Embed("qwen3-0.6b", qwen) }
+func init() { catalog.Embed("qwen3-0.6b", qwen) }
 
-src, _ := models.Resolve("qwen3-0.6b", models.DefaultDir()) // the embedded one, no download
+src, _ := catalog.Resolve("qwen3-0.6b", catalog.DefaultDir()) // the embedded one, no download
 m, _ := engine.Load(src.Path, engine.LoadOptions{})          // src.Path is "embedded:qwen3-0.6b"
 ```
 
 The operating system pages embedded data in from the executable as it's read, so there's no copy and no startup cost.
-Either way, a model inside the program resolves like any other: `models.Resolve` returns it with a path of
+Either way, a model inside the program resolves like any other: `catalog.Resolve` returns it with a path of
 `bundled:<name>` or `embedded:<name>`, and `engine.Load(src.Path, …)` opens it, so code written for downloaded models
 needs no change, and models not built in still download as usual. `engine.LoadBytes` takes any GGUF already in
 memory, and `engine.LoadRange` one at an offset inside any file.

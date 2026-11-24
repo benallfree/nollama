@@ -1,4 +1,4 @@
-package models
+package catalog
 
 import (
 	"bytes"
@@ -325,7 +325,7 @@ func BundleError() error {
 //	//go:embed qwen3-0.6b.gguf
 //	var qwen []byte
 //
-//	models.Embed("qwen3-0.6b", qwen)
+//	catalog.Embed("qwen3-0.6b", qwen)
 //
 // Resolve then finds it before any download, and engine.Load(src.Path) reads it in place. A catalog name gets the
 // catalog's SHA-256 (models.Verify checks it). data must not change afterward.

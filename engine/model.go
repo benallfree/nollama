@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/benallfree/nollama/models"
+	"github.com/benallfree/nollama/catalog"
 )
 
 // LoadOptions configures Load.
@@ -181,13 +181,13 @@ var fileTypeNames = map[int]string{
 	17: "Q5_K_M", 18: "Q6_K", 32: "BF16",
 }
 
-// Load opens a GGUF model file, or a model inside the program by the Path models.Resolve gave it
+// Load opens a GGUF model file, or a model inside the program by the Path catalog.Resolve gave it
 // ("bundled:<name>" for one bundled at the end of the executable, "embedded:<name>" for one registered with
-// models.Embed). So engine.Load(src.Path) opens any model models.Resolve finds.
+// catalog.Embed). So engine.Load(src.Path) opens any model catalog.Resolve finds.
 func Load(path string, opts LoadOptions) (*Model, error) {
-	if src, ok := models.Builtin(path); ok {
+	if src, ok := catalog.Builtin(path); ok {
 		return loadBuiltin(src, opts)
-	} else if strings.HasPrefix(path, models.BundledPrefix) || strings.HasPrefix(path, models.EmbeddedPrefix) {
+	} else if strings.HasPrefix(path, catalog.BundledPrefix) || strings.HasPrefix(path, catalog.EmbeddedPrefix) {
 		return nil, fmt.Errorf("no model %s inside this program", path)
 	}
 	g, err := openGGUF(path)
@@ -201,7 +201,7 @@ func Load(path string, opts LoadOptions) (*Model, error) {
 }
 
 // LoadRange opens the GGUF that takes up size bytes of the file at path starting at offset, such as a model
-// bundled at the end of an executable (see models.Bundle). It is mmapped like a file of its own, so it loads as
+// bundled at the end of an executable (see catalog.Bundle). It is mmapped like a file of its own, so it loads as
 // fast. size 0 means to the end of the file.
 func LoadRange(path string, offset, size int64, opts LoadOptions) (*Model, error) {
 	g, err := openGGUFRange(path, offset, size)
@@ -230,7 +230,7 @@ func LoadBytes(data []byte, opts LoadOptions) (*Model, error) {
 }
 
 // loadBuiltin opens a model inside the program: bundled (a range of the executable) or embedded (bytes).
-func loadBuiltin(src models.Source, opts LoadOptions) (*Model, error) {
+func loadBuiltin(src catalog.Source, opts LoadOptions) (*Model, error) {
 	if opts.ID == "" {
 		// the same name a downloaded copy has, so a conversation saved with one reads back with the other
 		opts.ID = fmt.Sprintf("%s.gguf:%d", src.Name, src.Size)

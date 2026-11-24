@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/benallfree/nollama/engine"
-	"github.com/benallfree/nollama/schema"
+	"github.com/benallfree/nollama/engine/schema"
 )
 
 // Tool calling, the same in both APIs: the tools go into the prompt, and the answer is held to calls that name a listed

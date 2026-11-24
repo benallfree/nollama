@@ -1,7 +1,7 @@
 #!/bin/sh
 # Run `bench vps` on a fresh Vultr instance and destroy it afterwards.
 #
-#   VULTR_API_KEY=...  VULTR_BENCH_APPROVED=vc2-1c-1gb,vhp-2c-4gb-amd  scripts/vultr-bench/vultr.sh all vc2-1c-1gb [region] [--ollama]
+#   VULTR_API_KEY=...  VULTR_BENCH_APPROVED=vc2-1c-1gb,vhp-2c-4gb-amd  tools/bench/vultr/vultr.sh all vc2-1c-1gb [region] [--ollama]
 #
 # Steps, each one blocking call that ends in seconds (except `all`, meant to run detached with its output in a log):
 #   create PLAN [REGION] [--ollama]  boot an instance (cloud-init downloads the models) -> prints the run dir
@@ -24,7 +24,7 @@
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-REPO=$(cd "$HERE/../.." && pwd)
+REPO=$(cd "$HERE/../../.." && pwd)
 BASE=${NOLLAMA_BENCH_DIR:-$HOME/.cache/nollama-vultr-bench}
 OS_ID=${VULTR_OS_ID:-2284} # Ubuntu 24.04 LTS x64
 say() { echo "$(date +%T) $*"; }
@@ -112,7 +112,7 @@ cmd_wait() {
 cmd_push() {
 	run=$1
 	say "building bench for linux/amd64"
-	(cd "$REPO" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "$run/bench" ./engine/cmd/bench)
+	(cd "$REPO" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "$run/bench" ./tools/bench)
 	say "copying bench ($(du -m "$run/bench" | cut -f1) MB)"
 	timeout 120 scp $SSHOPTS -i "$run/key" "$run/bench" "root@$(cat "$run/ip"):/root/bench/bench"
 	say "pushed"

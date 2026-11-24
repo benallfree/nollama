@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/benallfree/nollama/engine"
-	"github.com/benallfree/nollama/schema"
+	"github.com/benallfree/nollama/engine/schema"
 )
 
 // GGUF=<file> go test -run XXX -bench Classify ./engine

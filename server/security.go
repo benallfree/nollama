@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/benallfree/nollama/models"
+	"github.com/benallfree/nollama/catalog"
 )
 
 // What the server lets clients do, set in Config. The zero Config is the CLI server's behavior: no API key, model
@@ -181,20 +181,20 @@ func (c *clientCounts) leave(client string) {
 
 // resolve turns the model a request names into a source, applying the server's settings: the allowlist, and paths
 // only inside the models folder unless AllowPaths is set. Every handler that takes a model name goes through it.
-func (s *Server) resolve(name string) (models.Source, error) {
+func (s *Server) resolve(name string) (catalog.Source, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
-		return models.Source{}, badRequest{errors.New("model is required")}
+		return catalog.Source{}, badRequest{errors.New("model is required")}
 	}
 	if !s.modelAllowed(name) {
-		return models.Source{}, errForbidden{fmt.Errorf("model %q isn't one this server serves", name)}
+		return catalog.Source{}, errForbidden{fmt.Errorf("model %q isn't one this server serves", name)}
 	}
-	src, err := models.Resolve(name, s.cfg.ModelsDir)
+	src, err := catalog.Resolve(name, s.cfg.ModelsDir)
 	if err != nil {
 		return src, badRequest{err}
 	}
-	if models.IsPath(models.Normalize(name)) && !s.cfg.AllowPaths && !within(s.cfg.ModelsDir, src.Path) {
-		return models.Source{}, errForbidden{fmt.Errorf("model %q: this server doesn't load files by path; put the .gguf in its models folder and use its name", name)}
+	if catalog.IsPath(catalog.Normalize(name)) && !s.cfg.AllowPaths && !within(s.cfg.ModelsDir, src.Path) {
+		return catalog.Source{}, errForbidden{fmt.Errorf("model %q: this server doesn't load files by path; put the .gguf in its models folder and use its name", name)}
 	}
 	return src, nil
 }
@@ -205,9 +205,9 @@ func (s *Server) modelAllowed(name string) bool {
 	if len(s.cfg.Models) == 0 {
 		return true
 	}
-	n := models.Normalize(name)
+	n := catalog.Normalize(name)
 	for _, m := range s.cfg.Models {
-		if models.Normalize(m) == n {
+		if catalog.Normalize(m) == n {
 			return true
 		}
 	}

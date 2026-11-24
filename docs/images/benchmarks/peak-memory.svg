@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 598" width="900" height="598" role="img" aria-label="Peak memory: nollama and Ollama">
+<style>
+.bg{fill:#fcfcfb}.t1{fill:#0b0b0b}.t2{fill:#52514e}.grid{stroke:#e1e0d9}.axis{stroke:#c3c2b7}
+.n{fill:#2a78d6}.o{fill:#eb6834}.tie{fill:#8a8984}.link{stroke:#c3c2b7}.band{fill:#f0efec}.ring{stroke:#fcfcfb}
+@media (prefers-color-scheme: dark){.bg{fill:#1a1a19}.t1{fill:#f0efec}.t2{fill:#c3c2b7}.grid{stroke:#2c2c2a}
+.axis{stroke:#383835}.n{fill:#3987e5}.o{fill:#d95926}.tie{fill:#8a8984}.link{stroke:#55544f}.band{fill:#2c2c2a}.ring{stroke:#1a1a19}}
+text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+</style>
+<rect class="bg" width="900" height="598" rx="8"/>
+<text x="20.0" y="30.0" class="t1" text-anchor="start" font-size="17" font-weight="600">Peak memory</text>
+<text x="20.0" y="52.0" class="t2" text-anchor="start" font-size="12">Highest resident memory of the process holding the model, including the memory-mapped file. Lower is better. Log scale.</text>
+<circle cx="20.0" cy="72.0" r="5" class="n"/><text x="30.0" y="76.0" class="t1" text-anchor="start" font-size="12">nollama</text>
+<circle cx="100.0" cy="72.0" r="5" class="o"/><text x="110.0" y="76.0" class="t1" text-anchor="start" font-size="12">Ollama</text>
+<line class="grid" x1="250.0" x2="250.0" y1="86.0" y2="566.0" stroke-width="1"/>
+<text x="250.0" y="582.0" class="t2" text-anchor="middle" font-size="11">500</text>
+<line class="grid" x1="433.6" x2="433.6" y1="86.0" y2="566.0" stroke-width="1"/>
+<text x="433.6" y="582.0" class="t2" text-anchor="middle" font-size="11">1000</text>
+<line class="grid" x1="617.3" x2="617.3" y1="86.0" y2="566.0" stroke-width="1"/>
+<text x="617.3" y="582.0" class="t2" text-anchor="middle" font-size="11">2000</text>
+<line class="grid" x1="860.0" x2="860.0" y1="86.0" y2="566.0" stroke-width="1"/>
+<text x="860.0" y="582.0" class="t2" text-anchor="middle" font-size="11">5000</text>
+<text x="20.0" y="106.0" class="t1" text-anchor="start" font-size="12" font-weight="600">vc2-1c-1gb (1 vCPU, Broadwell)</text>
+<text x="236.0" y="123.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q4_K_M</text>
+<line class="link" x1="354.9" x2="354.6" y1="119.0" y2="119.0" stroke-width="2"/>
+<text x="345.6" y="123.0" class="t2" text-anchor="end" font-size="10">742 MB</text>
+<text x="363.9" y="123.0" class="t2" text-anchor="start" font-size="10">743 MB</text>
+<circle class="o ring" cx="354.6" cy="119.0" r="5" stroke-width="1.5"><title>Ollama: 742 MB</title></circle>
+<circle class="n ring" cx="354.9" cy="119.0" r="5" stroke-width="1.5"><title>nollama: 743 MB</title></circle>
+<text x="20.0" y="144.0" class="t1" text-anchor="start" font-size="12" font-weight="600">vc2-2c-4gb (2 vCPU, Skylake)</text>
+<text x="236.0" y="161.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q4_K_M</text>
+<line class="link" x1="518.4" x2="732.7" y1="157.0" y2="157.0" stroke-width="2"/>
+<text x="509.4" y="161.0" class="t2" text-anchor="end" font-size="10">1377 MB</text>
+<text x="741.7" y="161.0" class="t2" text-anchor="start" font-size="10">3092 MB</text>
+<circle class="o ring" cx="732.7" cy="157.0" r="5" stroke-width="1.5"><title>Ollama: 3092 MB</title></circle>
+<circle class="n ring" cx="518.4" cy="157.0" r="5" stroke-width="1.5"><title>nollama: 1377 MB</title></circle>
+<text x="236.0" y="183.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q8_0</text>
+<line class="link" x1="538.2" x2="721.9" y1="179.0" y2="179.0" stroke-width="2"/>
+<text x="529.2" y="183.0" class="t2" text-anchor="end" font-size="10">1484 MB</text>
+<text x="730.9" y="183.0" class="t2" text-anchor="start" font-size="10">2969 MB</text>
+<circle class="o ring" cx="721.9" cy="179.0" r="5" stroke-width="1.5"><title>Ollama: 2969 MB</title></circle>
+<circle class="n ring" cx="538.2" cy="179.0" r="5" stroke-width="1.5"><title>nollama: 1484 MB</title></circle>
+<text x="236.0" y="205.0" class="t2" text-anchor="end" font-size="12">qwen3-1.7b Q4_K_M</text>
+<line class="link" x1="640.5" x2="661.1" y1="201.0" y2="201.0" stroke-width="2"/>
+<text x="631.5" y="205.0" class="t2" text-anchor="end" font-size="10">2183 MB</text>
+<text x="670.1" y="205.0" class="t2" text-anchor="start" font-size="10">2360 MB</text>
+<circle class="o ring" cx="661.1" cy="201.0" r="5" stroke-width="1.5"><title>Ollama: 2360 MB</title></circle>
+<circle class="n ring" cx="640.5" cy="201.0" r="5" stroke-width="1.5"><title>nollama: 2183 MB</title></circle>
+<text x="236.0" y="227.0" class="t2" text-anchor="end" font-size="12">qwen3-1.7b Q8_0</text>
+<line class="link" x1="701.3" x2="679.3" y1="223.0" y2="223.0" stroke-width="2"/>
+<text x="670.3" y="227.0" class="t2" text-anchor="end" font-size="10">2528 MB</text>
+<text x="710.3" y="227.0" class="t2" text-anchor="start" font-size="10">2747 MB</text>
+<circle class="o ring" cx="679.3" cy="223.0" r="5" stroke-width="1.5"><title>Ollama: 2528 MB</title></circle>
+<circle class="n ring" cx="701.3" cy="223.0" r="5" stroke-width="1.5"><title>nollama: 2747 MB</title></circle>
+<text x="236.0" y="249.0" class="t2" text-anchor="end" font-size="12">qwen3-4b Q4_K_M</text>
+<line class="link" x1="774.0" x2="756.2" y1="245.0" y2="245.0" stroke-width="2"/>
+<text x="747.2" y="249.0" class="t2" text-anchor="end" font-size="10">3379 MB</text>
+<text x="783.0" y="249.0" class="t2" text-anchor="start" font-size="10">3614 MB</text>
+<circle class="o ring" cx="756.2" cy="245.0" r="5" stroke-width="1.5"><title>Ollama: 3379 MB</title></circle>
+<circle class="n ring" cx="774.0" cy="245.0" r="5" stroke-width="1.5"><title>nollama: 3614 MB</title></circle>
+<text x="20.0" y="270.0" class="t1" text-anchor="start" font-size="12" font-weight="600">vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome)</text>
+<text x="236.0" y="287.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q4_K_M</text>
+<line class="link" x1="505.2" x2="493.6" y1="283.0" y2="283.0" stroke-width="2"/>
+<text x="484.6" y="287.0" class="t2" text-anchor="end" font-size="10">1254 MB</text>
+<text x="514.2" y="287.0" class="t2" text-anchor="start" font-size="10">1310 MB</text>
+<circle class="o ring" cx="493.6" cy="283.0" r="5" stroke-width="1.5"><title>Ollama: 1254 MB</title></circle>
+<circle class="n ring" cx="505.2" cy="283.0" r="5" stroke-width="1.5"><title>nollama: 1310 MB</title></circle>
+<text x="236.0" y="309.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q8_0</text>
+<line class="link" x1="517.8" x2="515.7" y1="305.0" y2="305.0" stroke-width="2"/>
+<text x="506.7" y="309.0" class="t2" text-anchor="end" font-size="10">1363 MB</text>
+<text x="526.8" y="309.0" class="t2" text-anchor="start" font-size="10">1374 MB</text>
+<circle class="o ring" cx="515.7" cy="305.0" r="5" stroke-width="1.5"><title>Ollama: 1363 MB</title></circle>
+<circle class="n ring" cx="517.8" cy="305.0" r="5" stroke-width="1.5"><title>nollama: 1374 MB</title></circle>
+<text x="236.0" y="331.0" class="t2" text-anchor="end" font-size="12">qwen3-1.7b Q4_K_M</text>
+<line class="link" x1="611.1" x2="627.4" y1="327.0" y2="327.0" stroke-width="2"/>
+<text x="602.1" y="331.0" class="t2" text-anchor="end" font-size="10">1954 MB</text>
+<text x="636.4" y="331.0" class="t2" text-anchor="start" font-size="10">2078 MB</text>
+<circle class="o ring" cx="627.4" cy="327.0" r="5" stroke-width="1.5"><title>Ollama: 2078 MB</title></circle>
+<circle class="n ring" cx="611.1" cy="327.0" r="5" stroke-width="1.5"><title>nollama: 1954 MB</title></circle>
+<text x="20.0" y="352.0" class="t1" text-anchor="start" font-size="12" font-weight="600">vhp-2c-4gb-intel (2 vCPU, Cascadelake)</text>
+<text x="236.0" y="369.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q4_K_M</text>
+<line class="link" x1="514.3" x2="493.6" y1="365.0" y2="365.0" stroke-width="2"/>
+<text x="484.6" y="369.0" class="t2" text-anchor="end" font-size="10">1254 MB</text>
+<text x="523.3" y="369.0" class="t2" text-anchor="start" font-size="10">1356 MB</text>
+<circle class="o ring" cx="493.6" cy="365.0" r="5" stroke-width="1.5"><title>Ollama: 1254 MB</title></circle>
+<circle class="n ring" cx="514.3" cy="365.0" r="5" stroke-width="1.5"><title>nollama: 1356 MB</title></circle>
+<text x="236.0" y="391.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q8_0</text>
+<line class="link" x1="537.7" x2="515.7" y1="387.0" y2="387.0" stroke-width="2"/>
+<text x="506.7" y="391.0" class="t2" text-anchor="end" font-size="10">1363 MB</text>
+<text x="546.7" y="391.0" class="t2" text-anchor="start" font-size="10">1481 MB</text>
+<circle class="o ring" cx="515.7" cy="387.0" r="5" stroke-width="1.5"><title>Ollama: 1363 MB</title></circle>
+<circle class="n ring" cx="537.7" cy="387.0" r="5" stroke-width="1.5"><title>nollama: 1481 MB</title></circle>
+<text x="236.0" y="413.0" class="t2" text-anchor="end" font-size="12">qwen3-1.7b Q4_K_M</text>
+<line class="link" x1="639.2" x2="627.4" y1="409.0" y2="409.0" stroke-width="2"/>
+<text x="618.4" y="413.0" class="t2" text-anchor="end" font-size="10">2078 MB</text>
+<text x="648.2" y="413.0" class="t2" text-anchor="start" font-size="10">2173 MB</text>
+<circle class="o ring" cx="627.4" cy="409.0" r="5" stroke-width="1.5"><title>Ollama: 2078 MB</title></circle>
+<circle class="n ring" cx="639.2" cy="409.0" r="5" stroke-width="1.5"><title>nollama: 2173 MB</title></circle>
+<text x="236.0" y="435.0" class="t2" text-anchor="end" font-size="12">qwen3-1.7b Q8_0</text>
+<line class="link" x1="697.4" x2="679.3" y1="431.0" y2="431.0" stroke-width="2"/>
+<text x="670.3" y="435.0" class="t2" text-anchor="end" font-size="10">2528 MB</text>
+<text x="706.4" y="435.0" class="t2" text-anchor="start" font-size="10">2707 MB</text>
+<circle class="o ring" cx="679.3" cy="431.0" r="5" stroke-width="1.5"><title>Ollama: 2528 MB</title></circle>
+<circle class="n ring" cx="697.4" cy="431.0" r="5" stroke-width="1.5"><title>nollama: 2707 MB</title></circle>
+<text x="236.0" y="457.0" class="t2" text-anchor="end" font-size="12">qwen3-4b Q4_K_M</text>
+<line class="link" x1="772.9" x2="756.2" y1="453.0" y2="453.0" stroke-width="2"/>
+<text x="747.2" y="457.0" class="t2" text-anchor="end" font-size="10">3379 MB</text>
+<text x="781.9" y="457.0" class="t2" text-anchor="start" font-size="10">3599 MB</text>
+<circle class="o ring" cx="756.2" cy="453.0" r="5" stroke-width="1.5"><title>Ollama: 3379 MB</title></circle>
+<circle class="n ring" cx="772.9" cy="453.0" r="5" stroke-width="1.5"><title>nollama: 3599 MB</title></circle>
+<text x="20.0" y="478.0" class="t1" text-anchor="start" font-size="12" font-weight="600">vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome)</text>
+<text x="236.0" y="495.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q4_K_M</text>
+<line class="link" x1="503.7" x2="493.8" y1="491.0" y2="491.0" stroke-width="2"/>
+<text x="484.8" y="495.0" class="t2" text-anchor="end" font-size="10">1255 MB</text>
+<text x="512.7" y="495.0" class="t2" text-anchor="start" font-size="10">1303 MB</text>
+<circle class="o ring" cx="493.8" cy="491.0" r="5" stroke-width="1.5"><title>Ollama: 1255 MB</title></circle>
+<circle class="n ring" cx="503.7" cy="491.0" r="5" stroke-width="1.5"><title>nollama: 1303 MB</title></circle>
+<text x="236.0" y="517.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q8_0</text>
+<line class="link" x1="522.8" x2="515.7" y1="513.0" y2="513.0" stroke-width="2"/>
+<text x="506.7" y="517.0" class="t2" text-anchor="end" font-size="10">1363 MB</text>
+<text x="531.8" y="517.0" class="t2" text-anchor="start" font-size="10">1400 MB</text>
+<circle class="o ring" cx="515.7" cy="513.0" r="5" stroke-width="1.5"><title>Ollama: 1363 MB</title></circle>
+<circle class="n ring" cx="522.8" cy="513.0" r="5" stroke-width="1.5"><title>nollama: 1400 MB</title></circle>
+<text x="236.0" y="539.0" class="t2" text-anchor="end" font-size="12">qwen3-1.7b Q4_K_M</text>
+<line class="link" x1="623.9" x2="627.5" y1="535.0" y2="535.0" stroke-width="2"/>
+<text x="614.9" y="539.0" class="t2" text-anchor="end" font-size="10">2051 MB</text>
+<text x="636.5" y="539.0" class="t2" text-anchor="start" font-size="10">2079 MB</text>
+<circle class="o ring" cx="627.5" cy="535.0" r="5" stroke-width="1.5"><title>Ollama: 2079 MB</title></circle>
+<circle class="n ring" cx="623.9" cy="535.0" r="5" stroke-width="1.5"><title>nollama: 2051 MB</title></circle>
+<text x="236.0" y="561.0" class="t2" text-anchor="end" font-size="12">qwen3-1.7b Q8_0</text>
+<line class="link" x1="683.2" x2="679.3" y1="557.0" y2="557.0" stroke-width="2"/>
+<text x="670.3" y="561.0" class="t2" text-anchor="end" font-size="10">2528 MB</text>
+<text x="692.2" y="561.0" class="t2" text-anchor="start" font-size="10">2565 MB</text>
+<circle class="o ring" cx="679.3" cy="557.0" r="5" stroke-width="1.5"><title>Ollama: 2528 MB</title></circle>
+<circle class="n ring" cx="683.2" cy="557.0" r="5" stroke-width="1.5"><title>nollama: 2565 MB</title></circle>
+</svg>

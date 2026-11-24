@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/benallfree/nollama/audio"
+	"github.com/benallfree/nollama/x/audio"
 )
 
 // Whisper is a loaded OpenAI Whisper speech-recognition model (an encoder-decoder transformer over a log-mel

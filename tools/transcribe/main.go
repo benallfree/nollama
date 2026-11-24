@@ -1,6 +1,8 @@
+//go:build !windows
+
 // Command transcribe turns WAV files into text with a Whisper model in whisper.cpp's ggml format (experimental).
 //
-//	go run ./engine/cmd/transcribe -m ggml-tiny.bin clip.wav...
+//	go run ./tools/transcribe -m ggml-tiny.bin clip.wav...
 package main
 
 import (
@@ -13,8 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/benallfree/nollama/audio"
 	"github.com/benallfree/nollama/engine"
+	"github.com/benallfree/nollama/x/audio"
 )
 
 func main() {

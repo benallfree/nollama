@@ -1,0 +1,141 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 598" width="900" height="598" role="img" aria-label="First token, cold start: nollama and Ollama">
+<style>
+.bg{fill:#fcfcfb}.t1{fill:#0b0b0b}.t2{fill:#52514e}.grid{stroke:#e1e0d9}.axis{stroke:#c3c2b7}
+.n{fill:#2a78d6}.o{fill:#eb6834}.tie{fill:#8a8984}.link{stroke:#c3c2b7}.band{fill:#f0efec}.ring{stroke:#fcfcfb}
+@media (prefers-color-scheme: dark){.bg{fill:#1a1a19}.t1{fill:#f0efec}.t2{fill:#c3c2b7}.grid{stroke:#2c2c2a}
+.axis{stroke:#383835}.n{fill:#3987e5}.o{fill:#d95926}.tie{fill:#8a8984}.link{stroke:#55544f}.band{fill:#2c2c2a}.ring{stroke:#1a1a19}}
+text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+</style>
+<rect class="bg" width="900" height="598" rx="8"/>
+<text x="20.0" y="30.0" class="t1" text-anchor="start" font-size="17" font-weight="600">First token, cold start</text>
+<text x="20.0" y="52.0" class="t2" text-anchor="start" font-size="12">Time from a fresh start, with the model file not in the page cache, to the first token of the short prompt. Lower is better. Log scale.</text>
+<circle cx="20.0" cy="72.0" r="5" class="n"/><text x="30.0" y="76.0" class="t1" text-anchor="start" font-size="12">nollama</text>
+<circle cx="100.0" cy="72.0" r="5" class="o"/><text x="110.0" y="76.0" class="t1" text-anchor="start" font-size="12">Ollama</text>
+<line class="grid" x1="250.0" x2="250.0" y1="86.0" y2="566.0" stroke-width="1"/>
+<text x="250.0" y="582.0" class="t2" text-anchor="middle" font-size="11">500 ms</text>
+<line class="grid" x1="341.8" x2="341.8" y1="86.0" y2="566.0" stroke-width="1"/>
+<text x="341.8" y="582.0" class="t2" text-anchor="middle" font-size="11">1 s</text>
+<line class="grid" x1="433.6" x2="433.6" y1="86.0" y2="566.0" stroke-width="1"/>
+<text x="433.6" y="582.0" class="t2" text-anchor="middle" font-size="11">2 s</text>
+<line class="grid" x1="555.0" x2="555.0" y1="86.0" y2="566.0" stroke-width="1"/>
+<text x="555.0" y="582.0" class="t2" text-anchor="middle" font-size="11">5 s</text>
+<line class="grid" x1="646.8" x2="646.8" y1="86.0" y2="566.0" stroke-width="1"/>
+<text x="646.8" y="582.0" class="t2" text-anchor="middle" font-size="11">10 s</text>
+<line class="grid" x1="738.6" x2="738.6" y1="86.0" y2="566.0" stroke-width="1"/>
+<text x="738.6" y="582.0" class="t2" text-anchor="middle" font-size="11">20 s</text>
+<line class="grid" x1="860.0" x2="860.0" y1="86.0" y2="566.0" stroke-width="1"/>
+<text x="860.0" y="582.0" class="t2" text-anchor="middle" font-size="11">50 s</text>
+<text x="20.0" y="106.0" class="t1" text-anchor="start" font-size="12" font-weight="600">vc2-1c-1gb (1 vCPU, Broadwell)</text>
+<text x="236.0" y="123.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q4_K_M</text>
+<line class="link" x1="615.9" x2="833.0" y1="119.0" y2="119.0" stroke-width="2"/>
+<text x="606.9" y="123.0" class="t2" text-anchor="end" font-size="10">7.9 s</text>
+<text x="842.0" y="123.0" class="t2" text-anchor="start" font-size="10">40.8 s</text>
+<circle class="o ring" cx="833.0" cy="119.0" r="5" stroke-width="1.5"><title>Ollama: 40.8 s</title></circle>
+<circle class="n ring" cx="615.9" cy="119.0" r="5" stroke-width="1.5"><title>nollama: 7.9 s</title></circle>
+<text x="20.0" y="144.0" class="t1" text-anchor="start" font-size="12" font-weight="600">vc2-2c-4gb (2 vCPU, Skylake)</text>
+<text x="236.0" y="161.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q4_K_M</text>
+<line class="link" x1="381.2" x2="535.7" y1="157.0" y2="157.0" stroke-width="2"/>
+<text x="372.2" y="161.0" class="t2" text-anchor="end" font-size="10">1.3 s</text>
+<text x="544.7" y="161.0" class="t2" text-anchor="start" font-size="10">4.3 s</text>
+<circle class="o ring" cx="535.7" cy="157.0" r="5" stroke-width="1.5"><title>Ollama: 4.3 s</title></circle>
+<circle class="n ring" cx="381.2" cy="157.0" r="5" stroke-width="1.5"><title>nollama: 1.3 s</title></circle>
+<text x="236.0" y="183.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q8_0</text>
+<line class="link" x1="415.5" x2="536.9" y1="179.0" y2="179.0" stroke-width="2"/>
+<text x="406.5" y="183.0" class="t2" text-anchor="end" font-size="10">1.7 s</text>
+<text x="545.9" y="183.0" class="t2" text-anchor="start" font-size="10">4.4 s</text>
+<circle class="o ring" cx="536.9" cy="179.0" r="5" stroke-width="1.5"><title>Ollama: 4.4 s</title></circle>
+<circle class="n ring" cx="415.5" cy="179.0" r="5" stroke-width="1.5"><title>nollama: 1.7 s</title></circle>
+<text x="236.0" y="205.0" class="t2" text-anchor="end" font-size="12">qwen3-1.7b Q4_K_M</text>
+<line class="link" x1="489.3" x2="651.4" y1="201.0" y2="201.0" stroke-width="2"/>
+<text x="480.3" y="205.0" class="t2" text-anchor="end" font-size="10">3.0 s</text>
+<text x="660.4" y="205.0" class="t2" text-anchor="start" font-size="10">10.4 s</text>
+<circle class="o ring" cx="651.4" cy="201.0" r="5" stroke-width="1.5"><title>Ollama: 10.4 s</title></circle>
+<circle class="n ring" cx="489.3" cy="201.0" r="5" stroke-width="1.5"><title>nollama: 3.0 s</title></circle>
+<text x="236.0" y="227.0" class="t2" text-anchor="end" font-size="12">qwen3-1.7b Q8_0</text>
+<line class="link" x1="535.7" x2="619.4" y1="223.0" y2="223.0" stroke-width="2"/>
+<text x="526.7" y="227.0" class="t2" text-anchor="end" font-size="10">4.3 s</text>
+<text x="628.4" y="227.0" class="t2" text-anchor="start" font-size="10">8.1 s</text>
+<circle class="o ring" cx="619.4" cy="223.0" r="5" stroke-width="1.5"><title>Ollama: 8.1 s</title></circle>
+<circle class="n ring" cx="535.7" cy="223.0" r="5" stroke-width="1.5"><title>nollama: 4.3 s</title></circle>
+<text x="236.0" y="249.0" class="t2" text-anchor="end" font-size="12">qwen3-4b Q4_K_M</text>
+<line class="link" x1="582.8" x2="701.1" y1="245.0" y2="245.0" stroke-width="2"/>
+<text x="573.8" y="249.0" class="t2" text-anchor="end" font-size="10">6.2 s</text>
+<text x="710.1" y="249.0" class="t2" text-anchor="start" font-size="10">15.1 s</text>
+<circle class="o ring" cx="701.1" cy="245.0" r="5" stroke-width="1.5"><title>Ollama: 15.1 s</title></circle>
+<circle class="n ring" cx="582.8" cy="245.0" r="5" stroke-width="1.5"><title>nollama: 6.2 s</title></circle>
+<text x="20.0" y="270.0" class="t1" text-anchor="start" font-size="12" font-weight="600">vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome)</text>
+<text x="236.0" y="287.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q4_K_M</text>
+<line class="link" x1="540.0" x2="503.4" y1="283.0" y2="283.0" stroke-width="2"/>
+<text x="494.4" y="287.0" class="t2" text-anchor="end" font-size="10">3.4 s</text>
+<text x="549.0" y="287.0" class="t2" text-anchor="start" font-size="10">4.5 s</text>
+<circle class="o ring" cx="503.4" cy="283.0" r="5" stroke-width="1.5"><title>Ollama: 3.4 s</title></circle>
+<circle class="n ring" cx="540.0" cy="283.0" r="5" stroke-width="1.5"><title>nollama: 4.5 s</title></circle>
+<text x="236.0" y="309.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q8_0</text>
+<line class="link" x1="672.1" x2="487.2" y1="305.0" y2="305.0" stroke-width="2"/>
+<text x="478.2" y="309.0" class="t2" text-anchor="end" font-size="10">3.0 s</text>
+<text x="681.1" y="309.0" class="t2" text-anchor="start" font-size="10">12.1 s</text>
+<circle class="o ring" cx="487.2" cy="305.0" r="5" stroke-width="1.5"><title>Ollama: 3.0 s</title></circle>
+<circle class="n ring" cx="672.1" cy="305.0" r="5" stroke-width="1.5"><title>nollama: 12.1 s</title></circle>
+<text x="236.0" y="331.0" class="t2" text-anchor="end" font-size="12">qwen3-1.7b Q4_K_M</text>
+<line class="link" x1="669.1" x2="606.7" y1="327.0" y2="327.0" stroke-width="2"/>
+<text x="597.7" y="331.0" class="t2" text-anchor="end" font-size="10">7.4 s</text>
+<text x="678.1" y="331.0" class="t2" text-anchor="start" font-size="10">11.8 s</text>
+<circle class="o ring" cx="606.7" cy="327.0" r="5" stroke-width="1.5"><title>Ollama: 7.4 s</title></circle>
+<circle class="n ring" cx="669.1" cy="327.0" r="5" stroke-width="1.5"><title>nollama: 11.8 s</title></circle>
+<text x="20.0" y="352.0" class="t1" text-anchor="start" font-size="12" font-weight="600">vhp-2c-4gb-intel (2 vCPU, Cascadelake)</text>
+<text x="236.0" y="369.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q4_K_M</text>
+<line class="link" x1="338.6" x2="484.5" y1="365.0" y2="365.0" stroke-width="2"/>
+<text x="329.6" y="369.0" class="t2" text-anchor="end" font-size="10">976 ms</text>
+<text x="493.5" y="369.0" class="t2" text-anchor="start" font-size="10">2.9 s</text>
+<circle class="o ring" cx="484.5" cy="365.0" r="5" stroke-width="1.5"><title>Ollama: 2.9 s</title></circle>
+<circle class="n ring" cx="338.6" cy="365.0" r="5" stroke-width="1.5"><title>nollama: 976 ms</title></circle>
+<text x="236.0" y="391.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q8_0</text>
+<line class="link" x1="372.1" x2="491.9" y1="387.0" y2="387.0" stroke-width="2"/>
+<text x="363.1" y="391.0" class="t2" text-anchor="end" font-size="10">1.3 s</text>
+<text x="500.9" y="391.0" class="t2" text-anchor="start" font-size="10">3.1 s</text>
+<circle class="o ring" cx="491.9" cy="387.0" r="5" stroke-width="1.5"><title>Ollama: 3.1 s</title></circle>
+<circle class="n ring" cx="372.1" cy="387.0" r="5" stroke-width="1.5"><title>nollama: 1.3 s</title></circle>
+<text x="236.0" y="413.0" class="t2" text-anchor="end" font-size="12">qwen3-1.7b Q4_K_M</text>
+<line class="link" x1="428.9" x2="567.4" y1="409.0" y2="409.0" stroke-width="2"/>
+<text x="419.9" y="413.0" class="t2" text-anchor="end" font-size="10">1.9 s</text>
+<text x="576.4" y="413.0" class="t2" text-anchor="start" font-size="10">5.5 s</text>
+<circle class="o ring" cx="567.4" cy="409.0" r="5" stroke-width="1.5"><title>Ollama: 5.5 s</title></circle>
+<circle class="n ring" cx="428.9" cy="409.0" r="5" stroke-width="1.5"><title>nollama: 1.9 s</title></circle>
+<text x="236.0" y="435.0" class="t2" text-anchor="end" font-size="12">qwen3-1.7b Q8_0</text>
+<line class="link" x1="490.2" x2="582.5" y1="431.0" y2="431.0" stroke-width="2"/>
+<text x="481.2" y="435.0" class="t2" text-anchor="end" font-size="10">3.1 s</text>
+<text x="591.5" y="435.0" class="t2" text-anchor="start" font-size="10">6.2 s</text>
+<circle class="o ring" cx="582.5" cy="431.0" r="5" stroke-width="1.5"><title>Ollama: 6.2 s</title></circle>
+<circle class="n ring" cx="490.2" cy="431.0" r="5" stroke-width="1.5"><title>nollama: 3.1 s</title></circle>
+<text x="236.0" y="457.0" class="t2" text-anchor="end" font-size="12">qwen3-4b Q4_K_M</text>
+<line class="link" x1="529.2" x2="652.7" y1="453.0" y2="453.0" stroke-width="2"/>
+<text x="520.2" y="457.0" class="t2" text-anchor="end" font-size="10">4.1 s</text>
+<text x="661.7" y="457.0" class="t2" text-anchor="start" font-size="10">10.5 s</text>
+<circle class="o ring" cx="652.7" cy="453.0" r="5" stroke-width="1.5"><title>Ollama: 10.5 s</title></circle>
+<circle class="n ring" cx="529.2" cy="453.0" r="5" stroke-width="1.5"><title>nollama: 4.1 s</title></circle>
+<text x="20.0" y="478.0" class="t1" text-anchor="start" font-size="12" font-weight="600">vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome)</text>
+<text x="236.0" y="495.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q4_K_M</text>
+<line class="link" x1="450.9" x2="484.9" y1="491.0" y2="491.0" stroke-width="2"/>
+<text x="441.9" y="495.0" class="t2" text-anchor="end" font-size="10">2.3 s</text>
+<text x="493.9" y="495.0" class="t2" text-anchor="start" font-size="10">2.9 s</text>
+<circle class="o ring" cx="484.9" cy="491.0" r="5" stroke-width="1.5"><title>Ollama: 2.9 s</title></circle>
+<circle class="n ring" cx="450.9" cy="491.0" r="5" stroke-width="1.5"><title>nollama: 2.3 s</title></circle>
+<text x="236.0" y="517.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q8_0</text>
+<line class="link" x1="579.5" x2="502.5" y1="513.0" y2="513.0" stroke-width="2"/>
+<text x="493.5" y="517.0" class="t2" text-anchor="end" font-size="10">3.4 s</text>
+<text x="588.5" y="517.0" class="t2" text-anchor="start" font-size="10">6.0 s</text>
+<circle class="o ring" cx="502.5" cy="513.0" r="5" stroke-width="1.5"><title>Ollama: 3.4 s</title></circle>
+<circle class="n ring" cx="579.5" cy="513.0" r="5" stroke-width="1.5"><title>nollama: 6.0 s</title></circle>
+<text x="236.0" y="539.0" class="t2" text-anchor="end" font-size="12">qwen3-1.7b Q4_K_M</text>
+<line class="link" x1="593.3" x2="560.5" y1="535.0" y2="535.0" stroke-width="2"/>
+<text x="551.5" y="539.0" class="t2" text-anchor="end" font-size="10">5.2 s</text>
+<text x="602.3" y="539.0" class="t2" text-anchor="start" font-size="10">6.7 s</text>
+<circle class="o ring" cx="560.5" cy="535.0" r="5" stroke-width="1.5"><title>Ollama: 5.2 s</title></circle>
+<circle class="n ring" cx="593.3" cy="535.0" r="5" stroke-width="1.5"><title>nollama: 6.7 s</title></circle>
+<text x="236.0" y="561.0" class="t2" text-anchor="end" font-size="12">qwen3-1.7b Q8_0</text>
+<line class="link" x1="727.4" x2="568.4" y1="557.0" y2="557.0" stroke-width="2"/>
+<text x="559.4" y="561.0" class="t2" text-anchor="end" font-size="10">5.5 s</text>
+<text x="736.4" y="561.0" class="t2" text-anchor="start" font-size="10">18.4 s</text>
+<circle class="o ring" cx="568.4" cy="557.0" r="5" stroke-width="1.5"><title>Ollama: 5.5 s</title></circle>
+<circle class="n ring" cx="727.4" cy="557.0" r="5" stroke-width="1.5"><title>nollama: 18.4 s</title></circle>
+</svg>

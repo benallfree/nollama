@@ -7,8 +7,8 @@ import (
 	"testing"
 
 	"github.com/benallfree/nollama/engine"
+	"github.com/benallfree/nollama/engine/schema"
 	"github.com/benallfree/nollama/nollamatest"
-	"github.com/benallfree/nollama/schema"
 )
 
 var ctx = context.Background()

@@ -9,8 +9,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/benallfree/nollama/audio"
-	"github.com/benallfree/nollama/models"
+	"github.com/benallfree/nollama/catalog"
+	"github.com/benallfree/nollama/x/audio"
 )
 
 func TestGPT2PreTokenize(t *testing.T) {
@@ -104,7 +104,7 @@ func TestWhisperSpecialTokens(t *testing.T) {
 func whisperModel(t *testing.T) string {
 	p := os.Getenv("NOLLAMA_WHISPER_MODEL")
 	if p == "" {
-		p = filepath.Join(models.DefaultDir(), "whisper", "ggml-tiny.bin")
+		p = filepath.Join(catalog.DefaultDir(), "whisper", "ggml-tiny.bin")
 	}
 	if _, err := os.Stat(p); err != nil {
 		t.Skipf("no whisper model at %s (set NOLLAMA_WHISPER_MODEL)", p)
@@ -216,7 +216,7 @@ func TestWhisperReference(t *testing.T) {
 func BenchmarkWhisperEncode(b *testing.B) {
 	p := os.Getenv("NOLLAMA_WHISPER_MODEL")
 	if p == "" {
-		p = filepath.Join(models.DefaultDir(), "whisper", "ggml-tiny.bin")
+		p = filepath.Join(catalog.DefaultDir(), "whisper", "ggml-tiny.bin")
 	}
 	w, err := LoadWhisper(p, WhisperOptions{})
 	if err != nil {

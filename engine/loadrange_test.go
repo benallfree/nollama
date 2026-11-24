@@ -10,7 +10,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/benallfree/nollama/models"
+	"github.com/benallfree/nollama/catalog"
 )
 
 // tinyGGUF is a valid GGUF with one key and no tensors: enough to test finding and mapping one.
@@ -80,14 +80,14 @@ func TestLoadBundled(t *testing.T) {
 		t.Fatal(err)
 	}
 	bundled := filepath.Join(dir, "bundled")
-	if _, err := models.Bundle(bundled, exe, []models.Source{{Name: "m", Path: p}}); err != nil {
+	if _, err := catalog.Bundle(bundled, exe, []catalog.Source{{Name: "m", Path: p}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := models.UseBundle(bundled); err != nil {
+	if err := catalog.UseBundle(bundled); err != nil {
 		t.Fatal(err)
 	}
-	defer models.UseBundle("")
-	src, err := models.Resolve("m", dir)
+	defer catalog.UseBundle("")
+	src, err := catalog.Resolve("m", dir)
 	if err != nil || !src.Inside {
 		t.Fatalf("%+v %v", src, err)
 	}
@@ -133,8 +133,8 @@ func TestLoadBundled(t *testing.T) {
 	// from memory, deliberately misaligned, as go:embed data can be
 	odd := make([]byte, len(data)+1)
 	copy(odd[1:], data)
-	models.Embed("odd", odd[1:])
-	emb, err := models.Resolve("odd", dir)
+	catalog.Embed("odd", odd[1:])
+	emb, err := catalog.Resolve("odd", dir)
 	if err != nil || emb.Path != "embedded:odd" {
 		t.Fatalf("%+v %v", emb, err)
 	}

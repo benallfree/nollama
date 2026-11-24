@@ -19,9 +19,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/benallfree/nollama/catalog"
 	"github.com/benallfree/nollama/engine"
 	"github.com/benallfree/nollama/internal/tinymodel"
-	"github.com/benallfree/nollama/models"
 	"github.com/benallfree/nollama/server"
 )
 
@@ -160,7 +160,7 @@ func NewServer(t testing.TB, opts ...Option) *Server {
 	}
 	dir := t.TempDir()
 	data := TinyGGUF(o.tiny)
-	for _, k := range models.Catalog {
+	for _, k := range catalog.Catalog {
 		if err := os.WriteFile(filepath.Join(dir, k.Name+".gguf"), data, 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -180,5 +180,5 @@ func NewServer(t testing.TB, opts ...Option) *Server {
 	s := server.New(cfg)
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(func() { ts.Close(); _ = s.Close() })
-	return &Server{Server: ts, Nollama: s, Model: models.Catalog[0].Name}
+	return &Server{Server: ts, Nollama: s, Model: catalog.Catalog[0].Name}
 }

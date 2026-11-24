@@ -1,4 +1,4 @@
-// Package benchhooks gives cmd/bench access to engine internals that are
+// Package benchhooks gives tools/bench access to engine internals that are
 // not part of the engine's API. Package engine fills these in at init.
 package benchhooks
 

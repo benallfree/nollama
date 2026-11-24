@@ -14,9 +14,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/benallfree/nollama/catalog"
 	"github.com/benallfree/nollama/engine"
-	"github.com/benallfree/nollama/models"
-	"github.com/benallfree/nollama/schema"
+	"github.com/benallfree/nollama/engine/schema"
 )
 
 // OllamaVersion is the Ollama API version /api/version reports. Some clients check it before they use a feature
@@ -25,7 +25,7 @@ const OllamaVersion = "0.12.0"
 
 // Config sets up a Server.
 type Config struct {
-	ModelsDir   string // where models are downloaded and listed (default models.DefaultDir())
+	ModelsDir   string // where models are downloaded and listed (default catalog.DefaultDir())
 	Threads     int    // CPU threads shared by every model and answer (0: the engine's default)
 	MaxMemory   int64  // memory budget in bytes for weights, answers' state and caches (0: no limit; see engine.Resources)
 	LowPriority bool   // run the engine's threads at a lower OS priority (see engine.LowPrioritySupported)
@@ -92,7 +92,7 @@ type Server struct {
 
 type loaded struct {
 	name    string
-	src     models.Source
+	src     catalog.Source
 	m       *engine.Model
 	draft   *engine.Model  // nil: no draft for this model
 	active  int            // requests using it (guarded by Server.mu)
@@ -105,7 +105,7 @@ type loaded struct {
 // New returns a server for cfg.
 func New(cfg Config) *Server {
 	if cfg.ModelsDir == "" {
-		cfg.ModelsDir = models.DefaultDir()
+		cfg.ModelsDir = catalog.DefaultDir()
 	}
 	if cfg.Parallel <= 0 {
 		cfg.Parallel = 1
@@ -275,11 +275,11 @@ func (s *Server) acquire(name string) (*loaded, time.Duration, error) {
 }
 
 // loadDraft loads the configured draft model for target, or returns nil (and logs why) when there is none to use.
-func (s *Server) loadDraft(target models.Source, m *engine.Model) *engine.Model {
+func (s *Server) loadDraft(target catalog.Source, m *engine.Model) *engine.Model {
 	if s.cfg.Draft == "" {
 		return nil
 	}
-	src, err := models.Resolve(s.cfg.Draft, s.cfg.ModelsDir)
+	src, err := catalog.Resolve(s.cfg.Draft, s.cfg.ModelsDir)
 	if err != nil {
 		s.cfg.Logf("draft %s: %v", s.cfg.Draft, err)
 		return nil

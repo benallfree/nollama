@@ -1,10 +1,12 @@
 # Changelog
 
 Every user-visible change gets a line under **Unreleased** in the commit that makes it. At a release, `## Unreleased`
-becomes `## vX.Y.Z` and its lines are the release notes (`release.sh` reads them).
+becomes `## vX.Y.Z` and its lines are the release notes (`release/release.sh` reads them).
 
 ## Unreleased
 
+- Packages moved (import paths change): `models` is now `catalog` (`github.com/benallfree/nollama/catalog`, package `catalog`), `schema` is now `engine/schema`, and the experimental `compose` and `audio` packages are now `x/compose` and `x/audio`. `engine`, `server` and `nollamatest` are unchanged. Developer tools moved to `tools/` (`go run ./tools/bench`, `go run ./tools/transcribe`).
+- `bench report` prints one table per metric, nollama next to Ollama with the winner, from saved `bench vps` results, and with `-svg` draws the same comparisons as charts (a summary of every metric and one chart per metric). The README and docs are rewritten: the guide is `docs/guide.md`, and `docs/benchmarks.md` holds only scripted results (raw data in `benchmarks/results`).
 - Homebrew: nollama moved to the shared tap, `brew install benallfree/tap/nollama`. If you tapped `benallfree/nollama`, `brew update` moves you over.
 
 ## v0.0.1-alpha.2

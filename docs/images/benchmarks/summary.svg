@@ -1,0 +1,170 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 458" width="900" height="458" role="img" aria-label="nollama compared with Ollama, every metric">
+<style>
+.bg{fill:#fcfcfb}.t1{fill:#0b0b0b}.t2{fill:#52514e}.grid{stroke:#e1e0d9}.axis{stroke:#c3c2b7}
+.n{fill:#2a78d6}.o{fill:#eb6834}.tie{fill:#8a8984}.link{stroke:#c3c2b7}.band{fill:#f0efec}.ring{stroke:#fcfcfb}
+@media (prefers-color-scheme: dark){.bg{fill:#1a1a19}.t1{fill:#f0efec}.t2{fill:#c3c2b7}.grid{stroke:#2c2c2a}
+.axis{stroke:#383835}.n{fill:#3987e5}.o{fill:#d95926}.tie{fill:#8a8984}.link{stroke:#55544f}.band{fill:#2c2c2a}.ring{stroke:#1a1a19}}
+text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+</style>
+<rect class="bg" width="900" height="458" rx="8"/>
+<text x="20.0" y="30.0" class="t1" text-anchor="start" font-size="17" font-weight="600">nollama vs Ollama, CPU on small cloud servers</text>
+<text x="20.0" y="52.0" class="t2" text-anchor="start" font-size="12">Each dot is one machine and model. Right of 1× nollama is ahead, left of it Ollama is; the shaded band is within 5%.</text>
+<rect class="band" x="466.3" y="78.0" width="7.5" height="322.0"/>
+<line class="grid" x1="210.0" x2="210.0" y1="78.0" y2="400.0" stroke-width="1"/>
+<text x="210.0" y="418.0" class="t2" text-anchor="middle" font-size="11">1/30</text>
+<line class="grid" x1="294.0" x2="294.0" y1="78.0" y2="400.0" stroke-width="1"/>
+<text x="294.0" y="418.0" class="t2" text-anchor="middle" font-size="11">1/10</text>
+<line class="grid" x1="386.0" x2="386.0" y1="78.0" y2="400.0" stroke-width="1"/>
+<text x="386.0" y="418.0" class="t2" text-anchor="middle" font-size="11">1/3</text>
+<line class="axis" x1="470.0" x2="470.0" y1="78.0" y2="400.0" stroke-width="1"/>
+<text x="470.0" y="418.0" class="t2" text-anchor="middle" font-size="11">1×</text>
+<line class="grid" x1="554.0" x2="554.0" y1="78.0" y2="400.0" stroke-width="1"/>
+<text x="554.0" y="418.0" class="t2" text-anchor="middle" font-size="11">3×</text>
+<line class="grid" x1="646.0" x2="646.0" y1="78.0" y2="400.0" stroke-width="1"/>
+<text x="646.0" y="418.0" class="t2" text-anchor="middle" font-size="11">10×</text>
+<line class="grid" x1="730.0" x2="730.0" y1="78.0" y2="400.0" stroke-width="1"/>
+<text x="730.0" y="418.0" class="t2" text-anchor="middle" font-size="11">30×</text>
+<text x="460.0" y="70.0" class="o" text-anchor="end" font-size="12" font-weight="600">← Ollama ahead</text>
+<text x="480.0" y="70.0" class="n" text-anchor="start" font-size="12" font-weight="600">nollama ahead →</text>
+<text x="750.0" y="70.0" class="t2" text-anchor="start" font-size="11">nollama · tie · Ollama</text>
+<text x="196.0" y="100.0" class="t1" text-anchor="end" font-size="13">Writing speed</text>
+<circle class="o ring" cx="362.7" cy="96.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-1c-1gb (1 vCPU, Broadwell), qwen3-0.6b Q4_K_M: 0.25×</title></circle>
+<circle class="n ring" cx="474.7" cy="96.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-0.6b Q4_K_M: 1.06×</title></circle>
+<circle class="o ring" cx="454.4" cy="96.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-0.6b Q8_0: 0.82×</title></circle>
+<circle class="n ring" cx="475.1" cy="96.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-1.7b Q4_K_M: 1.07×</title></circle>
+<circle class="o ring" cx="453.2" cy="96.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-1.7b Q8_0: 0.80×</title></circle>
+<circle class="n ring" cx="474.9" cy="96.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-4b Q4_K_M: 1.07×</title></circle>
+<circle class="o ring" cx="294.3" cy="96.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome), qwen3-0.6b Q4_K_M: 0.10×</title></circle>
+<circle class="o ring" cx="220.5" cy="96.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome), qwen3-0.6b Q8_0: 0.04×</title></circle>
+<circle class="o ring" cx="277.8" cy="96.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome), qwen3-1.7b Q4_K_M: 0.08×</title></circle>
+<circle class="tie ring" cx="471.8" cy="96.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-0.6b Q4_K_M: 1.02×</title></circle>
+<circle class="o ring" cx="462.2" cy="96.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-0.6b Q8_0: 0.90×</title></circle>
+<circle class="tie ring" cx="473.1" cy="96.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-1.7b Q4_K_M: 1.04×</title></circle>
+<circle class="o ring" cx="459.2" cy="96.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-1.7b Q8_0: 0.87×</title></circle>
+<circle class="tie ring" cx="471.3" cy="96.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-4b Q4_K_M: 1.02×</title></circle>
+<circle class="o ring" cx="319.6" cy="96.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-0.6b Q4_K_M: 0.14×</title></circle>
+<circle class="o ring" cx="240.1" cy="96.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-0.6b Q8_0: 0.05×</title></circle>
+<circle class="o ring" cx="290.8" cy="96.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-1.7b Q4_K_M: 0.10×</title></circle>
+<circle class="o ring" cx="222.7" cy="96.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-1.7b Q8_0: 0.04×</title></circle>
+<text x="750.0" y="100.0" class="t1" text-anchor="start" font-size="13">3 · 3 · 12</text>
+<text x="196.0" y="146.0" class="t1" text-anchor="end" font-size="13">Reading speed, long prompt</text>
+<circle class="o ring" cx="363.3" cy="142.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-1c-1gb (1 vCPU, Broadwell), qwen3-0.6b Q4_K_M: 0.25×</title></circle>
+<circle class="o ring" cx="443.7" cy="142.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-0.6b Q4_K_M: 0.71×</title></circle>
+<circle class="o ring" cx="453.6" cy="142.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-0.6b Q8_0: 0.81×</title></circle>
+<circle class="o ring" cx="444.1" cy="142.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-1.7b Q4_K_M: 0.71×</title></circle>
+<circle class="o ring" cx="457.5" cy="142.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-1.7b Q8_0: 0.85×</title></circle>
+<circle class="o ring" cx="449.2" cy="142.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-4b Q4_K_M: 0.76×</title></circle>
+<circle class="o ring" cx="314.1" cy="142.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome), qwen3-0.6b Q4_K_M: 0.13×</title></circle>
+<circle class="o ring" cx="250.3" cy="142.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome), qwen3-0.6b Q8_0: 0.06×</title></circle>
+<circle class="o ring" cx="306.1" cy="142.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome), qwen3-1.7b Q4_K_M: 0.12×</title></circle>
+<circle class="o ring" cx="436.3" cy="142.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-0.6b Q4_K_M: 0.64×</title></circle>
+<circle class="o ring" cx="445.9" cy="142.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-0.6b Q8_0: 0.73×</title></circle>
+<circle class="o ring" cx="437.4" cy="142.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-1.7b Q4_K_M: 0.65×</title></circle>
+<circle class="o ring" cx="439.1" cy="142.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-1.7b Q8_0: 0.67×</title></circle>
+<circle class="o ring" cx="436.9" cy="142.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-4b Q4_K_M: 0.65×</title></circle>
+<circle class="o ring" cx="320.1" cy="142.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-0.6b Q4_K_M: 0.14×</title></circle>
+<circle class="o ring" cx="257.2" cy="142.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-0.6b Q8_0: 0.06×</title></circle>
+<circle class="o ring" cx="306.3" cy="142.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-1.7b Q4_K_M: 0.12×</title></circle>
+<circle class="o ring" cx="235.1" cy="142.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-1.7b Q8_0: 0.05×</title></circle>
+<text x="750.0" y="146.0" class="t1" text-anchor="start" font-size="13">0 · 0 · 18</text>
+<text x="196.0" y="192.0" class="t1" text-anchor="end" font-size="13">Reading speed, short prompt</text>
+<circle class="o ring" cx="361.2" cy="188.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-1c-1gb (1 vCPU, Broadwell), qwen3-0.6b Q4_K_M: 0.24×</title></circle>
+<circle class="o ring" cx="453.4" cy="188.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-0.6b Q4_K_M: 0.81×</title></circle>
+<circle class="o ring" cx="463.3" cy="188.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-0.6b Q8_0: 0.92×</title></circle>
+<circle class="o ring" cx="459.2" cy="188.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-1.7b Q4_K_M: 0.87×</title></circle>
+<circle class="o ring" cx="456.2" cy="188.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-1.7b Q8_0: 0.84×</title></circle>
+<circle class="o ring" cx="457.6" cy="188.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-4b Q4_K_M: 0.85×</title></circle>
+<circle class="o ring" cx="306.2" cy="188.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome), qwen3-0.6b Q4_K_M: 0.12×</title></circle>
+<circle class="o ring" cx="232.4" cy="188.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome), qwen3-0.6b Q8_0: 0.04×</title></circle>
+<circle class="o ring" cx="297.1" cy="188.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome), qwen3-1.7b Q4_K_M: 0.10×</title></circle>
+<circle class="o ring" cx="449.5" cy="188.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-0.6b Q4_K_M: 0.76×</title></circle>
+<circle class="o ring" cx="448.7" cy="188.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-0.6b Q8_0: 0.76×</title></circle>
+<circle class="o ring" cx="441.2" cy="188.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-1.7b Q4_K_M: 0.69×</title></circle>
+<circle class="o ring" cx="442.0" cy="188.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-1.7b Q8_0: 0.69×</title></circle>
+<circle class="o ring" cx="445.7" cy="188.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-4b Q4_K_M: 0.73×</title></circle>
+<circle class="o ring" cx="311.0" cy="188.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-0.6b Q4_K_M: 0.12×</title></circle>
+<circle class="o ring" cx="228.0" cy="188.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-0.6b Q8_0: 0.04×</title></circle>
+<circle class="o ring" cx="291.4" cy="188.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-1.7b Q4_K_M: 0.10×</title></circle>
+<circle class="o ring" cx="225.5" cy="188.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-1.7b Q8_0: 0.04×</title></circle>
+<text x="750.0" y="192.0" class="t1" text-anchor="start" font-size="13">0 · 0 · 18</text>
+<text x="196.0" y="238.0" class="t1" text-anchor="end" font-size="13">First token, model loaded</text>
+<circle class="o ring" cx="365.4" cy="234.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-1c-1gb (1 vCPU, Broadwell), qwen3-0.6b Q4_K_M: 0.25×</title></circle>
+<circle class="o ring" cx="444.6" cy="234.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-0.6b Q4_K_M: 0.72×</title></circle>
+<circle class="o ring" cx="454.3" cy="234.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-0.6b Q8_0: 0.81×</title></circle>
+<circle class="o ring" cx="444.4" cy="234.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-1.7b Q4_K_M: 0.72×</title></circle>
+<circle class="o ring" cx="457.7" cy="234.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-1.7b Q8_0: 0.85×</title></circle>
+<circle class="o ring" cx="449.3" cy="234.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-4b Q4_K_M: 0.76×</title></circle>
+<circle class="o ring" cx="314.7" cy="234.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome), qwen3-0.6b Q4_K_M: 0.13×</title></circle>
+<circle class="o ring" cx="251.3" cy="234.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome), qwen3-0.6b Q8_0: 0.06×</title></circle>
+<circle class="o ring" cx="306.6" cy="234.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome), qwen3-1.7b Q4_K_M: 0.12×</title></circle>
+<circle class="o ring" cx="437.4" cy="234.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-0.6b Q4_K_M: 0.65×</title></circle>
+<circle class="o ring" cx="446.7" cy="234.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-0.6b Q8_0: 0.74×</title></circle>
+<circle class="o ring" cx="438.0" cy="234.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-1.7b Q4_K_M: 0.66×</title></circle>
+<circle class="o ring" cx="439.2" cy="234.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-1.7b Q8_0: 0.67×</title></circle>
+<circle class="o ring" cx="437.0" cy="234.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-4b Q4_K_M: 0.65×</title></circle>
+<circle class="o ring" cx="322.1" cy="234.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-0.6b Q4_K_M: 0.14×</title></circle>
+<circle class="o ring" cx="258.6" cy="234.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-0.6b Q8_0: 0.06×</title></circle>
+<circle class="o ring" cx="307.0" cy="234.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-1.7b Q4_K_M: 0.12×</title></circle>
+<circle class="o ring" cx="235.3" cy="234.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-1.7b Q8_0: 0.05×</title></circle>
+<text x="750.0" y="238.0" class="t1" text-anchor="start" font-size="13">0 · 0 · 18</text>
+<text x="196.0" y="284.0" class="t1" text-anchor="end" font-size="13">First token, cold start</text>
+<circle class="n ring" cx="595.3" cy="280.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-1c-1gb (1 vCPU, Broadwell), qwen3-0.6b Q4_K_M: 5.15×</title></circle>
+<circle class="n ring" cx="559.2" cy="280.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-0.6b Q4_K_M: 3.21×</title></circle>
+<circle class="n ring" cx="540.1" cy="280.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-0.6b Q8_0: 2.50×</title></circle>
+<circle class="n ring" cx="563.5" cy="280.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-1.7b Q4_K_M: 3.40×</title></circle>
+<circle class="n ring" cx="518.3" cy="280.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-1.7b Q8_0: 1.88×</title></circle>
+<circle class="n ring" cx="538.3" cy="280.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-4b Q4_K_M: 2.44×</title></circle>
+<circle class="o ring" cx="448.9" cy="280.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome), qwen3-0.6b Q4_K_M: 0.76×</title></circle>
+<circle class="o ring" cx="363.3" cy="280.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome), qwen3-0.6b Q8_0: 0.25×</title></circle>
+<circle class="o ring" cx="434.0" cy="280.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome), qwen3-1.7b Q4_K_M: 0.62×</title></circle>
+<circle class="n ring" cx="554.2" cy="280.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-0.6b Q4_K_M: 3.01×</title></circle>
+<circle class="n ring" cx="539.2" cy="280.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-0.6b Q8_0: 2.47×</title></circle>
+<circle class="n ring" cx="549.9" cy="280.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-1.7b Q4_K_M: 2.85×</title></circle>
+<circle class="n ring" cx="523.2" cy="280.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-1.7b Q8_0: 2.01×</title></circle>
+<circle class="n ring" cx="541.2" cy="280.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-4b Q4_K_M: 2.54×</title></circle>
+<circle class="n ring" cx="489.6" cy="280.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-0.6b Q4_K_M: 1.29×</title></circle>
+<circle class="o ring" cx="425.6" cy="280.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-0.6b Q8_0: 0.56×</title></circle>
+<circle class="o ring" cx="451.1" cy="280.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-1.7b Q4_K_M: 0.78×</title></circle>
+<circle class="o ring" cx="378.2" cy="280.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-1.7b Q8_0: 0.30×</title></circle>
+<text x="750.0" y="284.0" class="t1" text-anchor="start" font-size="13">12 · 0 · 6</text>
+<text x="196.0" y="330.0" class="t1" text-anchor="end" font-size="13">First token, warm start</text>
+<circle class="n ring" cx="614.2" cy="326.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-1c-1gb (1 vCPU, Broadwell), qwen3-0.6b Q4_K_M: 6.59×</title></circle>
+<circle class="n ring" cx="594.9" cy="326.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-0.6b Q4_K_M: 5.12×</title></circle>
+<circle class="n ring" cx="569.4" cy="326.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-0.6b Q8_0: 3.67×</title></circle>
+<circle class="n ring" cx="568.3" cy="326.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-1.7b Q4_K_M: 3.62×</title></circle>
+<circle class="n ring" cx="549.1" cy="326.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-1.7b Q8_0: 2.82×</title></circle>
+<circle class="n ring" cx="576.1" cy="326.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-4b Q4_K_M: 4.00×</title></circle>
+<circle class="o ring" cx="443.5" cy="326.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome), qwen3-0.6b Q4_K_M: 0.71×</title></circle>
+<circle class="o ring" cx="351.0" cy="326.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome), qwen3-0.6b Q8_0: 0.21×</title></circle>
+<circle class="o ring" cx="412.1" cy="326.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome), qwen3-1.7b Q4_K_M: 0.47×</title></circle>
+<circle class="n ring" cx="579.1" cy="326.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-0.6b Q4_K_M: 4.17×</title></circle>
+<circle class="n ring" cx="555.8" cy="326.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-0.6b Q8_0: 3.07×</title></circle>
+<circle class="n ring" cx="574.9" cy="326.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-1.7b Q4_K_M: 3.95×</title></circle>
+<circle class="n ring" cx="537.8" cy="326.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-1.7b Q8_0: 2.43×</title></circle>
+<circle class="n ring" cx="566.5" cy="326.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-4b Q4_K_M: 3.53×</title></circle>
+<circle class="tie ring" cx="470.0" cy="326.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-0.6b Q4_K_M: 1.00×</title></circle>
+<circle class="o ring" cx="398.8" cy="326.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-0.6b Q8_0: 0.39×</title></circle>
+<circle class="o ring" cx="439.5" cy="326.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-1.7b Q4_K_M: 0.67×</title></circle>
+<circle class="o ring" cx="352.2" cy="326.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-1.7b Q8_0: 0.21×</title></circle>
+<text x="750.0" y="330.0" class="t1" text-anchor="start" font-size="13">11 · 1 · 6</text>
+<text x="196.0" y="376.0" class="t1" text-anchor="end" font-size="13">Peak memory</text>
+<circle class="tie ring" cx="469.9" cy="372.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-1c-1gb (1 vCPU, Broadwell), qwen3-0.6b Q4_K_M: 1.00×</title></circle>
+<circle class="n ring" cx="531.8" cy="372.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-0.6b Q4_K_M: 2.25×</title></circle>
+<circle class="n ring" cx="523.0" cy="372.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-0.6b Q8_0: 2.00×</title></circle>
+<circle class="n ring" cx="476.0" cy="372.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-1.7b Q4_K_M: 1.08×</title></circle>
+<circle class="o ring" cx="463.6" cy="372.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-1.7b Q8_0: 0.92×</title></circle>
+<circle class="o ring" cx="464.9" cy="372.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vc2-2c-4gb (2 vCPU, Skylake), qwen3-4b Q4_K_M: 0.93×</title></circle>
+<circle class="tie ring" cx="466.7" cy="372.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome), qwen3-0.6b Q4_K_M: 0.96×</title></circle>
+<circle class="tie ring" cx="469.4" cy="372.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome), qwen3-0.6b Q8_0: 0.99×</title></circle>
+<circle class="n ring" cx="474.7" cy="372.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome), qwen3-1.7b Q4_K_M: 1.06×</title></circle>
+<circle class="o ring" cx="464.0" cy="372.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-0.6b Q4_K_M: 0.92×</title></circle>
+<circle class="o ring" cx="463.7" cy="372.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-0.6b Q8_0: 0.92×</title></circle>
+<circle class="tie ring" cx="466.6" cy="372.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-1.7b Q4_K_M: 0.96×</title></circle>
+<circle class="o ring" cx="464.8" cy="372.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-1.7b Q8_0: 0.93×</title></circle>
+<circle class="o ring" cx="465.2" cy="372.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-2c-4gb-intel (2 vCPU, Cascadelake), qwen3-4b Q4_K_M: 0.94×</title></circle>
+<circle class="tie ring" cx="467.1" cy="372.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-0.6b Q4_K_M: 0.96×</title></circle>
+<circle class="tie ring" cx="468.0" cy="372.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-0.6b Q8_0: 0.97×</title></circle>
+<circle class="tie ring" cx="471.0" cy="372.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-1.7b Q4_K_M: 1.01×</title></circle>
+<circle class="tie ring" cx="468.9" cy="372.0" r="5.5" stroke-width="1.5" fill-opacity="0.85"><title>vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome), qwen3-1.7b Q8_0: 0.99×</title></circle>
+<text x="750.0" y="376.0" class="t1" text-anchor="start" font-size="13">4 · 8 · 6</text>
+</svg>

@@ -1,7 +1,7 @@
-// Package models finds model files: a name nollama knows (downloaded from its publisher and checked against its
+// Package catalog finds model files: a name nollama knows (downloaded from its publisher and checked against its
 // SHA-256), an hf:<org>/<repo>/<file>.gguf from Hugging Face, a path to a .gguf file, or a model inside the program
 // itself (bundled at the end of the executable with Bundle, or compiled in and registered with Embed).
-package models
+package catalog
 
 import (
 	"crypto/sha256"

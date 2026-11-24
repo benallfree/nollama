@@ -24,8 +24,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/benallfree/nollama/catalog"
 	"github.com/benallfree/nollama/engine"
-	"github.com/benallfree/nollama/models"
 	"github.com/benallfree/nollama/server"
 )
 
@@ -64,7 +64,7 @@ var version = "dev"
 func main() {
 	log.SetFlags(0)
 	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, usage, models.Names(), models.DefaultDir())
+		fmt.Fprintf(os.Stderr, usage, catalog.Names(), catalog.DefaultDir())
 		os.Exit(2)
 	}
 	var err error
@@ -84,7 +84,7 @@ func main() {
 	case "version", "--version", "-v":
 		fmt.Println("nollama", version)
 	case "help", "-h", "--help":
-		fmt.Printf(usage, models.Names(), models.DefaultDir())
+		fmt.Printf(usage, catalog.Names(), catalog.DefaultDir())
 	default:
 		err = fmt.Errorf("unknown command %q (try nollama help)", cmd)
 	}
@@ -95,9 +95,9 @@ func main() {
 
 func modelsDir() string {
 	if d := os.Getenv("NOLLAMA_MODELS"); d != "" {
-		return models.ExpandHome(d)
+		return catalog.ExpandHome(d)
 	}
-	return models.DefaultDir()
+	return catalog.DefaultDir()
 }
 
 // parseKeepAlive reads a keep-alive the way Ollama's OLLAMA_KEEP_ALIVE does: seconds ("300", "-1") or a duration ("5m").
@@ -275,8 +275,8 @@ func sizeString(n int64) string {
 	return fmt.Sprintf("%.1f GB", float64(n)/(1<<30))
 }
 
-func pull(spec string) (models.Source, error) {
-	src, err := models.Resolve(spec, modelsDir())
+func pull(spec string) (catalog.Source, error) {
+	src, err := catalog.Resolve(spec, modelsDir())
 	if err != nil {
 		return src, err
 	}
@@ -285,7 +285,7 @@ func pull(spec string) (models.Source, error) {
 	}
 	fmt.Fprintf(os.Stderr, "pulling %s from %s\n", src.Name, src.URL)
 	last := time.Time{}
-	err = models.Fetch(src, nil, func(done, total int64) {
+	err = catalog.Fetch(src, nil, func(done, total int64) {
 		if time.Since(last) < 200*time.Millisecond && done != total {
 			return
 		}
@@ -317,15 +317,15 @@ func cmdPull(args []string) error {
 }
 
 func cmdList(args []string) error {
-	local, err := models.Available(modelsDir())
+	local, err := catalog.Available(modelsDir())
 	if err != nil {
 		return err
 	}
-	if err := models.BundleError(); err != nil {
+	if err := catalog.BundleError(); err != nil {
 		fmt.Fprintln(os.Stderr, "nollama:", err)
 	}
 	if len(local) == 0 {
-		fmt.Printf("no models in %s yet; try: nollama pull %s\n", modelsDir(), models.Catalog[1].Name)
+		fmt.Printf("no models in %s yet; try: nollama pull %s\n", modelsDir(), catalog.Catalog[1].Name)
 		return nil
 	}
 	fmt.Printf("%-28s %10s  %s\n", "NAME", "SIZE", "MODIFIED")
@@ -343,7 +343,7 @@ func cmdRm(args []string) error {
 	if len(args) != 1 {
 		return errors.New("usage: nollama rm <model>")
 	}
-	src, err := models.Resolve(args[0], modelsDir())
+	src, err := catalog.Resolve(args[0], modelsDir())
 	if err != nil {
 		return err
 	}
@@ -469,7 +469,7 @@ func cmdBundle(args []string) error {
        nollama bundle -check <file>
 
 Writes a copy of the program with the models added to its end. The copy finds them by name with nothing to
-download: "nollama run qwen3-0.6b", the server's /api/tags, and models.Resolve in your own Go program. A model is
+download: "nollama run qwen3-0.6b", the server's /api/tags, and catalog.Resolve in your own Go program. A model is
 <name>, <name>=<spec> to give it another name, or any spec nollama run takes; it's downloaded first if needed.
 
 `)
@@ -490,7 +490,7 @@ download: "nollama run qwen3-0.6b", the server's /api/tags, and models.Resolve i
 		}
 		*exe = self
 	}
-	var srcs []models.Source
+	var srcs []catalog.Source
 	for _, arg := range fs.Args() {
 		name, spec, renamed := strings.Cut(arg, "=")
 		if !renamed {
@@ -501,11 +501,11 @@ download: "nollama run qwen3-0.6b", the server's /api/tags, and models.Resolve i
 			return err
 		}
 		if renamed {
-			src.Name = models.Normalize(name)
+			src.Name = catalog.Normalize(name)
 		}
 		srcs = append(srcs, src)
 	}
-	list, err := models.Bundle(*out, *exe, srcs)
+	list, err := catalog.Bundle(*out, *exe, srcs)
 	if err != nil {
 		return err
 	}
@@ -517,7 +517,7 @@ download: "nollama run qwen3-0.6b", the server's /api/tags, and models.Resolve i
 }
 
 func checkBundle(path string) error {
-	_, list, err := models.ReadBundle(path)
+	_, list, err := catalog.ReadBundle(path)
 	if err != nil {
 		return err
 	}
@@ -526,7 +526,7 @@ func checkBundle(path string) error {
 	}
 	bad := 0
 	for _, b := range list {
-		err := models.Verify(models.Source{Name: b.Name, Path: models.BundledPrefix + b.Name, File: path, Offset: b.Offset, Size: b.Size, SHA256: b.SHA256})
+		err := catalog.Verify(catalog.Source{Name: b.Name, Path: catalog.BundledPrefix + b.Name, File: path, Offset: b.Offset, Size: b.Size, SHA256: b.SHA256})
 		status := "sha256 ok"
 		if err != nil {
 			status, bad = err.Error(), bad+1

@@ -10,6 +10,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -43,8 +44,12 @@ var reportMetrics = []reportMetric{
 }
 
 func cmdReport(args []string) error {
+	fs := flag.NewFlagSet("report", flag.ExitOnError)
+	svgDir := fs.String("svg", "", "also write SVG charts into this directory")
+	img := fs.String("img", "", "path the markdown uses for the charts (default: the -svg directory)")
+	fs.Parse(args)
 	var reps []VPSReport
-	for _, p := range args {
+	for _, p := range fs.Args() {
 		b, err := os.ReadFile(p)
 		if err != nil {
 			return err
@@ -56,7 +61,15 @@ func cmdReport(args []string) error {
 		reps = append(reps, rep)
 	}
 	sort.SliceStable(reps, func(i, j int) bool { return reps[i].System.Label < reps[j].System.Label })
-	writeReport(os.Stdout, reps)
+	if *svgDir != "" {
+		if err := writeCharts(*svgDir, reps); err != nil {
+			return err
+		}
+		if *img == "" {
+			*img = *svgDir
+		}
+	}
+	writeReport(os.Stdout, reps, *img)
 	return nil
 }
 
@@ -103,7 +116,7 @@ func machineName(s System) string {
 	return fmt.Sprintf("%s (%d vCPU, %s)", s.Label, s.VCPUs, cpu)
 }
 
-func writeReport(w io.Writer, reps []VPSReport) {
+func writeReport(w io.Writer, reps []VPSReport, img string) {
 	if len(reps) == 0 {
 		return
 	}
@@ -118,7 +131,11 @@ func writeReport(w io.Writer, reps []VPSReport) {
 	}
 	fmt.Fprintln(w)
 	for _, m := range reportMetrics {
-		fmt.Fprintf(w, "### %s\n\n%s ", m.title, m.about)
+		fmt.Fprintf(w, "### %s\n\n", m.title)
+		if img != "" {
+			fmt.Fprintf(w, "![%s: nollama and Ollama](%s/%s.svg)\n\n", m.title, img, slug(m.title))
+		}
+		fmt.Fprintf(w, "%s ", m.about)
 		if m.higher {
 			fmt.Fprintf(w, "Higher is better.\n\n")
 		} else {

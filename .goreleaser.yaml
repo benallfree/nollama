@@ -1,4 +1,4 @@
-# nollama's release config. Cut a release with ./release.sh vX.Y.Z (see the script).
+# nollama's release config. Cut a release with release/release.sh vX.Y.Z (see the script).
 version: 2
 
 project_name: nollama
@@ -140,21 +140,21 @@ nfpms:
     license: MIT
     bindir: /usr/bin
     contents:
-      - src: packaging/nollama.service
+      - src: release/nollama.service
         dst: /usr/lib/systemd/system/nollama.service
         packager: deb
-      - src: packaging/nollama.service
+      - src: release/nollama.service
         dst: /usr/lib/systemd/system/nollama.service
         packager: rpm
-      - src: packaging/nollama.env
+      - src: release/nollama.env
         dst: /etc/nollama/nollama.env
         type: config|noreplace
         file_info:
           mode: 0640 # it can hold NOLLAMA_API_KEY; systemd reads it as root
     scripts:
-      postinstall: packaging/postinstall.sh
-      preremove: packaging/preremove.sh
-      postremove: packaging/postremove.sh
+      postinstall: release/postinstall.sh
+      preremove: release/preremove.sh
+      postremove: release/postremove.sh
 
 checksum:
   name_template: 'checksums.txt'
@@ -163,4 +163,4 @@ snapshot:
   version_template: '{{ incpatch .Version }}-next'
 
 # GitHub renders every newline in release notes as a line break: never hard-wrap the header above or the notes.
-# release.sh passes the version's section of CHANGELOG.md as --release-notes; the header above is prepended.
+# release/release.sh passes the version's section of CHANGELOG.md as --release-notes; the header above is prepended.

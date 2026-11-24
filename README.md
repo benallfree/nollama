@@ -33,7 +33,7 @@ you do that work in your own process:
 - conversation state you can save, reload, rewind and fork, so several branches share the work of reading the same
   prompt (`engine.State`, experimental);
 - decoding middleware for writing your own sampling and search strategies, with best-of-N and beam search built on it
-  in the `compose` package (experimental);
+  in the `x/compose` package (experimental);
 - a deterministic mode in which the CPU, Metal and CUDA kernels produce the same logits, bit for bit, on every
   machine;
 - integer models, whose forward pass uses integer arithmetic only, so that other implementations of the same
@@ -167,12 +167,12 @@ The simplest use loads a model and generates text. Here the answer is held to a 
 ```go
 import (
 	"github.com/benallfree/nollama/engine"
-	"github.com/benallfree/nollama/models"
-	"github.com/benallfree/nollama/schema"
+	"github.com/benallfree/nollama/catalog"
+	"github.com/benallfree/nollama/engine/schema"
 )
 
-src, _ := models.Resolve("qwen3-1.7b", models.DefaultDir())
-_ = models.Fetch(src, nil, nil) // downloads the model once and checks its SHA-256
+src, _ := catalog.Resolve("qwen3-1.7b", catalog.DefaultDir())
+_ = catalog.Fetch(src, nil, nil) // downloads the model once and checks its SHA-256
 m, _ := engine.Load(src.Path, engine.LoadOptions{})
 defer m.Close()
 
@@ -213,18 +213,11 @@ and testing without a model.
 
 [Benchmarks](docs/benchmarks.md) compares nollama with Ollama one metric at a time, on the same machines and the same
 model files, and marks the winner of each comparison. Every number there is produced by a script from saved raw
-results. So far the scripted runs cover the CPU on five small cloud servers, with Qwen3 0.6B, 1.7B and 4B; this is how
-the 18 comparisons per metric came out:
+results. So far the scripted runs cover the CPU on five small cloud servers, with Qwen3 0.6B, 1.7B and 4B. Each dot
+below is one of those comparisons; the numbers on the right count how many comparisons nollama won, tied (within 5%)
+and lost on each metric.
 
-| Metric | nollama ahead | Within 5% | Ollama ahead |
-|---|---|---|---|
-| Writing speed | 3 | 3 | 12 |
-| Reading speed, long prompt | 0 | 0 | 18 |
-| Reading speed, short prompt | 0 | 0 | 18 |
-| First token, model loaded | 0 | 0 | 18 |
-| First token, cold start | 12 | 0 | 6 |
-| First token, warm start | 11 | 1 | 6 |
-| Peak memory | 4 | 8 | 6 |
+![nollama compared with Ollama, every metric](docs/images/benchmarks/summary.svg)
 
 nollama starts much faster, because it memory-maps the model file instead of loading it. Ollama reads prompts faster
 everywhere and writes faster on most of these machines. On the AMD EPYC Rome and Intel Broadwell servers nollama is

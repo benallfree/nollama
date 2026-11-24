@@ -3,7 +3,7 @@ package engine
 import (
 	"math"
 
-	"github.com/benallfree/nollama/engine/internal/benchhooks"
+	"github.com/benallfree/nollama/internal/benchhooks"
 )
 
 func init() {

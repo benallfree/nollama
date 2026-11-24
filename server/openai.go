@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/benallfree/nollama/catalog"
 	"github.com/benallfree/nollama/engine"
-	"github.com/benallfree/nollama/models"
-	"github.com/benallfree/nollama/schema"
+	"github.com/benallfree/nollama/engine/schema"
 )
 
 // OpenAI's API, the parts a local model answers: models, chat completions and (legacy) completions.
@@ -476,7 +476,7 @@ func (s *Server) openaiCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) openaiModels(w http.ResponseWriter, r *http.Request) {
-	local, err := models.Available(s.cfg.ModelsDir)
+	local, err := catalog.Available(s.cfg.ModelsDir)
 	if err != nil {
 		openaiError(w, err)
 		return

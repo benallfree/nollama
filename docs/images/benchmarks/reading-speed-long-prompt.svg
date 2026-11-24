@@ -1,0 +1,141 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 598" width="900" height="598" role="img" aria-label="Reading speed, long prompt: nollama and Ollama">
+<style>
+.bg{fill:#fcfcfb}.t1{fill:#0b0b0b}.t2{fill:#52514e}.grid{stroke:#e1e0d9}.axis{stroke:#c3c2b7}
+.n{fill:#2a78d6}.o{fill:#eb6834}.tie{fill:#8a8984}.link{stroke:#c3c2b7}.band{fill:#f0efec}.ring{stroke:#fcfcfb}
+@media (prefers-color-scheme: dark){.bg{fill:#1a1a19}.t1{fill:#f0efec}.t2{fill:#c3c2b7}.grid{stroke:#2c2c2a}
+.axis{stroke:#383835}.n{fill:#3987e5}.o{fill:#d95926}.tie{fill:#8a8984}.link{stroke:#55544f}.band{fill:#2c2c2a}.ring{stroke:#1a1a19}}
+text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+</style>
+<rect class="bg" width="900" height="598" rx="8"/>
+<text x="20.0" y="30.0" class="t1" text-anchor="start" font-size="17" font-weight="600">Reading speed, long prompt</text>
+<text x="20.0" y="52.0" class="t2" text-anchor="start" font-size="12">Prompt tokens read per second, for the 590-token prompt. Higher is better. Log scale.</text>
+<circle cx="20.0" cy="72.0" r="5" class="n"/><text x="30.0" y="76.0" class="t1" text-anchor="start" font-size="12">nollama</text>
+<circle cx="100.0" cy="72.0" r="5" class="o"/><text x="110.0" y="76.0" class="t1" text-anchor="start" font-size="12">Ollama</text>
+<line class="grid" x1="250.0" x2="250.0" y1="86.0" y2="566.0" stroke-width="1"/>
+<text x="250.0" y="582.0" class="t2" text-anchor="middle" font-size="11">2</text>
+<line class="grid" x1="371.4" x2="371.4" y1="86.0" y2="566.0" stroke-width="1"/>
+<text x="371.4" y="582.0" class="t2" text-anchor="middle" font-size="11">5</text>
+<line class="grid" x1="463.2" x2="463.2" y1="86.0" y2="566.0" stroke-width="1"/>
+<text x="463.2" y="582.0" class="t2" text-anchor="middle" font-size="11">10</text>
+<line class="grid" x1="555.0" x2="555.0" y1="86.0" y2="566.0" stroke-width="1"/>
+<text x="555.0" y="582.0" class="t2" text-anchor="middle" font-size="11">20</text>
+<line class="grid" x1="676.4" x2="676.4" y1="86.0" y2="566.0" stroke-width="1"/>
+<text x="676.4" y="582.0" class="t2" text-anchor="middle" font-size="11">50</text>
+<line class="grid" x1="768.2" x2="768.2" y1="86.0" y2="566.0" stroke-width="1"/>
+<text x="768.2" y="582.0" class="t2" text-anchor="middle" font-size="11">100</text>
+<line class="grid" x1="860.0" x2="860.0" y1="86.0" y2="566.0" stroke-width="1"/>
+<text x="860.0" y="582.0" class="t2" text-anchor="middle" font-size="11">200</text>
+<text x="20.0" y="106.0" class="t1" text-anchor="start" font-size="12" font-weight="600">vc2-1c-1gb (1 vCPU, Broadwell)</text>
+<text x="236.0" y="123.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q4_K_M</text>
+<line class="link" x1="399.9" x2="584.8" y1="119.0" y2="119.0" stroke-width="2"/>
+<text x="390.9" y="123.0" class="t2" text-anchor="end" font-size="10">6.2 tok/s</text>
+<text x="593.8" y="123.0" class="t2" text-anchor="start" font-size="10">25 tok/s</text>
+<circle class="o ring" cx="584.8" cy="119.0" r="5" stroke-width="1.5"><title>Ollama: 25 tok/s</title></circle>
+<circle class="n ring" cx="399.9" cy="119.0" r="5" stroke-width="1.5"><title>nollama: 6.2 tok/s</title></circle>
+<text x="20.0" y="144.0" class="t1" text-anchor="start" font-size="12" font-weight="600">vc2-2c-4gb (2 vCPU, Skylake)</text>
+<text x="236.0" y="161.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q4_K_M</text>
+<line class="link" x1="697.4" x2="743.0" y1="157.0" y2="157.0" stroke-width="2"/>
+<text x="688.4" y="161.0" class="t2" text-anchor="end" font-size="10">59 tok/s</text>
+<text x="752.0" y="161.0" class="t2" text-anchor="start" font-size="10">83 tok/s</text>
+<circle class="o ring" cx="743.0" cy="157.0" r="5" stroke-width="1.5"><title>Ollama: 83 tok/s</title></circle>
+<circle class="n ring" cx="697.4" cy="157.0" r="5" stroke-width="1.5"><title>nollama: 59 tok/s</title></circle>
+<text x="236.0" y="183.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q8_0</text>
+<line class="link" x1="671.7" x2="700.2" y1="179.0" y2="179.0" stroke-width="2"/>
+<text x="662.7" y="183.0" class="t2" text-anchor="end" font-size="10">48 tok/s</text>
+<text x="709.2" y="183.0" class="t2" text-anchor="start" font-size="10">60 tok/s</text>
+<circle class="o ring" cx="700.2" cy="179.0" r="5" stroke-width="1.5"><title>Ollama: 60 tok/s</title></circle>
+<circle class="n ring" cx="671.7" cy="179.0" r="5" stroke-width="1.5"><title>nollama: 48 tok/s</title></circle>
+<text x="236.0" y="205.0" class="t2" text-anchor="end" font-size="12">qwen3-1.7b Q4_K_M</text>
+<line class="link" x1="590.2" x2="635.2" y1="201.0" y2="201.0" stroke-width="2"/>
+<text x="581.2" y="205.0" class="t2" text-anchor="end" font-size="10">26 tok/s</text>
+<text x="644.2" y="205.0" class="t2" text-anchor="start" font-size="10">37 tok/s</text>
+<circle class="o ring" cx="635.2" cy="201.0" r="5" stroke-width="1.5"><title>Ollama: 37 tok/s</title></circle>
+<circle class="n ring" cx="590.2" cy="201.0" r="5" stroke-width="1.5"><title>nollama: 26 tok/s</title></circle>
+<text x="236.0" y="227.0" class="t2" text-anchor="end" font-size="12">qwen3-1.7b Q8_0</text>
+<line class="link" x1="547.8" x2="569.4" y1="223.0" y2="223.0" stroke-width="2"/>
+<text x="538.8" y="227.0" class="t2" text-anchor="end" font-size="10">19 tok/s</text>
+<text x="578.4" y="227.0" class="t2" text-anchor="start" font-size="10">22 tok/s</text>
+<circle class="o ring" cx="569.4" cy="223.0" r="5" stroke-width="1.5"><title>Ollama: 22 tok/s</title></circle>
+<circle class="n ring" cx="547.8" cy="223.0" r="5" stroke-width="1.5"><title>nollama: 19 tok/s</title></circle>
+<text x="236.0" y="249.0" class="t2" text-anchor="end" font-size="12">qwen3-4b Q4_K_M</text>
+<line class="link" x1="469.4" x2="505.5" y1="245.0" y2="245.0" stroke-width="2"/>
+<text x="460.4" y="249.0" class="t2" text-anchor="end" font-size="10">10 tok/s</text>
+<text x="514.5" y="249.0" class="t2" text-anchor="start" font-size="10">14 tok/s</text>
+<circle class="o ring" cx="505.5" cy="245.0" r="5" stroke-width="1.5"><title>Ollama: 14 tok/s</title></circle>
+<circle class="n ring" cx="469.4" cy="245.0" r="5" stroke-width="1.5"><title>nollama: 10 tok/s</title></circle>
+<text x="20.0" y="270.0" class="t1" text-anchor="start" font-size="12" font-weight="600">vhp-2c-4gb-amd (2 vCPU, AMD EPYC-Rome)</text>
+<text x="236.0" y="287.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q4_K_M</text>
+<line class="link" x1="471.4" x2="741.6" y1="283.0" y2="283.0" stroke-width="2"/>
+<text x="462.4" y="287.0" class="t2" text-anchor="end" font-size="10">11 tok/s</text>
+<text x="750.6" y="287.0" class="t2" text-anchor="start" font-size="10">82 tok/s</text>
+<circle class="o ring" cx="741.6" cy="283.0" r="5" stroke-width="1.5"><title>Ollama: 82 tok/s</title></circle>
+<circle class="n ring" cx="471.4" cy="283.0" r="5" stroke-width="1.5"><title>nollama: 11 tok/s</title></circle>
+<text x="236.0" y="309.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q8_0</text>
+<line class="link" x1="332.2" x2="712.9" y1="305.0" y2="305.0" stroke-width="2"/>
+<text x="323.2" y="309.0" class="t2" text-anchor="end" font-size="10">3.7 tok/s</text>
+<text x="721.9" y="309.0" class="t2" text-anchor="start" font-size="10">66 tok/s</text>
+<circle class="o ring" cx="712.9" cy="305.0" r="5" stroke-width="1.5"><title>Ollama: 66 tok/s</title></circle>
+<circle class="n ring" cx="332.2" cy="305.0" r="5" stroke-width="1.5"><title>nollama: 3.7 tok/s</title></circle>
+<text x="236.0" y="331.0" class="t2" text-anchor="end" font-size="12">qwen3-1.7b Q4_K_M</text>
+<line class="link" x1="322.8" x2="606.9" y1="327.0" y2="327.0" stroke-width="2"/>
+<text x="313.8" y="331.0" class="t2" text-anchor="end" font-size="10">3.5 tok/s</text>
+<text x="615.9" y="331.0" class="t2" text-anchor="start" font-size="10">30 tok/s</text>
+<circle class="o ring" cx="606.9" cy="327.0" r="5" stroke-width="1.5"><title>Ollama: 30 tok/s</title></circle>
+<circle class="n ring" cx="322.8" cy="327.0" r="5" stroke-width="1.5"><title>nollama: 3.5 tok/s</title></circle>
+<text x="20.0" y="352.0" class="t1" text-anchor="start" font-size="12" font-weight="600">vhp-2c-4gb-intel (2 vCPU, Cascadelake)</text>
+<text x="236.0" y="369.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q4_K_M</text>
+<line class="link" x1="720.2" x2="778.5" y1="365.0" y2="365.0" stroke-width="2"/>
+<text x="711.2" y="369.0" class="t2" text-anchor="end" font-size="10">70 tok/s</text>
+<text x="787.5" y="369.0" class="t2" text-anchor="start" font-size="10">108 tok/s</text>
+<circle class="o ring" cx="778.5" cy="365.0" r="5" stroke-width="1.5"><title>Ollama: 108 tok/s</title></circle>
+<circle class="n ring" cx="720.2" cy="365.0" r="5" stroke-width="1.5"><title>nollama: 70 tok/s</title></circle>
+<text x="236.0" y="391.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q8_0</text>
+<line class="link" x1="686.7" x2="728.5" y1="387.0" y2="387.0" stroke-width="2"/>
+<text x="677.7" y="391.0" class="t2" text-anchor="end" font-size="10">54 tok/s</text>
+<text x="737.5" y="391.0" class="t2" text-anchor="start" font-size="10">74 tok/s</text>
+<circle class="o ring" cx="728.5" cy="387.0" r="5" stroke-width="1.5"><title>Ollama: 74 tok/s</title></circle>
+<circle class="n ring" cx="686.7" cy="387.0" r="5" stroke-width="1.5"><title>nollama: 54 tok/s</title></circle>
+<text x="236.0" y="413.0" class="t2" text-anchor="end" font-size="12">qwen3-1.7b Q4_K_M</text>
+<line class="link" x1="606.7" x2="663.2" y1="409.0" y2="409.0" stroke-width="2"/>
+<text x="597.7" y="413.0" class="t2" text-anchor="end" font-size="10">30 tok/s</text>
+<text x="672.2" y="413.0" class="t2" text-anchor="start" font-size="10">45 tok/s</text>
+<circle class="o ring" cx="663.2" cy="409.0" r="5" stroke-width="1.5"><title>Ollama: 45 tok/s</title></circle>
+<circle class="n ring" cx="606.7" cy="409.0" r="5" stroke-width="1.5"><title>nollama: 30 tok/s</title></circle>
+<text x="236.0" y="435.0" class="t2" text-anchor="end" font-size="12">qwen3-1.7b Q8_0</text>
+<line class="link" x1="556.4" x2="610.1" y1="431.0" y2="431.0" stroke-width="2"/>
+<text x="547.4" y="435.0" class="t2" text-anchor="end" font-size="10">20 tok/s</text>
+<text x="619.1" y="435.0" class="t2" text-anchor="start" font-size="10">30 tok/s</text>
+<circle class="o ring" cx="610.1" cy="431.0" r="5" stroke-width="1.5"><title>Ollama: 30 tok/s</title></circle>
+<circle class="n ring" cx="556.4" cy="431.0" r="5" stroke-width="1.5"><title>nollama: 20 tok/s</title></circle>
+<text x="236.0" y="457.0" class="t2" text-anchor="end" font-size="12">qwen3-4b Q4_K_M</text>
+<line class="link" x1="485.4" x2="542.7" y1="453.0" y2="453.0" stroke-width="2"/>
+<text x="476.4" y="457.0" class="t2" text-anchor="end" font-size="10">12 tok/s</text>
+<text x="551.7" y="457.0" class="t2" text-anchor="start" font-size="10">18 tok/s</text>
+<circle class="o ring" cx="542.7" cy="453.0" r="5" stroke-width="1.5"><title>Ollama: 18 tok/s</title></circle>
+<circle class="n ring" cx="485.4" cy="453.0" r="5" stroke-width="1.5"><title>nollama: 12 tok/s</title></circle>
+<text x="20.0" y="478.0" class="t1" text-anchor="start" font-size="12" font-weight="600">vhp-4c-8gb-amd (4 vCPU, AMD EPYC-Rome)</text>
+<text x="236.0" y="495.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q4_K_M</text>
+<line class="link" x1="560.7" x2="820.4" y1="491.0" y2="491.0" stroke-width="2"/>
+<text x="551.7" y="495.0" class="t2" text-anchor="end" font-size="10">21 tok/s</text>
+<text x="829.4" y="495.0" class="t2" text-anchor="start" font-size="10">148 tok/s</text>
+<circle class="o ring" cx="820.4" cy="491.0" r="5" stroke-width="1.5"><title>Ollama: 148 tok/s</title></circle>
+<circle class="n ring" cx="560.7" cy="491.0" r="5" stroke-width="1.5"><title>nollama: 21 tok/s</title></circle>
+<text x="236.0" y="517.0" class="t2" text-anchor="end" font-size="12">qwen3-0.6b Q8_0</text>
+<line class="link" x1="423.3" x2="792.0" y1="513.0" y2="513.0" stroke-width="2"/>
+<text x="414.3" y="517.0" class="t2" text-anchor="end" font-size="10">7.4 tok/s</text>
+<text x="801.0" y="517.0" class="t2" text-anchor="start" font-size="10">120 tok/s</text>
+<circle class="o ring" cx="792.0" cy="513.0" r="5" stroke-width="1.5"><title>Ollama: 120 tok/s</title></circle>
+<circle class="n ring" cx="423.3" cy="513.0" r="5" stroke-width="1.5"><title>nollama: 7.4 tok/s</title></circle>
+<text x="236.0" y="539.0" class="t2" text-anchor="end" font-size="12">qwen3-1.7b Q4_K_M</text>
+<line class="link" x1="412.6" x2="696.2" y1="535.0" y2="535.0" stroke-width="2"/>
+<text x="403.6" y="539.0" class="t2" text-anchor="end" font-size="10">6.8 tok/s</text>
+<text x="705.2" y="539.0" class="t2" text-anchor="start" font-size="10">58 tok/s</text>
+<circle class="o ring" cx="696.2" cy="535.0" r="5" stroke-width="1.5"><title>Ollama: 58 tok/s</title></circle>
+<circle class="n ring" cx="412.6" cy="535.0" r="5" stroke-width="1.5"><title>nollama: 6.8 tok/s</title></circle>
+<text x="236.0" y="561.0" class="t2" text-anchor="end" font-size="12">qwen3-1.7b Q8_0</text>
+<line class="link" x1="272.0" x2="679.0" y1="557.0" y2="557.0" stroke-width="2"/>
+<text x="263.0" y="561.0" class="t2" text-anchor="end" font-size="10">2.4 tok/s</text>
+<text x="688.0" y="561.0" class="t2" text-anchor="start" font-size="10">51 tok/s</text>
+<circle class="o ring" cx="679.0" cy="557.0" r="5" stroke-width="1.5"><title>Ollama: 51 tok/s</title></circle>
+<circle class="n ring" cx="272.0" cy="557.0" r="5" stroke-width="1.5"><title>nollama: 2.4 tok/s</title></circle>
+</svg>

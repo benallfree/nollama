@@ -9,9 +9,9 @@ import (
 	"os"
 	"time"
 
+	"github.com/benallfree/nollama/catalog"
 	"github.com/benallfree/nollama/engine"
-	"github.com/benallfree/nollama/models"
-	"github.com/benallfree/nollama/schema"
+	"github.com/benallfree/nollama/engine/schema"
 )
 
 // Ollama's API: https://github.com/ollama/ollama/blob/main/docs/api.md
@@ -449,7 +449,7 @@ type ollamaDetails struct {
 }
 
 func (s *Server) tags(w http.ResponseWriter, r *http.Request) {
-	local, err := models.Available(s.cfg.ModelsDir)
+	local, err := catalog.Available(s.cfg.ModelsDir)
 	if err != nil {
 		ollamaError(w, err)
 		return
@@ -597,7 +597,7 @@ func (s *Server) pullModel(w http.ResponseWriter, r *http.Request) {
 		nd.send(map[string]any{"status": "pulling " + src.Name, "digest": src.SHA256, "total": total, "completed": done})
 	}
 	s.pull.Lock()
-	err = models.Fetch(src, s.cfg.Client, progress)
+	err = catalog.Fetch(src, s.cfg.Client, progress)
 	s.pull.Unlock()
 	if err != nil {
 		if stream {

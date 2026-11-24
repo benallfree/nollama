@@ -5,7 +5,7 @@ known=$(curl -s -m 10 "https://proxy.golang.org/$module/@v/list" || true)
 # Cuts a nollama release as a draft on GitHub. Run from a clean checkout of main, in sync with origin:
 #
 #   1. In CHANGELOG.md, rename "## Unreleased" to "## vX.Y.Z" (and add a new empty Unreleased above it); commit, push.
-#   2. ./release.sh vX.Y.Z
+#   2. release/release.sh vX.Y.Z
 #   3. Publish the draft on GitHub (brew and scoop installs fail until you do).
 #
 # It vets and tests, tags, pushes the tag, and runs goreleaser: zips, Linux packages, checksums, the Homebrew formula
@@ -16,7 +16,7 @@ set -euo pipefail
 
 repo=benallfree/nollama
 module=github.com/benallfree/nollama
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 step() { echo "$(date +%T) $*" >&2; }
 die() { echo "release: $*" >&2; exit 1; }
