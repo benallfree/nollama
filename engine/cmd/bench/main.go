@@ -6,6 +6,7 @@
 //	bench run     -gguf FILE -threads N -prompt short|long -gen 128   (one engine run, JSON)
 //	bench vps     -models name:QUANT=spec,... [-ollama] [-json out.json]   (cold/warm first token, peak RAM; see vps.go)
 //	bench vpstable FILE.json...                                (markdown table from saved vps reports)
+//	bench report FILE.json...                                  (one table per metric, nollama vs Ollama, from saved vps reports)
 package main
 
 import (
@@ -49,6 +50,8 @@ func main() {
 		err = cmdVPSRun(os.Args[2:])
 	case "vpstable":
 		err = cmdVPSTable(os.Args[2:])
+	case "report":
+		err = cmdReport(os.Args[2:])
 	case "compare":
 		err = cmdCompare(os.Args[2:])
 	case "bench":

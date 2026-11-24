@@ -1,0 +1,291 @@
+{
+  "system": {
+    "host": "nollama-bench-vc2-2c-4gb",
+    "os": "linux",
+    "arch": "amd64",
+    "cpu": "Intel Xeon Processor (Skylake, IBRS)",
+    "cpu_flags": "fma f16c avx2 avx512f avx512bw avx512vl",
+    "vcpus": 2,
+    "ram_mb": 3910,
+    "swap_mb": 7899,
+    "disk": "/dev/vda2 vda2 79.5G 1 part └─vda 80G 1 disk",
+    "kernel": "6.8.0-149-generic",
+    "uptime": "19:00:09 up 23 min,  1 user,  load average: 1.76, 2.02, 1.68",
+    "nollama": "36325534d761",
+    "ollama": "ollama version is 0.40.17",
+    "threads": 2,
+    "gen_tokens": 128,
+    "runs": 3,
+    "truly_cold": true,
+    "started_at": "2026-11-21T19:00:09Z",
+    "duration_s": 2288.995264367,
+    "label": "vc2-2c-4gb"
+  },
+  "rows": [
+    {
+      "model": "qwen3-0.6b",
+      "quant": "Q4_K_M",
+      "engine": "nollama",
+      "file": "/root/bench/models/qwen3-0.6b-Q4_K_M.gguf",
+      "file_mb": 498,
+      "kernels": "avx2+fma",
+      "cold_first_token_s": 1.346144124,
+      "cold_load_s": 0.230184772,
+      "warm_first_token_s": 0.640432463,
+      "warm_load_s": 0.116040611,
+      "short": {
+        "prompt_tokens": 35,
+        "out_tokens": 128,
+        "first_token_s": 0.512090544,
+        "prefill_tok_s": 69.1642533299026,
+        "decode_tok_s": 17.86773037675787
+      },
+      "long": {
+        "prompt_tokens": 590,
+        "out_tokens": 128,
+        "first_token_s": 10.097670442,
+        "prefill_tok_s": 58.604228724383404,
+        "decode_tok_s": 11.057358413852514
+      },
+      "peak_rss_mb": 1377
+    },
+    {
+      "model": "qwen3-0.6b",
+      "quant": "Q4_K_M",
+      "engine": "ollama",
+      "file": "/root/bench/models/qwen3-0.6b-Q4_K_M.gguf",
+      "file_mb": 498,
+      "cold_first_token_s": 4.322385637,
+      "cold_load_s": 3.907210619,
+      "warm_first_token_s": 3.281351431,
+      "warm_load_s": 2.890547467,
+      "short": {
+        "prompt_tokens": 35,
+        "out_tokens": 128,
+        "first_token_s": 0.438297647,
+        "prefill_tok_s": 85.90980942749704,
+        "decode_tok_s": 16.79999695500055
+      },
+      "long": {
+        "prompt_tokens": 590,
+        "out_tokens": 128,
+        "first_token_s": 7.239278796,
+        "prefill_tok_s": 82.68120286295576,
+        "decode_tok_s": 10.080449865276362
+      },
+      "peak_rss_mb": 3092
+    },
+    {
+      "model": "qwen3-0.6b",
+      "quant": "Q8_0",
+      "engine": "nollama",
+      "file": "/root/bench/models/qwen3-0.6b-Q8_0.gguf",
+      "file_mb": 609,
+      "kernels": "avx2+fma",
+      "cold_first_token_s": 1.744311186,
+      "cold_load_s": 0.214120018,
+      "warm_first_token_s": 0.896510653,
+      "warm_load_s": 0.123986861,
+      "short": {
+        "prompt_tokens": 35,
+        "out_tokens": 128,
+        "first_token_s": 0.801686861,
+        "prefill_tok_s": 44.817964359556186,
+        "decode_tok_s": 10.801296399115865
+      },
+      "long": {
+        "prompt_tokens": 590,
+        "out_tokens": 128,
+        "first_token_s": 12.251042424,
+        "prefill_tok_s": 48.27619471875156,
+        "decode_tok_s": 8.103110330211406
+      },
+      "peak_rss_mb": 1484
+    },
+    {
+      "model": "qwen3-0.6b",
+      "quant": "Q8_0",
+      "engine": "ollama",
+      "file": "/root/bench/models/qwen3-0.6b-Q8_0.gguf",
+      "file_mb": 609,
+      "cold_first_token_s": 4.361353741,
+      "cold_load_s": 3.657847568,
+      "warm_first_token_s": 3.290852484,
+      "warm_load_s": 2.629129026,
+      "short": {
+        "prompt_tokens": 35,
+        "out_tokens": 128,
+        "first_token_s": 0.757356663,
+        "prefill_tok_s": 48.93359710872346,
+        "decode_tok_s": 13.242077487464769
+      },
+      "long": {
+        "prompt_tokens": 590,
+        "out_tokens": 128,
+        "first_token_s": 9.975462457,
+        "prefill_tok_s": 59.855296270528086,
+        "decode_tok_s": 8.780122077994235
+      },
+      "peak_rss_mb": 2969
+    },
+    {
+      "model": "qwen3-1.7b",
+      "quant": "Q4_K_M",
+      "engine": "nollama",
+      "file": "/root/bench/models/qwen3-1.7b-Q4_K_M.gguf",
+      "file_mb": 1296,
+      "kernels": "avx2+fma",
+      "cold_first_token_s": 3.044795122,
+      "cold_load_s": 0.216010251,
+      "warm_first_token_s": 1.5539740979999999,
+      "warm_load_s": 0.138680939,
+      "short": {
+        "prompt_tokens": 35,
+        "out_tokens": 128,
+        "first_token_s": 1.349069343,
+        "prefill_tok_s": 26.21653287205179,
+        "decode_tok_s": 8.10173867323245
+      },
+      "long": {
+        "prompt_tokens": 590,
+        "out_tokens": 128,
+        "first_token_s": 22.645686403,
+        "prefill_tok_s": 26.09357552886607,
+        "decode_tok_s": 6.486955310439582
+      },
+      "peak_rss_mb": 2183
+    },
+    {
+      "model": "qwen3-1.7b",
+      "quant": "Q4_K_M",
+      "engine": "ollama",
+      "file": "/root/bench/models/qwen3-1.7b-Q4_K_M.gguf",
+      "file_mb": 1296,
+      "cold_first_token_s": 10.351165931,
+      "cold_load_s": 9.082032614,
+      "warm_first_token_s": 5.620051277,
+      "warm_load_s": 4.411832212,
+      "short": {
+        "prompt_tokens": 35,
+        "out_tokens": 128,
+        "first_token_s": 1.188605552,
+        "prefill_tok_s": 30.200427292902724,
+        "decode_tok_s": 7.574800414813517
+      },
+      "long": {
+        "prompt_tokens": 590,
+        "out_tokens": 128,
+        "first_token_s": 16.211127991,
+        "prefill_tok_s": 36.63633716110612,
+        "decode_tok_s": 6.099481301063202
+      },
+      "peak_rss_mb": 2360
+    },
+    {
+      "model": "qwen3-1.7b",
+      "quant": "Q8_0",
+      "engine": "nollama",
+      "file": "/root/bench/models/qwen3-1.7b-Q8_0.gguf",
+      "file_mb": 1749,
+      "kernels": "avx2+fma",
+      "cold_first_token_s": 4.320717413,
+      "cold_load_s": 0.219405576,
+      "warm_first_token_s": 2.2123603960000002,
+      "warm_load_s": 0.116646933,
+      "short": {
+        "prompt_tokens": 35,
+        "out_tokens": 128,
+        "first_token_s": 2.220938623,
+        "prefill_tok_s": 15.759521899980065,
+        "decode_tok_s": 4.216172095847791
+      },
+      "long": {
+        "prompt_tokens": 590,
+        "out_tokens": 128,
+        "first_token_s": 31.17456636,
+        "prefill_tok_s": 18.947712441331348,
+        "decode_tok_s": 3.7870326983811693
+      },
+      "peak_rss_mb": 2747
+    },
+    {
+      "model": "qwen3-1.7b",
+      "quant": "Q8_0",
+      "engine": "ollama",
+      "file": "/root/bench/models/qwen3-1.7b-Q8_0.gguf",
+      "file_mb": 1749,
+      "cold_first_token_s": 8.132816124,
+      "cold_load_s": 6.441005304,
+      "warm_first_token_s": 6.22967095,
+      "warm_load_s": 4.650700227,
+      "short": {
+        "prompt_tokens": 35,
+        "out_tokens": 128,
+        "first_token_s": 1.888843235,
+        "prefill_tok_s": 18.867497339682874,
+        "decode_tok_s": 5.25240385700429
+      },
+      "long": {
+        "prompt_tokens": 590,
+        "out_tokens": 128,
+        "first_token_s": 26.538796083,
+        "prefill_tok_s": 22.303015420607277,
+        "decode_tok_s": 4.512055560324156
+      },
+      "peak_rss_mb": 2528
+    },
+    {
+      "model": "qwen3-4b",
+      "quant": "Q4_K_M",
+      "engine": "nollama",
+      "file": "/root/bench/models/qwen3-4b-Q4_K_M.gguf",
+      "file_mb": 2381,
+      "kernels": "avx2+fma",
+      "cold_first_token_s": 6.166084684,
+      "cold_load_s": 0.225277206,
+      "warm_first_token_s": 3.52747512,
+      "warm_load_s": 0.135496102,
+      "short": {
+        "prompt_tokens": 35,
+        "out_tokens": 128,
+        "first_token_s": 3.212524957,
+        "prefill_tok_s": 10.895027312396886,
+        "decode_tok_s": 3.99265317460193
+      },
+      "long": {
+        "prompt_tokens": 590,
+        "out_tokens": 128,
+        "first_token_s": 56.325618912,
+        "prefill_tok_s": 10.484062865443434,
+        "decode_tok_s": 3.368021604342505
+      },
+      "peak_rss_mb": 3614
+    },
+    {
+      "model": "qwen3-4b",
+      "quant": "Q4_K_M",
+      "engine": "ollama",
+      "file": "/root/bench/models/qwen3-4b-Q4_K_M.gguf",
+      "file_mb": 2381,
+      "cold_first_token_s": 15.064330884,
+      "cold_load_s": 11.488477251,
+      "warm_first_token_s": 14.12451664,
+      "warm_load_s": 11.21595853,
+      "short": {
+        "prompt_tokens": 35,
+        "out_tokens": 128,
+        "first_token_s": 2.782746917,
+        "prefill_tok_s": 12.807292692012421,
+        "decode_tok_s": 3.7454540283265176
+      },
+      "long": {
+        "prompt_tokens": 590,
+        "out_tokens": 128,
+        "first_token_s": 42.987883796,
+        "prefill_tok_s": 13.759469546795723,
+        "decode_tok_s": 2.919029141853779
+      },
+      "peak_rss_mb": 3379
+    }
+  ]
+}

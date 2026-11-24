@@ -1,167 +1,168 @@
 # nollama
 
-An embeddable, Ollama-compatible LLM engine, in Go.
+nollama is an Ollama-compatible model server written in pure Go, which you can embed in your own Go application. The
+`nollama` command line tool is meant to work as a drop-in replacement for the basic uses of Ollama: it serves Ollama's
+HTTP API on the same address, it runs and pulls models with the same commands, and Ollama's own clients work with it.
+The more important part of the project is the engine underneath. Because it is a Go library with no cgo, you can
+compile it into your application and call it directly, instead of asking your users to install and run Ollama next to
+it.
 
-If your app or tool wants a local model, the usual answer is "first install Ollama", and your users now have two
-programs to install, update and keep running. nollama is an inference engine written in Go, plus an HTTP server that
-speaks Ollama's API and OpenAI's. Ship it as one binary, or compile it into your own Go program. Your end users install
-nothing else: no Ollama, no Python, no cgo.
+The engine runs models on the CPU, with hand-written assembly kernels for ARM64 and x86-64, and on the GPU, through
+Metal on Apple Silicon and CUDA on NVIDIA cards. It uses a GPU when it finds one that works and falls back to the CPU
+when it does not, with nothing extra to install in either case.
 
-> nollama is alpha. Today it runs Qwen3 models on the CPU, with hand-tuned assembly for ARM64 and x86-64, and on the
-> GPU (Metal on Apple Silicon, CUDA on NVIDIA): good for small models doing short, focused jobs, such as labeling a
-> ticket, pulling JSON out of an email or summarizing a record. It also calls tools and makes embeddings (with
-> Qwen3-Embedding). More model families and images aren't there yet.
+## Who it is for
+
+### Applications that want a local model without a separate server
+
+Instead of asking your users to install Ollama and making HTTP calls to it, you can compile nollama into your
+application and make Go function calls into it. Your users install one program, the model loads in milliseconds
+because the file is memory-mapped, and nothing listens on a port unless you want it to. You can also build the model
+file into your binary.
+
+### Applications that need control over inference
+
+Some applications do not fit well behind an HTTP API. A program that scores thousands of candidate answers, explores
+several continuations of the same prompt, steers each token with its own rules, or needs every machine to compute the
+same probabilities spends most of its time working around a server that only answers "what comes next?". nollama lets
+you do that work in your own process:
+
+- the model's logits after every token, and the log-probability of any token or sequence (`Score`);
+- a probability for each of a set of labels, without generating text (`Classify`);
+- output held to a JSON schema or a tool's parameters, token by token;
+- conversation state you can save, reload, rewind and fork, so several branches share the work of reading the same
+  prompt (`engine.State`, experimental);
+- decoding middleware for writing your own sampling and search strategies, with best-of-N and beam search built on it
+  in the `compose` package (experimental);
+- a deterministic mode in which the CPU, Metal and CUDA kernels produce the same logits, bit for bit, on every
+  machine;
+- integer models, whose forward pass uses integer arithmetic only, so that other implementations of the same
+  specification can match nollama exactly.
+
+### A custom inference service on a GPU machine
+
+nollama works best when your application runs on a machine with a supported GPU. If your application cannot run
+there, you can build a small service of your own with nollama, run it on a dedicated GPU machine, and give it the API
+your application needs.
+
+## Privacy
+
+When nollama is embedded in your application, the prompts, the answers and the model's state never leave your
+process. There is no separate server holding your users' conversations, no port that another program on the machine
+can query unless you open one, and no telemetry. The only network requests nollama makes are model downloads from
+Hugging Face, which you can avoid entirely by shipping the model file with your application or building it into the
+binary. This makes nollama suitable for applications that handle private data, that must work offline, or that run
+where outbound connections are not allowed.
+
+When you run `nollama serve`, it listens on `127.0.0.1` only and refuses requests from web pages served by other
+sites and requests that rely on DNS rebinding. It will not listen on a network address without an API key. The
+guide's [Security](docs/guide.md#security) section describes these protections in detail.
 
 ## Install
 
-macOS or Linux, with Homebrew:
+The `nollama` command line tool installs with Homebrew on macOS and Linux:
 
 ```bash
 brew install benallfree/tap/nollama
 ```
 
-Windows, with [Scoop](https://scoop.sh):
+On Windows it installs with [Scoop](https://scoop.sh):
 
 ```powershell
 scoop bucket add nollama https://github.com/benallfree/nollama
 scoop install nollama
 ```
 
-macOS or Linux, without Homebrew:
+Without Homebrew on macOS or Linux, you can use the install script, which on Linux also sets up a systemd service:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/benallfree/nollama/main/install.sh | sh
 ```
 
-On Linux the script installs a `.deb`, `.rpm` or `.apk` package that adds a `nollama` systemd service (settings in
-`/etc/nollama/nollama.env`); on macOS it puts `nollama` in `/usr/local/bin`. The zips and packages are also on the
-[releases page](https://github.com/benallfree/nollama/releases), for Linux, macOS and Windows on x86-64 and ARM64, and
-Linux on ARMv7, ppc64le and s390x.
-
-With Go: `go install github.com/benallfree/nollama/cmd/nollama@latest`.
-
-## Use it
-
-Chat in the terminal (the first run downloads the model and checks its SHA-256):
+Archives and Linux packages for every supported platform are on the
+[releases page](https://github.com/benallfree/nollama/releases). To embed the engine, add the Go module:
 
 ```bash
-nollama run qwen3-1.7b
-nollama run qwen3-1.7b "Write a title for a post about sourdough starters."
+go get github.com/benallfree/nollama
 ```
 
-Run the server. It listens on `127.0.0.1:11434`, Ollama's address, so tools that talk to Ollama work unchanged:
+## Using it in place of Ollama
+
+`nollama serve` listens on `127.0.0.1:11434`, the address Ollama uses, so programs written for Ollama find it without
+any changes. The `ollama` command line tool works against it as well.
 
 ```bash
 nollama serve
+nollama run qwen3:1.7b "Write a title for a post about sourdough starters."
 ```
 
-```bash
-curl http://127.0.0.1:11434/api/chat -d '{
-  "model": "qwen3:1.7b",
-  "messages": [{"role": "user", "content": "Label this ticket: I was charged twice."}],
-  "format": {"type": "object", "properties": {"label": {"enum": ["bug", "billing", "question"]}}, "required": ["label"]},
-  "stream": false
-}'
-```
+### Command line
 
-nollama also has an endpoint of its own, `/api/classify`, which returns a probability for each label instead of
-generating text (see [Classify](#classify)):
+| Ollama command | nollama | Notes |
+|---|---|---|
+| `ollama serve` | Yes | The same address and the same `keep_alive` behavior. |
+| `ollama run` | Yes | Interactive chat or a single prompt. |
+| `ollama pull` | Partly | Pulls nollama's catalog models and `hf:` files from Hugging Face, not from Ollama's registry. |
+| `ollama list` | Yes | |
+| `ollama rm` | Yes | |
+| `ollama ps` | No | `ollama ps` itself works against `nollama serve`. |
+| `ollama show` | No | `ollama show` itself works against `nollama serve`. |
+| `ollama stop` | No | |
+| `ollama create`, `cp`, `push` | No | nollama has no Modelfiles. |
 
-```bash
-curl http://127.0.0.1:11434/api/classify -d '{
-  "model": "qwen3:1.7b",
-  "system": "Label the support ticket: bug, feature request or billing question.",
-  "prompt": "I was charged twice this month.",
-  "labels": ["bug", "feature request", "billing question"],
-  "complete": true
-}'
-```
+### HTTP API
 
-It answers `{"label": "billing question", "labels": [{"label": "bug", "probability": 0.000004, "logprob": ..., "tokens": 2}, ...]}`,
-each label's probability, log-probability and token count, in the order given. `prompt` is the user's turn in the chat template (with `system`), or `messages` gives
-the whole conversation; `raw: true` sends `prompt` as is. `normalize`, `options.num_ctx` and `keep_alive` work too.
+| Endpoint | nollama | Notes |
+|---|---|---|
+| `POST /api/chat` | Yes | Streaming, `format` (JSON or a schema), `tools`, `keep_alive`. `think` is ignored, and `images` are refused. |
+| `POST /api/generate` | Yes | `raw`, `system`, `context`, `suffix`, `format`, `keep_alive`. `images` are refused. |
+| `POST /api/embed` | Yes | `input`, `truncate`, `dimensions`. |
+| `POST /api/embeddings` | Yes | The older embeddings endpoint. |
+| `GET /api/tags` | Yes | |
+| `POST /api/show` | Yes | `modelfile`, `parameters` and `template` are empty. |
+| `GET /api/ps` | Yes | It reports models on the GPU as running on the CPU. |
+| `POST /api/pull` | Partly | nollama's catalog models and `hf:` files only. |
+| `DELETE /api/delete` | Yes | |
+| `GET /api/version` | Yes | |
+| `POST /api/create`, `/api/copy`, `/api/push` | No | Each answers 501. |
+| `HEAD`/`POST /api/blobs/:digest` | No | |
+| `options` | Partly | `temperature`, `top_p`, `top_k`, `num_predict`, `num_ctx`, `seed` and `stop` are used. Others, such as `repeat_penalty` and `min_p`, are ignored. |
+| `POST /v1/chat/completions` | Yes | OpenAI's API, with streaming, `response_format`, `tools` and `tool_choice`. |
+| `POST /v1/completions` | Yes | |
+| `POST /v1/embeddings` | Yes | Text or token ids, `dimensions`, `encoding_format`. |
+| `GET /v1/models` | Yes | |
 
-Or with any OpenAI client:
+nollama also has an endpoint of its own, `/api/classify`, which returns a probability for each of a set of labels.
+The [guide](docs/guide.md) documents every endpoint and option. The server holds one model at a time and switches
+models on demand.
 
-```python
-from openai import OpenAI
+## Supported models
 
-client = OpenAI(base_url="http://127.0.0.1:11434/v1", api_key="unused")
-r = client.chat.completions.create(model="qwen3-1.7b", messages=[{"role": "user", "content": "Say hi in French."}])
-print(r.choices[0].message.content)
-```
+The goal is to run every model in Ollama's library. This table shows where nollama stands today.
 
-Embeddings, for search and similarity (Ollama's `/api/embed` and OpenAI's `/v1/embeddings`; pull the model first with
-`nollama pull qwen3-embedding-0.6b`):
+| Model family | nollama | Ollama |
+|---|---|---|
+| Qwen3, dense | Yes for 0.6B, 1.7B and 4B, which download by name. The larger sizes (8B, 14B, 32B) share the architecture and load from a GGUF file, but are untested. | Yes |
+| Qwen3-Embedding | Yes. 0.6B downloads by name. | Yes |
+| Qwen3, mixture of experts (30B-A3B, 235B-A22B) | No | Yes |
+| Qwen2.5 and Qwen2.5-Coder | Only as integer models (see the [guide](docs/guide.md#integer-models-the-same-distribution-on-every-machine)) | Yes |
+| Llama 3.1, 3.2 and 3.3 | No | Yes |
+| Gemma 3 | No | Yes |
+| Mistral and Mistral Small | No | Yes |
+| Phi-4 | No | Yes |
+| DeepSeek-R1 | No | Yes |
+| gpt-oss | No | Yes |
+| nomic-embed-text | No | Yes |
+| Vision models (images as input) | No | Yes |
 
-```bash
-curl http://127.0.0.1:11434/api/embed -d '{
-  "model": "qwen3-embedding:0.6b",
-  "input": ["The capital of China is Beijing.", "Gravity is a force that attracts two bodies towards each other."]
-}'
-```
+nollama runs Qwen3 weights in Q8_0, Q4_K_M, F16 and BF16. The models it downloads by name come from Qwen's own Hugging
+Face repositories and are checked against their SHA-256. Ollama's spellings of their names, such as `qwen3:1.7b`, work
+as well. The engine also contains an early, experimental Whisper speech recognizer, which the server does not expose
+yet.
 
-Vectors are unit length, so a dot product is the cosine similarity. For retrieval, Qwen3-Embedding wants an instruction
-on queries (not on documents): `Instruct: Given a web search query, retrieve relevant passages that answer the
-query\nQuery:<the query>`. `dimensions` keeps the first n values (32 to 1024).
+## Using the engine from Go
 
-### Tool calls
-
-Pass `tools` (and `tool_choice`: `auto`, `none`, `required` or a named function) on `/v1/chat/completions` or
-`/api/chat`. The model decides between answering and calling a tool; once it starts a call, nollama holds the rest of it
-to a tool you listed and to that tool's parameter schema, token by token. A call always parses, and its arguments match
-the schema. `required` or a named function makes the answer a call from the first token. Several calls in one answer
-come back as several entries in `tool_calls`.
-
-```python
-tools = [{"type": "function", "function": {
-    "name": "get_weather",
-    "description": "Current weather in a city",
-    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
-}}]
-messages = [{"role": "user", "content": "What's the weather in Paris?"}]
-r = client.chat.completions.create(model="qwen3-1.7b", messages=messages, tools=tools)
-call = r.choices[0].message.tool_calls[0]  # finish_reason is "tool_calls"
-print(call.function.name, call.function.arguments)  # get_weather {"city": "Paris"}
-
-messages += [r.choices[0].message, {"role": "tool", "tool_call_id": call.id, "content": '{"temp_c": 18, "sky": "sunny"}'}]
-r = client.chat.completions.create(model="qwen3-1.7b", messages=messages, tools=tools)
-print(r.choices[0].message.content)  # It's 18°C and sunny in Paris.
-```
-
-Other commands: `nollama pull <model>`, `nollama list`, `nollama rm <model>`, and `nollama bundle` to
-[ship a model inside the binary](#ship-the-model-inside-the-binary). `nollama serve --help` lists the server's
-flags (threads, answers at once, how long an idle model stays loaded, context window, KV cache type). `NOLLAMA_HOST`
-sets the address, `NOLLAMA_MODELS` the models folder, `NOLLAMA_KV_CACHE_TYPE` the KV cache's format and
-`NOLLAMA_KEEP_ALIVE` how long an idle model stays loaded (see [Loading and keep_alive](#loading-and-keep_alive)).
-
-## Context limits
-
-nollama never cuts a prompt to make it fit. Ollama's default context window quietly drops the start of a long prompt,
-and the model then seems to ignore its instructions. Here, a prompt that doesn't fit the context window (`num_ctx`,
-default 4096, `--num-ctx` on the server) is an HTTP 400 that gives the token counts and the limit, in each API's error
-shape. An answer that reaches `num_predict`/`max_tokens` or the end of the window ends with `done_reason: "length"`
-(Ollama) or `finish_reason: "length"` (OpenAI). Token counts are always in the answer: `prompt_eval_count` and
-`eval_count` on Ollama, `usage` on OpenAI (when streaming, with `stream_options.include_usage`).
-
-To drop old turns instead, send `"truncate": true` with a chat (`/api/chat` or `/v1/chat/completions`), or start the
-server with `--truncate` (a request can still send `"truncate": false`). nollama then keeps the system prompt and the
-most recent messages, leaving `max_tokens` (or a quarter of the window, at most 1024) for the answer. It says what it
-dropped in the answer, `"truncated": {"messages": 6, "tokens": 1840, "prompt_tokens": 5012}`, and in the server log.
-
-## Embed it in a Go program
-
-Mount the server in your own HTTP server:
-
-```go
-import "github.com/benallfree/nollama/server"
-
-srv := server.New(server.Config{ModelsDir: "./models"})
-defer srv.Close()
-mux.Handle("/llm/", http.StripPrefix("/llm", srv.Handler()))
-```
-
-Or call the engine directly, with no HTTP at all:
+The simplest use loads a model and generates text. Here the answer is held to a JSON schema, so it always parses:
 
 ```go
 import (
@@ -171,612 +172,77 @@ import (
 )
 
 src, _ := models.Resolve("qwen3-1.7b", models.DefaultDir())
-_ = models.Fetch(src, nil, nil) // downloads once, checks the SHA-256
-m, _ := engine.Load(src.Path, engine.LoadOptions{}) // a downloaded file, or a model built into the binary
+_ = models.Fetch(src, nil, nil) // downloads the model once and checks its SHA-256
+m, _ := engine.Load(src.Path, engine.LoadOptions{})
 defer m.Close()
 
 label, _ := schema.Compile([]byte(`{"type":"object","properties":{"label":{"enum":["bug","billing","question"]}},"required":["label"]}`))
 res, _ := m.Generate(ctx, m.ChatPrompt([]engine.Message{{Role: "user", Content: "I was charged twice."}}),
 	engine.GenerateOptions{MaxTokens: 30, Constraint: label.Fit}, nil)
-fmt.Println(res.Text) // {"label": "billing"}
+fmt.Println(res.Text) // a JSON object whose label is one of the three
 ```
 
-Embeddings work the same way, with an embedding model:
+Going a layer lower, the experimental `engine.State` API lets you drive the model one step at a time. This example
+reads a prompt once, then forks the state to measure how likely the model finds each of several answers, without
+reading the prompt again for each one:
 
 ```go
-es, _ := m.Embed(ctx, []string{engine.EmbedQuery("", "What is the capital of China?"), "The capital of China is Beijing."},
-	engine.EmbedOptions{})
-fmt.Println(engine.Cosine(es[0].Vector, es[1].Vector)) // about 0.77
-```
+st, _ := m.NewState(engine.StateOptions{})
+defer st.Close()
+question := "What is the capital of France? Answer in one word."
+st.Step(ctx, m.Tokenize(m.ChatPrompt([]engine.Message{{Role: "user", Content: question}}))...)
 
-### Classify
-
-To label something, you don't need the model to write an answer and then parse it. `Classify` reads the prompt once
-and scores each candidate label as the model's answer, so you get a probability for every label, and the answer is
-always one of them:
-
-```go
-prompt := m.ChatPrompt([]engine.Message{
-	{Role: "system", Content: "Label the support ticket: bug, feature request or billing question."},
-	{Role: "user", Content: "I was charged twice this month."},
-})
-res, _ := m.Classify(ctx, prompt, []string{"bug", "feature request", "billing question"},
-	engine.ClassifyOptions{Complete: true})
-fmt.Println(res.Best(), res.Probs) // 2 [0.000004 0.000018 0.99998] with qwen3-1.7b
-```
-
-Labels can be several tokens long. `Complete` scores each label as the whole answer (it must be followed by the end
-of the turn), which matters when one label starts another ("bug", "bug report"); `Normalize` scores per token, so long
-labels aren't penalized. Labels are tokenized on their own, so write them as the answer would start. A one-token label
-costs nothing beyond reading the prompt; the other labels' tokens are read together in one batched pass; and the prompt
-cache skips instructions shared across calls. Labeling a ticket with 5 labels (an 85-token prompt), that's 1.6 to 1.8
-times faster than generating a schema-constrained JSON answer (`go test ./engine -bench Classify`), and you get
-the model's odds for every label instead of one word.
-
-The engine also keeps the start of recent prompts (`LoadOptions.PromptCache`), so a long system prompt is read once,
-and can keep a conversation's state between calls (`GenerateOptions.Thread`).
-
-A prompt that doesn't fit is an error you can check: `errors.Is(err, engine.ErrContextExceeded)`, or `errors.As` with
-`*engine.ContextError` for the counts. `engine.TrimMessages` drops a conversation's oldest messages to fit a budget,
-and tells you what it dropped.
-
-### Save a conversation and pick it up later
-
-A thread's state (the keys and values of every token the model read and wrote) can be saved wherever your app keeps
-things, and loaded back after a restart or on another machine. The next turn then reads only the new message, not the
-whole conversation:
-
-```go
-var buf bytes.Buffer
-_ = m.SaveThread(&buf, "", "chat-42", engine.SnapshotOptions{})   // after a Generate with Thread: "chat-42"
-// ... store buf.Bytes() in a file, a database row, object storage ...
-
-info, err := m.LoadThread(bytes.NewReader(saved), "", "chat-42", engine.SnapshotOptions{})
-res, _ := m.Generate(ctx, prompt, engine.GenerateOptions{Thread: "chat-42"}, nil) // res.CachedTokens: the saved part
-```
-
-`SavePromptCache` and `LoadPromptCache` do the same for the prompt cache, so a long system prompt warmed once (`Warm`)
-can ship with your app or survive restarts, pinned so other prompts don't push it out.
-
-A snapshot is tied to the model file it came from (a fingerprint of the GGUF's header and samples of its weights, so a
-renamed copy works and a finetune with the same shapes doesn't), versioned and checksummed; a mismatch returns
-`engine.ErrSnapshotModel`, damage `engine.ErrSnapshotCorrupt`. It's half precision by default, which moves token
-probabilities by about one in a million; `SnapshotOptions{Full: true}` stores exact floats, and the conversation then
-continues bit for bit as if it had never stopped. `Compress: true` deflates it: that saves 11 to 17% at full precision,
-but only 2 to 6% at half, whose bits are mostly noise to a compressor.
-
-Snapshots are big: every token keeps its keys and values for every layer, about 112 KB per token at half precision for
-Qwen3 0.6B. Restoring is still far cheaper than reading again. A 2,149-token conversation on `qwen3:0.6b` (Q4_K_M,
-Apple M1 Max, 4 threads, other jobs running, so the reading time is on the slow side):
-
-| | Size | Save | Load |
-|---|---|---|---|
-| Reading the conversation again | | | 29 to 35 s |
-| Half precision | 247 MB | 1.5 to 3 s | 0.5 to 1.0 s |
-| Half, compressed | 231 MB | 1.6 s | 1.5 s |
-| Full precision | 493 MB | 0.7 s | 0.3 to 0.8 s |
-| Full, compressed | 409 MB | 1.7 s | 2.4 s |
-
-(`GenerateOptions.ThreadDir` already keeps threads on disk in a folder the engine manages; snapshots are for when your
-app wants to hold the state itself.)
-
-### Keep it from starving your app
-
-Give nollama a budget so it shares the machine with the program it lives in:
-
-```go
-res := engine.NewResources(engine.ResourceOptions{
-	Threads:     4,       // CPU threads, shared by every model and every answer
-	Memory:      3 << 30, // bytes for weights, answers in progress and caches
-	LowPriority: true,    // your app's threads win the CPU when it's busy
-})
-defer res.Close()
-
-srv := server.New(server.Config{ModelsDir: "./models", Resources: res})
-m, _ := engine.Load(src.Path, engine.LoadOptions{Resources: res}) // same budget
-```
-
-- **Threads.** Every model and every answer shares the same worker threads, taking turns, instead of each model
-  starting its own. Each call also works on its caller's goroutine, so cap concurrent calls (the server's `Parallel`)
-  to cap the total.
-- **Memory.** The budget counts the model files (they're mapped into memory and read in full for every token), each
-  answer's keys and values, and the prompt cache and conversation threads kept in memory. When something doesn't fit,
-  nollama first drops what it can rebuild (idle buffers, then the least recently used cache entries, across all models
-  on the budget). A load or an answer that still doesn't fit fails with an error matching `engine.ErrMemoryLimit`
-  (the server answers 503) instead of meeting the OOM killer. Go's own heap overhead isn't counted, so leave some
-  headroom, or also set `GOMEMLIMIT`.
-- **Low priority.** The OS runs nollama's threads below your app's: nice 10 on Linux (on desktops with autogroup
-  scheduling, that's below the rest of your process rather than other programs), the utility QoS class on macOS, and
-  `THREAD_PRIORITY_LOWEST` on Windows. Other systems run at normal priority (`engine.LowPrioritySupported`). It's done
-  without cgo: the threads doing the work are dedicated to it and end when it does, so a lowered thread never runs
-  the rest of your app.
-
-For one model, `LoadOptions` takes `Threads`, `MaxMemory` and `LowPriority` directly. `nollama serve` takes
-`--threads`, `--max-memory 3GB` and `--low-priority` (or `NOLLAMA_THREADS`, `NOLLAMA_MAX_MEMORY`,
-`NOLLAMA_LOW_PRIORITY`).
-
-### The same numbers on every machine
-
-The logits are the same bits on arm64 and amd64, with or without the assembly kernels, at any thread count and prompt
-batch size, and with or without a prompt-cache hit. Every kernel (Go, NEON, AVX2; one token or four at a time) sums in
-one reference order with single-rounding multiply-adds, and the Go code never leaves a multiply-add to the compiler,
-which fuses `x*y+z` on arm64 but not on amd64. So greedy output and seeded sampling match across machines, and `Score`
-gives the same logprobs whatever its `Batch`. `TestKernelsReferenceOrder` and `TestDeterministic` (golden hashes) check
-this on each CI architecture. It holds for the default `f32` KV cache; the compact caches (`--kv-cache-type`) round
-differently per CPU. The GPU's default kernels sum in their own order, so their logits differ from the CPU's.
-
-`LoadOptions.Deterministic` (or `nollama serve --deterministic`, `NOLLAMA_DETERMINISTIC=1`, `nollama run
---deterministic`) also makes logprobs (`Score`, `Classify`, generate's logprobs) the same bits, by computing their
-log-softmax with portable `exp`/`log` instead of Go's `math.Exp`/`math.Log`, which differ by CPU in the last bit. It
-refuses what would break exactness: a compact KV cache, and continuing from half-precision state (thread files in a
-`ThreadDir` are ignored; `LoadThread` / `LoadPromptCache` need a snapshot saved with `Full`). Use it when two machines
-must agree exactly, for example a compressor driven by the model's probabilities. It costs little: the log-softmax over
-the vocabulary is about 1.5x slower, the rest runs the same kernels.
-
-Deterministic mode runs on the GPU too, on Macs (Metal) and NVIDIA cards (CUDA), with kernels that compute exactly
-what the CPU computes, bit for bit (Q8_0 and Q4_K weights; `TestDeterministic` compares them). They follow the same
-reference order with IEEE float32 arithmetic, and the reference flushes subnormals in rmsnorm, SwiGLU and the softmax
-as Apple GPUs do. Qwen3-1.7B gives the same logits on an M1 Max and on an Intel server with an NVIDIA A16. With
-Qwen3-1.7B, an M1 Max writes about 40 to 50 tokens/s and reads prompts at about 860 tokens/s, less than half the speed
-of its default GPU kernels; an A16 writes about 31 tokens/s (its default kernels: about 60) and reads about 550
-tokens/s.
-
-## Integer models: the same distribution on every machine
-
-An integer model runs the forward pass in integer arithmetic only, so the next-token distribution is the same exact
-integers on every machine: arm64 or amd64, any thread count, NEON kernels or plain Go. An arithmetic coder can
-therefore decode on one machine what another encoded. [signal](https://github.com/benallfree/compress13k), a
-compressor that uses nollama, is built on this. The deterministic float mode above matches only across nollama's own
-CPU and GPU kernels; integer models also match other implementations of the same spec.
-
-```go
-m, _ := engine.LoadIntModel("qwen2.5-coder-0.5b-int-v1.gguf", 0)
-s := m.NewSession(4096)
-cum := s.Feed(m.BOS()) // the next token's distribution: cumulative integer counts, cum[len-1] is the total
-```
-
-- **The model** is a converted GGUF (architecture `qwen2-intcodec`): the official Qwen2.5 weights rounded to 8 bits
-  with an integer scale per 64, plus lookup tables and the tokenizer.
-- **Conversion:** `engine.ConvertIntModel(snapshotDir, out, logf)` makes it from the official bf16 safetensors. It is
-  deterministic, so the same source gives the same file, byte for byte, on any machine.
-  - Qwen2.5-Coder-0.5B: 2 s, 520 MB.
-  - Qwen2.5-Coder-7B: 41 s, 7.9 GB.
-- **API:** `Tokenize`, `TokenBytes`, `ByteToken`; `NewSession`, `Feed`, `Reset`.
-- **Speed (M1 Max, NEON):** about 16–40 ms per token for the 0.5B, rising as the context grows, and about 120 ms for
-  the 7B.
-- **Conformance:** `go test ./engine -run TestInt` compares the tokenizer, 330 distributions and the converter with
-  the reference implementation, given `NOLLAMA_INTMODEL_DIR` (and `NOLLAMA_INTMODEL_SRC` for the converter).
-
-## Test without a model
-
-The `nollamatest` package lets your tests run in CI with no download. A scripted model answers with a function you
-write, so you can test what your code does with an answer:
-
-```go
-import "github.com/benallfree/nollama/nollamatest"
-
-func TestRouting(t *testing.T) {
-	m := nollamatest.Scripted(t, func(p nollamatest.Prompt) string {
-		if strings.Contains(p.Last("user"), "charged") {
-			return `{"label": "billing"}`
-		}
-		return `{"label": "question"}`
-	})
-	// m is an *engine.Model: pass it to your code. Its answers are tokenized, streamed, cut at max tokens and stop
-	// strings, and checked against your schema (an answer that doesn't fit is an error).
+for _, answer := range []string{"Paris", "Lyon", "Berlin"} {
+	f, _ := st.Fork()
+	logits, total := st.Logits(), 0.0
+	for _, tok := range m.Tokenize(answer) {
+		total += m.LogprobOf(logits, tok, 0).Logprob.Logprob
+		logits, _ = f.Step(ctx, tok)
+	}
+	f.Close()
+	fmt.Printf("%-7s %.2f\n", answer, total) // Paris -0.00, Lyon -18.35, Berlin -14.97
 }
 ```
 
-`nollamatest.Load(t, nollamatest.TinyConfig{})` is a tiny Qwen3 model with random weights (about 1 MB, built in
-memory in a few milliseconds). It runs the whole engine, constraints included, and writes a jumble of English words,
-the same every run on a given machine.
+You can also mount the whole Ollama-compatible server inside your own HTTP server, with `server.New` and its
+`Handler`. The [guide](docs/guide.md) covers this, embeddings, `Classify`, saving and resuming conversations, running
+at low priority alongside your application, deterministic mode, integer models, building a model into the binary,
+and testing without a model.
 
-For code that talks HTTP, `nollamatest.NewServer(t)` runs nollama's real server on either model. It answers to every
-catalog name (`qwen3:1.7b` and the rest), so code that names a real model works unchanged:
+## Benchmarks against Ollama
 
-```go
-ts := nollamatest.NewServer(t, nollamatest.WithResponder(nollamatest.Reply("Bonjour !")))
-client := openai.NewClient(option.WithBaseURL(ts.URL+"/v1"), option.WithAPIKey("unused"))
-// or an Ollama client pointed at ts.URL
-```
+[Benchmarks](docs/benchmarks.md) compares nollama with Ollama one metric at a time, on the same machines and the same
+model files, and marks the winner of each comparison. Every number there is produced by a script from saved raw
+results. So far the scripted runs cover the CPU on five small cloud servers, with Qwen3 0.6B, 1.7B and 4B; this is how
+the 18 comparisons per metric came out:
 
-## Ship the model inside the binary
-
-A model can travel inside the executable, so the program runs it on a machine with no network and nothing to
-download. Two ways:
-
-**Add it to a built binary.** `nollama bundle` writes a copy of a program with GGUF files added to its end:
-
-```bash
-nollama bundle -o mytool qwen3-0.6b                 # a nollama that has qwen3-0.6b built in
-nollama bundle -o myapp -exe ./myapp tagger=qwen3-0.6b   # your own Go program, model named "tagger"
-nollama bundle -check myapp                         # list what's inside and check each SHA-256
-```
-
-The copy finds its models by name: `mytool run qwen3-0.6b`, `/api/tags` and `/v1/models` list them, and in your own
-program `models.Resolve("tagger", dir)` returns them before any download. Each model sits on a 64 KiB boundary and is
-mmapped straight from the executable, so it loads as fast as a separate file (tens of milliseconds). Catalog models are
-checked against their SHA-256 as they're copied in, and the bundle records every model's SHA-256 for `-check` and
-`models.Verify`. On macOS the result runs with the linker's ad-hoc signature, but `codesign` can't sign a file with
-data after its end: bundle before shipping only if you don't need a Developer ID signature, and use `go:embed` (below)
-if you do. On Windows, sign after bundling; nollama still finds the models. macOS checks a new executable the
-first time it runs, which takes a few seconds for one this size; after that it starts at once.
-
-**Compile it in with `go:embed`.** The model becomes part of the program's own data, signed along with it:
-
-```go
-//go:embed qwen3-0.6b.gguf
-var qwen []byte
-
-func init() { models.Embed("qwen3-0.6b", qwen) }
-
-src, _ := models.Resolve("qwen3-0.6b", models.DefaultDir()) // the embedded one, no download
-m, _ := engine.Load(src.Path, engine.LoadOptions{})          // src.Path is "embedded:qwen3-0.6b"
-```
-
-The operating system pages embedded data in from the executable as it's read, so there's no copy and no startup cost.
-Either way, a model inside the program resolves like any other: `models.Resolve` returns it with a path of
-`bundled:<name>` or `embedded:<name>`, and `engine.Load(src.Path, …)` opens it, so code written for downloaded models
-needs no change, and models not built in still download as usual. `engine.LoadBytes` takes any GGUF already in
-memory, and `engine.LoadRange` one at an offset inside any file.
-
-## Run it on a GPU
-
-nollama runs the model on a GPU when it finds one that works, with no toolkit or driver add-ons to install:
-
-- **Macs with Apple Silicon**: Metal. The GPU reads the memory-mapped model file in place, so loading costs nothing
-  extra.
-- **NVIDIA cards** (compute capability 7.5 and newer: T4, RTX 20xx and later, A10, A16, A100, L4, L40S, H100) on Linux
-  and Windows: CUDA, through the NVIDIA driver alone (`libcuda.so.1` or `nvcuda.dll`). The driver compiles nollama's
-  kernels for the card when the model loads. The model has to fit in the card's memory. On compute 8.0 and newer, prompts
-  with Q4_K and Q6_K weights use the int8 tensor cores.
-
-It takes models whose weights are all Q8_0, Q4_K, Q6_K or F16 (Ollama's Q8_0 and Q4_K_M files are), with any KV cache
-type (see [Long contexts](#long-contexts-a-smaller-kv-cache)). When something doesn't fit, such as another weight type
-or a model larger than the card, the whole model runs on the CPU, and the server's
-log says why when it loads it: `loaded qwen3-1.7b in 120ms (CPU, ...; no GPU: ...)`. `--gpu off` (or `NOLLAMA_GPU=off`,
-or `engine.LoadOptions.GPU = "off"`) keeps it on the CPU; `engine.Model.Info().GPU` names the GPU in use.
-
-The GPU's default kernels sum in a different order than the CPU, so their logits differ slightly (up to about 1% of
-the logits' spread, like the CPU's own fast path); `--deterministic` gives the CPU's results bit for bit on the GPU too
-(see [The same numbers on every machine](#the-same-numbers-on-every-machine)). How fast it is:
-[On a GPU](#on-a-gpu).
-
-## Long contexts: a smaller KV cache
-
-While it answers, the model keeps the attention keys and values of every token so far (the KV cache). At full
-precision that's 224 KB per token for Qwen3 0.6B and 1.7B (288 KB for 4B), so a 4,096-token conversation takes about
-900 MB on top of the model. `--kv-cache-type` (or `NOLLAMA_KV_CACHE_TYPE`, or `engine.LoadOptions.KVCacheType`) stores
-it smaller. The names are Ollama's `OLLAMA_KV_CACHE_TYPE` values:
-
-| Type | Per token (0.6B, 1.7B) | 4,096 tokens | 32,768 tokens | Perplexity vs `f32` (0.6B, 1.7B) |
-|---|---|---|---|---|
-| `f32` (default) | 224 KB | 896 MB | 7.0 GB | exactly what the model computes |
-| `f16` | 112 KB | 448 MB | 3.5 GB | +0.3%, +0.9% (Ollama's default cache) |
-| `q8_0` | 60 KB | 238 MB | 1.9 GB | +0.1%, −0.0% |
-| `q4_0` | 46 KB | 182 MB | 1.4 GB | −4.1%, +0.1% |
-
-`q4_0` stores values in 4 bits but keeps keys at 8 (`q8_0`): with 4-bit keys Qwen3's perplexity more than doubles,
-because attention scores are sensitive to errors in keys and not in values.
-
-Quality was measured on a fixed 361-token text, teacher-forced, with Ollama's Q4_K_M files: perplexity, and how far
-each token's log-probability moves from `f32` (on average 0.12 to 0.17 for `f16`, 0.19 to 0.25 for `q8_0`, 0.28 to
-0.29 for `q4_0`). Changes within a couple of percent either way are noise: rounding the cache to `f16` alone moves a
-small model's log-probabilities that much. `go test ./engine -run TestKVCacheQuality` with `GGUF` set repeats it.
-
-Speed (provisional: measured on a heavily loaded M1 Max, load average 150 to 230, so only the attention kernels'
-relative cost is meaningful): attention over a compact cache takes 1.5× (`q8_0`), 2× (`f16`) or 2 to 3.5× (`q4_0`) the
-time of `f32` attention, single-threaded over 2,048 positions. From that, writing at a 2K-token context should be about
-5% slower with `q8_0` and 10 to 25% slower with `f16` or `q4_0`, and less at shorter contexts; reading a prompt is
-dominated by the weights either way. These are estimates until they're measured on an idle machine.
-`go test ./engine -run '^$' -bench BenchmarkKVAttention` measures the kernels.
-
-The prompt cache and threads keep their copies at full precision, within their own budgets (`--prompt-cache-mb`,
-`LoadOptions.ThreadMemory`); the KV cache type sets the memory of the answers being written.
-
-Every cache type runs on the GPU (deterministic mode takes `f32` only). On an M1 Max the compact caches read prompts
-as fast as `f32` and write within 4% of it; on an NVIDIA A16 they read prompts as fast and write as fast with `f16`,
-and 6 to 10% slower with `q8_0` or `q4_0` (more so at longer contexts). Both measured on Qwen3 1.7B, Q8_0 and Q4_K_M,
-short and long prompts.
-
-```bash
-nollama serve --kv-cache-type q8_0
-```
-
-## Models
-
-| Name | Download | Memory | Good for |
+| Metric | nollama ahead | Within 5% | Ollama ahead |
 |---|---|---|---|
-| `qwen3-0.6b` | 640 MB | about 1 GB | tags, yes/no, short extraction |
-| `qwen3-1.7b` | 1.8 GB | about 2 GB | a good default for a small server |
-| `qwen3-4b` | 2.5 GB | about 3 GB | better answers, slower |
-| `qwen3-embedding-0.6b` | 640 MB | about 1 GB | embeddings (1024 values) for search and similarity |
+| Writing speed | 3 | 3 | 12 |
+| Reading speed, long prompt | 0 | 0 | 18 |
+| Reading speed, short prompt | 0 | 0 | 18 |
+| First token, model loaded | 0 | 0 | 18 |
+| First token, cold start | 12 | 0 | 6 |
+| First token, warm start | 11 | 1 | 6 |
+| Peak memory | 4 | 8 | 6 |
 
-These come from Qwen's own Hugging Face repository and are checked against their SHA-256. Ollama's spellings work too
-(`qwen3:1.7b`, `qwen3-embedding:0.6b`). Any other Qwen3 GGUF works by `hf:<org>/<repo>/<file>.gguf`, by path to a `.gguf` file (in
-`nollama run`; the server takes paths only with `--allow-paths`), or, for the server too, by name once the file is in
-the models folder (`mymodel.gguf` there is `mymodel`). The engine
-runs Qwen3 dense models in Q8_0, Q4_K_M, F16 and BF16; other architectures are not supported yet.
+nollama starts much faster, because it memory-maps the model file instead of loading it. Ollama reads prompts faster
+everywhere and writes faster on most of these machines. On the AMD EPYC Rome and Intel Broadwell servers nollama is
+currently far slower, which is a known problem with how its AVX2 kernels behave on those CPUs. GPU benchmarks will be
+added when a script produces them the same way.
 
-## Benchmarks
+## Examples
 
-Measured on an Apple M1 Max (64 GB), 4 CPU threads, generating 128 tokens; nollama and Ollama 0.23 ran on the same
-GGUF files (Ollama's `qwen3:0.6b` and `qwen3:1.7b`, Q4_K_M). "Short" is a 35-token prompt, "long" a 590-token one.
-Medians of 3 runs, which vary by 10 to 20% from run to run on a busy laptop.
+- [Surprisal](https://github.com/benallfree/surprisal) is a lossless compressor that uses a language model as its
+  predictor. It runs an integer model on nollama, so an archive compressed on a Mac's GPU decompresses bit for bit on an
+  NVIDIA GPU or a plain CPU. It depends on direct access to the model's probabilities at every token, which an HTTP API
+  does not provide.
 
-| Model | Prompt | Engine | Reading the prompt | Writing the answer | First token | Load | Memory |
-|---|---|---|---|---|---|---|---|
-| 0.6B | short | **nollama, CPU** | 241 tok/s | 76 tok/s | 145 ms | 0.04 s | 667 MB |
-| 0.6B | short | Ollama, CPU | 241 tok/s | 85 tok/s | 145 ms | 1.1 s | 875 MB |
-| 0.6B | short | Ollama, GPU (Metal) | 731 tok/s | 82 tok/s | 48 ms | 0.9 s | 844 MB |
-| 0.6B | long | **nollama, CPU** | 220 tok/s | 51 tok/s | 2.7 s | 0.02 s | 906 MB |
-| 0.6B | long | Ollama, CPU | 349 tok/s | 53 tok/s | 1.7 s | 1.0 s | 885 MB |
-| 0.6B | long | Ollama, GPU (Metal) | 1485 tok/s | 42 tok/s | 0.4 s | 0.6 s | 862 MB |
-| 1.7B | short | **nollama, CPU** | 86 tok/s | 31 tok/s | 409 ms | 0.10 s | 1.4 GB |
-| 1.7B | short | Ollama, CPU | 89 tok/s | 39 tok/s | 392 ms | 0.6 s | 1.7 GB |
-| 1.7B | short | Ollama, GPU (Metal) | 364 tok/s | 54 tok/s | 96 ms | 0.7 s | 1.7 GB |
-| 1.7B | long | **nollama, CPU** | 99 tok/s | 32 tok/s | 5.9 s | 0.02 s | 1.7 GB |
-| 1.7B | long | Ollama, CPU | 262 tok/s | 32 tok/s | 2.3 s | 0.6 s | 1.8 GB |
-| 1.7B | long | Ollama, GPU (Metal) | 589 tok/s | 29 tok/s | 1.0 s | 1.0 s | 1.7 GB |
+## Documentation
 
-What that means:
-
-- **Writing** runs at roughly Ollama's CPU speed, 80 to 100% of it. A word is about 1.3 tokens, so the 1.7B model writes a
-  short answer in a second or two.
-- **Reading long prompts** is where nollama is slower: 40 to 65% of Ollama's CPU speed, and far behind a GPU. A
-  600-token prompt takes a few seconds before the first word. The prompt cache helps when prompts share a start (a fixed
-  system prompt, a growing chat): only the new part is read.
-- **Loading** is near instant (the file is memory-mapped), and memory use is a little lower.
-- On a small server it depends on the CPU: see [On small cloud servers](#on-small-cloud-servers).
-
-On the same machine, nollama on the GPU writes at 85 to 100% of Ollama's GPU speed and reads prompts at 40 to 60% of
-it: see [On a GPU](#on-a-gpu).
-
-Run them yourself with `go run ./engine/cmd/bench bench` (it needs Ollama running, for the comparison).
-
-### On a GPU
-
-Provisional, measured on 2026-11-21 and 22 with qwen3-1.7b (and 4b on the A16), nollama and Ollama on the same machine
-and the same GGUF files, 128 tokens written, nollama's `f32` KV cache unless noted. "Short" is a 29 to 35-token
-prompt, "long" a 590-token one (654 tokens for Ollama, whose template adds some). Writing speed is after the short
-prompt, then after the long one.
-
-| Machine | Model | nollama: reading short / long | nollama: writing | Ollama: reading long | Ollama: writing |
-|---|---|---|---|---|---|
-| Apple M1 Max (Metal), idle GPU | 1.7b Q8_0 | 620 / 1,550 tok/s | 105 to 111 / 93 to 99 tok/s | 2,416 tok/s | 111 tok/s |
-| Apple M1 Max (Metal), idle GPU | 1.7b Q4_K_M | 610 / 1,460 tok/s | 120 to 128 / 112 tok/s (`f16` cache: 130 to 136 short) | 2,174 tok/s | 134 to 144 tok/s |
-| NVIDIA A16 (CUDA), Vultr `vcg-a16-6c-60g-16vram` | 1.7b Q8_0 | 690 / 1,340 tok/s | 63 / 60 tok/s | 3,224 tok/s | 68 to 70 tok/s |
-| NVIDIA A16 (CUDA), Vultr `vcg-a16-6c-60g-16vram` | 1.7b Q4_K_M | 960 / 1,550 tok/s | 80 / 75 tok/s | 3,036 tok/s | 83 to 85 tok/s |
-| NVIDIA A16 (CUDA), Vultr `vcg-a16-6c-60g-16vram` | 4b Q4_K_M | 477 / 733 tok/s | 38 / 34 tok/s | 1,290 tok/s | 40 to 41 tok/s |
-
-Writing runs at 85 to 100% of Ollama's GPU speed. Reading prompts is the gap: 40 to 65% of Ollama's, so a long prompt
-takes about twice as long before the first word. The A16 rows predate two later changes, each measured against the previous build on
-the same machine: copying a prompt's keys and values back through page-locked memory made reading the long prompt 5
-to 8% faster there, and int8 tensor cores for Q6_K weights made Q4_K_M prompts another 2 to 4% faster. `go run ./engine/cmd/bench run -gguf FILE -gpu auto -prompt long`
-measures one model; `-kv f16` picks the cache.
-
-### On small cloud servers
-
-Measured on Vultr cloud servers on 2026-11-21: nollama (main at afe1f7f) and Ollama 0.40.17, both on the CPU, on the
-same GGUF files, Ubuntu 24.04. Threads = vCPUs, 128 tokens written per run, medians of 3 runs. A 4096-token context and
-a 256 MB prompt cache, like `nollama serve`'s defaults; prompts are the same 35- and 590-token texts as above. The
-Q4_K_M files for 0.6B and 1.7B are Ollama's own (`qwen3:0.6b`, `qwen3:1.7b`), since Qwen publishes only Q8_0 at those
-sizes; the rest come from Qwen's Hugging Face repositories.
-
-- **Cold first token**: a fresh start with the model file out of the page cache (`drop_caches`), to the first token of
-  the short prompt. For nollama that's a new process; for Ollama, its server is up but the model isn't loaded.
-- **Warm first token**: the same, with the file already in the page cache.
-- **First token, loaded**: the model already loaded and nothing reused from the prompt cache.
-- **Peak RAM**: the highest resident memory of the process holding the model (for Ollama, its `llama-server`). It
-  includes the memory-mapped model file.
-
-`qwen3-0.6b`, Q4_K_M:
-
-| Machine | Engine | Cold first token | Warm first token | First token, loaded (short / long) | Reading tok/s (short / long) | Writing tok/s | Peak RAM |
-|---|---|---|---|---|---|---|---|
-| Vultr vc2-1c-1gb (1 vCPU, 1 GB, Broadwell, AVX2) | **nollama** | 7.9 s | 5.5 s | 6.0 s / 95 s | 6 / 6 | 1.7 | 743 MB |
-| | Ollama | 41 s | 37 s | 1.5 s / 24 s | 24 / 25 | 7.0 | 742 MB |
-| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | **nollama** | 1.3 s | 640 ms | 512 ms / 10 s | 69 / 59 | 17.9 | 1.3 GB |
-| | Ollama | 4.3 s | 3.3 s | 438 ms / 7.2 s | 86 / 83 | 16.8 | 3.0 GB |
-| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | **nollama** | 976 ms | 584 ms | 478 ms / 8.5 s | 76 / 70 | 13.9 | 1.3 GB |
-| | Ollama | 2.9 s | 2.4 s | 407 ms / 5.5 s | 99 / 108 | 13.6 | 1.2 GB |
-| Vultr vhp-2c-4gb-amd (2 vCPU, 4 GB, EPYC Rome, AVX2) | **nollama** | 4.5 s | 3.7 s | 3.9 s / 55 s | 9 / 11 | 2.4 | 1.3 GB |
-| | Ollama | 3.4 s | 2.6 s | 469 ms / 7.3 s | 77 / 82 | 24.0 | 1.2 GB |
-| Vultr vhp-4c-8gb-amd (4 vCPU, 8 GB, EPYC Rome, AVX2) | **nollama** | 2.3 s | 2.1 s | 2.0 s / 28 s | 17 / 21 | 4.8 | 1.3 GB |
-| | Ollama | 2.9 s | 2.1 s | 276 ms / 4.1 s | 138 / 148 | 34.0 | 1.2 GB |
-
-What that means:
-
-- **Starting is fast.** From a cold start, nollama's first token comes 2 to 5 times sooner than Ollama's on the Intel
-  servers: there's nothing to load, the file is memory-mapped. On the 1 GB server Ollama took 41 s.
-- **On Skylake and Cascade Lake Xeons, nollama keeps up.** Across all the models, writing runs at 80 to 105% of Ollama's speed
-  and reading at 65 to 90%. On 2 vCPUs the 0.6B model's first token after a 590-token prompt takes 8 to 10 s.
-- **On older Intel (Broadwell) and AMD EPYC Rome servers, nollama is far slower today.** There it reads and writes 4 to
-  12 times slower than Ollama with Q4_K_M, and 20 to 30 times slower with Q8_0, while Ollama runs fine on the same
-  machines. nollama runs the same AVX2 code on every one of these servers (it has no AVX-512 code), so the slow part is
-  how that code behaves on those CPU models, not missing support. It's a known problem to fix. Until then, check the
-  CPU model (`grep -m1 "model name" /proc/cpuinfo`) before you pick nollama for a server: Skylake, Cascade Lake or
-  newer Intel ran well here.
-- **Memory** is about the same as Ollama's, apart from Ollama's two 0.6B runs on vc2-2c-4gb (about 3 GB), which we
-  didn't dig into.
-
-<details>
-<summary>Every model on every server</summary>
-
-On the EPYC Rome servers the bigger models didn't finish within the run's 90 minutes, so they're missing. A model is
-left out when its file doesn't fit in the server's memory.
-
-| Machine | Model | Quant | Engine | Cold first token | Warm first token | First token, loaded (short / long) | Reading tok/s (short / long) | Writing tok/s | Peak RAM |
-|---|---|---|---|---|---|---|---|---|---|
-| Vultr vc2-1c-1gb (1 vCPU, 1 GB, Broadwell, AVX2) | 0.6b | Q4_K_M | **nollama** | 7.9 s | 5.5 s | 6.0 s / 95 s | 6 / 6 | 1.7 | 743 MB |
-| Vultr vc2-1c-1gb (1 vCPU, 1 GB, Broadwell, AVX2) | 0.6b | Q4_K_M | Ollama | 41 s | 37 s | 1.5 s / 24 s | 24 / 25 | 7.0 | 742 MB |
-| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | 0.6b | Q4_K_M | **nollama** | 1.3 s | 640 ms | 512 ms / 10 s | 69 / 59 | 17.9 | 1.3 GB |
-| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | 0.6b | Q4_K_M | Ollama | 4.3 s | 3.3 s | 438 ms / 7.2 s | 86 / 83 | 16.8 | 3.0 GB |
-| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | 0.6b | Q8_0 | **nollama** | 1.7 s | 897 ms | 802 ms / 12 s | 45 / 48 | 10.8 | 1.4 GB |
-| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | 0.6b | Q8_0 | Ollama | 4.4 s | 3.3 s | 757 ms / 10.0 s | 49 / 60 | 13.2 | 2.9 GB |
-| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | 1.7b | Q4_K_M | **nollama** | 3.0 s | 1.6 s | 1.3 s / 23 s | 26 / 26 | 8.1 | 2.1 GB |
-| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | 1.7b | Q4_K_M | Ollama | 10 s | 5.6 s | 1.2 s / 16 s | 30 / 37 | 7.6 | 2.3 GB |
-| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | 1.7b | Q8_0 | **nollama** | 4.3 s | 2.2 s | 2.2 s / 31 s | 16 / 19 | 4.2 | 2.7 GB |
-| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | 1.7b | Q8_0 | Ollama | 8.1 s | 6.2 s | 1.9 s / 27 s | 19 / 22 | 5.3 | 2.5 GB |
-| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | 4b | Q4_K_M | **nollama** | 6.2 s | 3.5 s | 3.2 s / 56 s | 11 / 10 | 4.0 | 3.5 GB |
-| Vultr vc2-2c-4gb (2 vCPU, 4 GB, Skylake, AVX-512) | 4b | Q4_K_M | Ollama | 15 s | 14 s | 2.8 s / 43 s | 13 / 14 | 3.7 | 3.3 GB |
-| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | 0.6b | Q4_K_M | **nollama** | 976 ms | 584 ms | 478 ms / 8.5 s | 76 / 70 | 13.9 | 1.3 GB |
-| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | 0.6b | Q4_K_M | Ollama | 2.9 s | 2.4 s | 407 ms / 5.5 s | 99 / 108 | 13.6 | 1.2 GB |
-| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | 0.6b | Q8_0 | **nollama** | 1.3 s | 831 ms | 718 ms / 11 s | 49 / 54 | 9.1 | 1.4 GB |
-| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | 0.6b | Q8_0 | Ollama | 3.1 s | 2.6 s | 564 ms / 8.1 s | 64 / 74 | 10.1 | 1.3 GB |
-| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | 1.7b | Q4_K_M | **nollama** | 1.9 s | 1.2 s | 1.2 s / 20 s | 29 / 30 | 5.8 | 2.1 GB |
-| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | 1.7b | Q4_K_M | Ollama | 5.5 s | 4.8 s | 866 ms / 13 s | 42 / 45 | 5.6 | 2.0 GB |
-| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | 1.7b | Q8_0 | **nollama** | 3.1 s | 2.1 s | 2.1 s / 29 s | 16 / 20 | 3.5 | 2.6 GB |
-| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | 1.7b | Q8_0 | Ollama | 6.2 s | 5.2 s | 1.5 s / 19 s | 24 / 30 | 4.0 | 2.5 GB |
-| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | 4b | Q4_K_M | **nollama** | 4.1 s | 3.0 s | 2.9 s / 50 s | 12 / 12 | 2.8 | 3.5 GB |
-| Vultr vhp-2c-4gb-intel (2 vCPU, 4 GB, Cascade Lake, AVX-512) | 4b | Q4_K_M | Ollama | 10 s | 10 s | 2.2 s / 32 s | 16 / 18 | 2.8 | 3.3 GB |
-| Vultr vhp-2c-4gb-amd (2 vCPU, 4 GB, EPYC Rome, AVX2) | 0.6b | Q4_K_M | **nollama** | 4.5 s | 3.7 s | 3.9 s / 55 s | 9 / 11 | 2.4 | 1.3 GB |
-| Vultr vhp-2c-4gb-amd (2 vCPU, 4 GB, EPYC Rome, AVX2) | 0.6b | Q4_K_M | Ollama | 3.4 s | 2.6 s | 469 ms / 7.3 s | 77 / 82 | 24.0 | 1.2 GB |
-| Vultr vhp-2c-4gb-amd (2 vCPU, 4 GB, EPYC Rome, AVX2) | 0.6b | Q8_0 | **nollama** | 12 s | 12 s | 12 s / 159 s | 3 / 4 | 0.7 | 1.3 GB |
-| Vultr vhp-2c-4gb-amd (2 vCPU, 4 GB, EPYC Rome, AVX2) | 0.6b | Q8_0 | Ollama | 3.0 s | 2.6 s | 554 ms / 9.1 s | 67 / 66 | 19.4 | 1.3 GB |
-| Vultr vhp-2c-4gb-amd (2 vCPU, 4 GB, EPYC Rome, AVX2) | 1.7b | Q4_K_M | **nollama** | 12 s | 11 s | 12 s / 170 s | 3 / 3 | 0.9 | 1.9 GB |
-| Vultr vhp-2c-4gb-amd (2 vCPU, 4 GB, EPYC Rome, AVX2) | 1.7b | Q4_K_M | Ollama | 7.4 s | 5.2 s | 1.3 s / 20 s | 28 / 30 | 10.5 | 2.0 GB |
-| Vultr vhp-4c-8gb-amd (4 vCPU, 8 GB, EPYC Rome, AVX2) | 0.6b | Q4_K_M | **nollama** | 2.3 s | 2.1 s | 2.0 s / 28 s | 17 / 21 | 4.8 | 1.3 GB |
-| Vultr vhp-4c-8gb-amd (4 vCPU, 8 GB, EPYC Rome, AVX2) | 0.6b | Q4_K_M | Ollama | 2.9 s | 2.1 s | 276 ms / 4.1 s | 138 / 148 | 34.0 | 1.2 GB |
-| Vultr vhp-4c-8gb-amd (4 vCPU, 8 GB, EPYC Rome, AVX2) | 0.6b | Q8_0 | **nollama** | 6.0 s | 5.3 s | 5.9 s / 80 s | 6 / 7 | 1.5 | 1.4 GB |
-| Vultr vhp-4c-8gb-amd (4 vCPU, 8 GB, EPYC Rome, AVX2) | 0.6b | Q8_0 | Ollama | 3.4 s | 2.1 s | 282 ms / 5.0 s | 140 / 120 | 29.8 | 1.3 GB |
-| Vultr vhp-4c-8gb-amd (4 vCPU, 8 GB, EPYC Rome, AVX2) | 1.7b | Q4_K_M | **nollama** | 6.7 s | 5.8 s | 6.1 s / 86 s | 6 / 7 | 1.7 | 2.0 GB |
-| Vultr vhp-4c-8gb-amd (4 vCPU, 8 GB, EPYC Rome, AVX2) | 1.7b | Q4_K_M | Ollama | 5.2 s | 3.9 s | 605 ms / 10 s | 59 / 58 | 17.3 | 2.0 GB |
-| Vultr vhp-4c-8gb-amd (4 vCPU, 8 GB, EPYC Rome, AVX2) | 1.7b | Q8_0 | **nollama** | 18 s | 17 s | 18 s / 250 s | 2 / 2 | 0.5 | 2.5 GB |
-| Vultr vhp-4c-8gb-amd (4 vCPU, 8 GB, EPYC Rome, AVX2) | 1.7b | Q8_0 | Ollama | 5.5 s | 3.5 s | 758 ms / 12 s | 48 / 51 | 13.4 | 2.5 GB |
-
-</details>
-
-Run them yourself with `go run ./engine/cmd/bench vps -models qwen3-0.6b:Q4_K_M=/path/to/model.gguf -ollama` (as root,
-for the cold starts), or on a fresh Vultr server with `scripts/vultr-bench/vultr.sh`.
-
-### For comparison: an Apple M1 Max
-
-The same measurements on a laptop, so you can see how far a small server is from one. These rows don't tell you what
-a VPS will do: use the table above for that.
-
-Measured on 2026-11-21 on an Apple M1 Max (10 cores, 64 GB), macOS, nollama at 19fb099 on the CPU only, 128 tokens
-written per run, medians of 3 runs, 4096-token context and 256 MB prompt cache. Each run started with the machine's
-load average under 4. `qwen3-0.6b` and `qwen3-1.7b` are Qwen's Q8_0 files, `qwen3-4b` is Q4_K_M (what `nollama pull`
-downloads); the short prompt is 31 tokens here (no chat template), the long one 586.
-
-- **Cold first token**: a new process reading a copy of the model file that isn't in the page cache. macOS can't drop
-  the page cache without `sudo purge`, so each cold run used a fresh APFS clone of the file (`cp -c`), which starts with
-  nothing cached (checked with `mincore`) and is read from the laptop's SSD. A cloud server's disk is slower.
-- **2 threads** stands in for a small server's 2 vCPUs, but it is not a VPS measurement: at 2 threads the M1 Max reads and
-  writes 3 to 8 times faster than the 2-vCPU Cascade Lake server above, on the same files.
-- **Peak RAM** is the process's highest resident memory, including the memory-mapped model file.
-
-| Machine | Model | Quant | Cold first token | Warm first token | First token, loaded (short / long) | Reading tok/s (short / long) | Writing tok/s | Peak RAM |
-|---|---|---|---|---|---|---|---|---|
-| Apple M1 Max, 4 threads | 0.6b | Q8_0 | 549 ms | 213 ms | 164 ms / 1.5 s | 419 / 407 | 106 | 1.8 GB |
-| Apple M1 Max, 4 threads | 1.7b | Q8_0 | 1.3 s | 419 ms | 312 ms / 3.6 s | 156 / 165 | 47 | 3.1 GB |
-| Apple M1 Max, 4 threads | 4b | Q4_K_M | 1.9 s | 770 ms | 703 ms / 10 s | 59 / 59 | 28 | 4.2 GB |
-| Apple M1 Max, 2 threads (stand-in, not a VPS) | 0.6b | Q8_0 | 658 ms | 236 ms | 189 ms / 2.9 s | 221 / 206 | 65 | 1.8 GB |
-| Apple M1 Max, 2 threads (stand-in, not a VPS) | 1.7b | Q8_0 | 1.7 s | 545 ms | 476 ms / 7.1 s | 80 / 84 | 29 | 3.1 GB |
-| Apple M1 Max, 2 threads (stand-in, not a VPS) | 4b | Q4_K_M | 2.7 s | 1.2 s | 1.2 s / 20 s | 30 / 30 | 15 | 4.2 GB |
-
-Cold and warm first token are for the short prompt. Writing tok/s is after the short prompt; after the long one it is
-70 to 90% of that.
-
-## Loading and keep_alive
-
-nollama memory-maps the model file, so loading takes 15 to 40 ms; there is nothing to copy. An idle model is unloaded
-after 5 minutes (`nollama serve --keep-alive`, `NOLLAMA_KEEP_ALIVE`, or `keep_alive` on a request, in Ollama's formats:
-`300` or `"5m"`, a negative value for forever, `0` to unload as soon as the answer is done).
-
-Since reloading is that cheap, you might want a short keep-alive. Before you set one, know what unloading throws away: the
-prompt cache. A model that stays loaded reads a shared start (a system prompt, a growing chat) once; after a reload it
-reads the whole prompt again. Measured on the M1 Max above (4 threads, a 614-token prompt that starts with a fixed
-system prompt):
-
-| Model | Load (file in page cache) | Whole prompt, nothing cached (as after a reload) | The same prompt again | Same system prompt, new question | Memory freed by unloading |
-|---|---|---|---|---|---|
-| 0.6b, Q8_0 | 16 ms | 1.5 s | 22 ms | 85 ms | 373 MB |
-| 1.7b, Q8_0 | 16 ms | 3.8 s | 30 ms | 168 ms | 404 MB |
-| 4b, Q4_K_M | 17 ms | 10.4 s | 51 ms | 416 ms | 533 MB |
-
-- **Unloading frees less than you'd think.** It frees the answer state and the prompt cache (the last column). The
-  weights are page cache the OS keeps until it needs the memory, and gives back on its own when it does, whether or not
-  the model is loaded.
-- **A reload is only fast while the file is still in the page cache.** Once the OS has dropped it, the next request pays
-  the cold first token from the tables above.
-- **So keep the default** if requests share a system prompt or continue chats, or if memory isn't tight. Use
-  `keep_alive: 0` (or `--keep-alive 0`) on a small server where answers are rare, prompts share nothing, and the few
-  hundred MB matter more than a few seconds on the next answer.
-
-## Draft models (experimental, not faster yet)
-
-A small model can guess the next few tokens and let the larger one check them all in one pass (speculative decoding).
-On a GPU that check costs about as much as writing one token, so every guess the larger model agrees with is a token for
-free. The answer doesn't change: with temperature 0 it is exactly the larger model's own answer, and with sampling it
-follows the same distribution.
-
-```bash
-nollama serve --draft qwen3-0.6b
-nollama run --draft qwen3-0.6b qwen3-4b "Write a Go function that reverses a string."
-```
-
-**On nollama's CPU engine today it makes answers slower, so leave it off.** Checking a batch of five tokens costs the
-1.7B model three to five times as much as writing one, so even when the larger model keeps most guesses it comes out
-behind: 0.2 to 0.9 times the speed without a draft in our runs. It is here, correct and tested, so it speeds answers up
-as soon as nollama reads short batches faster.
-
-The guesses themselves are good. With `qwen3-0.6b` guessing up to 4 tokens for `qwen3-1.7b` (it stops early after a
-token it isn't sure of), each check yields, at temperature 0: about 4 tokens for code, 2.7 to 2.8 for JSON or a list,
-and 1.8 for free-form prose.
-
-The draft must share the larger model's tokenizer (all the Qwen3 sizes do), and is skipped for the draft model itself.
-A request can set `draft_tokens` in Ollama's `options` (or at the top level of an OpenAI request): how many tokens the
-draft guesses at a time, `0` to turn it off. In Go, load both models and pass `engine.GenerateOptions{Draft: draft}`;
-`engine.CheckDraft` says whether a pair fits.
-
-## What's supported
-
-Ollama's API: `/api/chat`, `/api/generate` (with `raw`, `system`, `context`), `/api/tags`, `/api/ps`, `/api/show`,
-`/api/pull`, `/api/delete`, `/api/version`, `/api/embed` (`input`, `truncate`, `dimensions`) and the older
-`/api/embeddings`, streaming and not, `format` (`"json"` or a JSON schema), `options`
-(`temperature`, `top_p`, `top_k`, `num_predict`, `num_ctx`, `seed`, `stop`, and nollama's `draft_tokens`), `keep_alive`.
-
-OpenAI's API: `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/embeddings` (text or token ids,
-`dimensions`, `encoding_format` `float` or `base64`), streaming (with `stream_options.include_usage`)
-and not, `response_format` (`json_object`, `json_schema`), `max_tokens`/`max_completion_tokens`, `temperature`,
-`top_p`, `seed`, `stop`.
-
-nollama's own: `/api/classify` (label probabilities, above).
-
-Not yet: model families other than Qwen3, images, `/api/create`, thinking mode (Qwen3's thinking is always off),
-`q8_0` and `q4_0` KV caches on the GPU, and several models loaded at once (nollama holds one and swaps on demand).
-
-## Security
-
-`nollama serve` listens on `127.0.0.1` with no API key, which is safe on a machine you alone use. It also guards
-against the attacks that have hit local LLM servers:
-
-- **Web pages.** A page you visit can send requests to a server on your machine. nollama refuses any request from a
-  browser page that isn't served from this machine (its `Origin` header), and any request whose `Host` header names a
-  domain rather than an IP address or `localhost`, which stops DNS rebinding. `--allowed-origins` (`NOLLAMA_ORIGINS`)
-  and `--allowed-hosts` (`NOLLAMA_ALLOWED_HOSTS`) widen these.
-- **Files on disk.** A request names models, not files: catalog names, `hf:` specs, and `.gguf` files in the models
-  folder. A path anywhere else (`/etc/passwd`, `../../x.gguf`) is refused unless you pass `--allow-paths`. Downloads
-  always land inside the models folder, whatever the `hf:` spec says.
-- **Open to the network.** `serve` won't listen on anything but a loopback address without an API key. Set
-  `NOLLAMA_API_KEY` (better than `--api-key`, which other users can see in `ps`) and clients send
-  `Authorization: Bearer <key>`: OpenAI clients through `api_key`, Ollama's through their `headers` option. `GET /`
-  answers without the key, for health checks. `--insecure-public` listens without one anyway, with a warning.
-- **Limits.** Request bodies are capped at 8 MB (`--max-body-mb`), the context window a request may ask for at 32768
-  tokens (`--max-num-ctx`), and one client IP to 8 requests at once (`--per-client`; behind a reverse proxy, set it
-  there). `--max-tokens` caps how long an answer may be.
-- **Model management.** `--read-only` turns off pulls, deletes, create, copy and push; `--no-pull` and `--no-delete`
-  turn off one each. `--models qwen3-1.7b,qwen3-0.6b` limits the models clients may use, and the listings show only
-  those.
-
-Embedding the server, the same settings are fields of `server.Config`. A typical embedded server serves one model and
-manages nothing:
-
-```go
-srv := server.New(server.Config{ModelsDir: "./models", ReadOnly: true, Models: []string{"qwen3-1.7b"}, APIKey: key})
-```
+- [Guide](docs/guide.md): the engine's features, the command line tool and the HTTP server in detail.
+- [Benchmarks](docs/benchmarks.md): nollama compared with Ollama, one metric at a time.
+- [CHANGELOG](CHANGELOG.md): what changed in each release.
 
 ## License
 

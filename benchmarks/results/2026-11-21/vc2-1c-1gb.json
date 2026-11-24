@@ -1,0 +1,79 @@
+{
+  "system": {
+    "host": "nollama-bench-vc2-1c-1gb",
+    "os": "linux",
+    "arch": "amd64",
+    "cpu": "Intel Core Processor (Broadwell, no TSX, IBRS)",
+    "cpu_flags": "fma f16c avx2",
+    "vcpus": 1,
+    "ram_mb": 955,
+    "swap_mb": 2399,
+    "disk": "/dev/vda2 vda2 24.5G 1 part └─vda 25G 1 disk",
+    "kernel": "6.8.0-149-generic",
+    "uptime": "19:00:07 up 26 min,  1 user,  load average: 0.38, 0.74, 0.82",
+    "nollama": "0668f344222c-dirty",
+    "ollama": "ollama version is 0.40.17",
+    "threads": 1,
+    "gen_tokens": 128,
+    "runs": 3,
+    "truly_cold": true,
+    "started_at": "2026-11-21T19:00:07Z",
+    "duration_s": 1189.915707793,
+    "label": "vc2-1c-1gb"
+  },
+  "rows": [
+    {
+      "model": "qwen3-0.6b",
+      "quant": "Q4_K_M",
+      "engine": "nollama",
+      "file": "/root/bench/models/qwen3-0.6b-Q4_K_M.gguf",
+      "file_mb": 498,
+      "kernels": "avx2+fma",
+      "cold_first_token_s": 7.918142683,
+      "cold_load_s": 0.475953118,
+      "warm_first_token_s": 5.547129458,
+      "warm_load_s": 0.250836981,
+      "short": {
+        "prompt_tokens": 35,
+        "out_tokens": 128,
+        "first_token_s": 6.048271366,
+        "prefill_tok_s": 5.78687287279224,
+        "decode_tok_s": 1.7125011600766027
+      },
+      "long": {
+        "prompt_tokens": 590,
+        "out_tokens": 128,
+        "first_token_s": 95.144991106,
+        "prefill_tok_s": 6.202395054480246,
+        "decode_tok_s": 1.3673815290795366
+      },
+      "peak_rss_mb": 743
+    },
+    {
+      "model": "qwen3-0.6b",
+      "quant": "Q4_K_M",
+      "engine": "ollama",
+      "file": "/root/bench/models/qwen3-0.6b-Q4_K_M.gguf",
+      "file_mb": 498,
+      "cold_first_token_s": 40.766851552,
+      "cold_load_s": 33.312293822,
+      "warm_first_token_s": 36.568135379,
+      "warm_load_s": 31.677393288,
+      "short": {
+        "prompt_tokens": 35,
+        "out_tokens": 128,
+        "first_token_s": 1.53386429,
+        "prefill_tok_s": 24.019391197648023,
+        "decode_tok_s": 6.9658146659023865
+      },
+      "long": {
+        "prompt_tokens": 590,
+        "out_tokens": 128,
+        "first_token_s": 24.201916503,
+        "prefill_tok_s": 25.04067943257481,
+        "decode_tok_s": 4.3377378995073546
+      },
+      "peak_rss_mb": 742
+    }
+  ]
+}

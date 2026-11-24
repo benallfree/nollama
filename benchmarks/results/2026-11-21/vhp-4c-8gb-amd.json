@@ -1,0 +1,238 @@
+{
+  "system": {
+    "host": "nollama-bench-vhp-4c-8gb-amd",
+    "os": "linux",
+    "arch": "amd64",
+    "cpu": "AMD EPYC-Rome Processor",
+    "cpu_flags": "fma f16c avx2",
+    "vcpus": 4,
+    "ram_mb": 7935,
+    "swap_mb": 8191,
+    "disk": "/dev/vda2 vda2 179.5G 1 part └─vda 180G 1 disk",
+    "kernel": "6.8.0-149-generic",
+    "uptime": "19:06:53 up 4 min,  1 user,  load average: 0.84, 0.45, 0.19",
+    "nollama": "42876ce7747c",
+    "ollama": "ollama version is 0.40.17",
+    "threads": 4,
+    "gen_tokens": 128,
+    "runs": 3,
+    "truly_cold": true,
+    "started_at": "2026-11-21T19:06:53Z",
+    "duration_s": 4904.006090466,
+    "label": "vhp-4c-8gb-amd"
+  },
+  "rows": [
+    {
+      "model": "qwen3-0.6b",
+      "quant": "Q4_K_M",
+      "engine": "nollama",
+      "file": "/root/bench/models/qwen3-0.6b-Q4_K_M.gguf",
+      "file_mb": 498,
+      "kernels": "avx2+fma",
+      "cold_first_token_s": 2.279061986,
+      "cold_load_s": 0.160146819,
+      "warm_first_token_s": 2.081593289,
+      "warm_load_s": 0.112599905,
+      "short": {
+        "prompt_tokens": 35,
+        "out_tokens": 128,
+        "first_token_s": 2.03165594,
+        "prefill_tok_s": 17.227923478901612,
+        "decode_tok_s": 4.753819147950684
+      },
+      "long": {
+        "prompt_tokens": 590,
+        "out_tokens": 128,
+        "first_token_s": 28.261920932,
+        "prefill_tok_s": 20.876297973083144,
+        "decode_tok_s": 4.499664008742111
+      },
+      "peak_rss_mb": 1303
+    },
+    {
+      "model": "qwen3-0.6b",
+      "quant": "Q4_K_M",
+      "engine": "ollama",
+      "file": "/root/bench/models/qwen3-0.6b-Q4_K_M.gguf",
+      "file_mb": 498,
+      "cold_first_token_s": 2.94571944,
+      "cold_load_s": 2.619803281,
+      "warm_first_token_s": 2.082528081,
+      "warm_load_s": 1.823394285,
+      "short": {
+        "prompt_tokens": 35,
+        "out_tokens": 128,
+        "first_token_s": 0.275982567,
+        "prefill_tok_s": 137.9745338431821,
+        "decode_tok_s": 33.992080376398555
+      },
+      "long": {
+        "prompt_tokens": 590,
+        "out_tokens": 128,
+        "first_token_s": 4.083214957,
+        "prefill_tok_s": 148.32916000442472,
+        "decode_tok_s": 27.7744687102166
+      },
+      "peak_rss_mb": 1255
+    },
+    {
+      "model": "qwen3-0.6b",
+      "quant": "Q8_0",
+      "engine": "nollama",
+      "file": "/root/bench/models/qwen3-0.6b-Q8_0.gguf",
+      "file_mb": 609,
+      "kernels": "avx2+fma",
+      "cold_first_token_s": 6.016565573,
+      "cold_load_s": 0.197678131,
+      "warm_first_token_s": 5.349145166,
+      "warm_load_s": 0.08068711,
+      "short": {
+        "prompt_tokens": 35,
+        "out_tokens": 128,
+        "first_token_s": 5.907876648,
+        "prefill_tok_s": 5.924349445630118,
+        "decode_tok_s": 1.4741390217965948
+      },
+      "long": {
+        "prompt_tokens": 590,
+        "out_tokens": 128,
+        "first_token_s": 79.781807002,
+        "prefill_tok_s": 7.397537040631445,
+        "decode_tok_s": 1.4560867110848548
+      },
+      "peak_rss_mb": 1400
+    },
+    {
+      "model": "qwen3-0.6b",
+      "quant": "Q8_0",
+      "engine": "ollama",
+      "file": "/root/bench/models/qwen3-0.6b-Q8_0.gguf",
+      "file_mb": 609,
+      "cold_first_token_s": 3.363761055,
+      "cold_load_s": 3.110674171,
+      "warm_first_token_s": 2.107467789,
+      "warm_load_s": 1.824485552,
+      "short": {
+        "prompt_tokens": 35,
+        "out_tokens": 128,
+        "first_token_s": 0.281738795,
+        "prefill_tok_s": 140.39704283714346,
+        "decode_tok_s": 29.82651917763626
+      },
+      "long": {
+        "prompt_tokens": 590,
+        "out_tokens": 128,
+        "first_token_s": 5.023907359,
+        "prefill_tok_s": 119.69983339406241,
+        "decode_tok_s": 22.905879205488105
+      },
+      "peak_rss_mb": 1363
+    },
+    {
+      "model": "qwen3-1.7b",
+      "quant": "Q4_K_M",
+      "engine": "nollama",
+      "file": "/root/bench/models/qwen3-1.7b-Q4_K_M.gguf",
+      "file_mb": 1296,
+      "kernels": "avx2+fma",
+      "cold_first_token_s": 6.678887676,
+      "cold_load_s": 0.164451007,
+      "warm_first_token_s": 5.804348336,
+      "warm_load_s": 0.089672965,
+      "short": {
+        "prompt_tokens": 35,
+        "out_tokens": 128,
+        "first_token_s": 6.112308882,
+        "prefill_tok_s": 5.737575324077352,
+        "decode_tok_s": 1.6623845255242014
+      },
+      "long": {
+        "prompt_tokens": 590,
+        "out_tokens": 128,
+        "first_token_s": 86.475823871,
+        "prefill_tok_s": 6.8261963356833375,
+        "decode_tok_s": 1.6480607917681285
+      },
+      "peak_rss_mb": 2051
+    },
+    {
+      "model": "qwen3-1.7b",
+      "quant": "Q4_K_M",
+      "engine": "ollama",
+      "file": "/root/bench/models/qwen3-1.7b-Q4_K_M.gguf",
+      "file_mb": 1296,
+      "cold_first_token_s": 5.213453578,
+      "cold_load_s": 4.642532842,
+      "warm_first_token_s": 3.893731125,
+      "warm_load_s": 3.331548007,
+      "short": {
+        "prompt_tokens": 35,
+        "out_tokens": 128,
+        "first_token_s": 0.604642969,
+        "prefill_tok_s": 59.3598632348751,
+        "decode_tok_s": 17.324454550376267
+      },
+      "long": {
+        "prompt_tokens": 590,
+        "out_tokens": 128,
+        "first_token_s": 10.251697067,
+        "prefill_tok_s": 58.07978962122035,
+        "decode_tok_s": 13.479558460213187
+      },
+      "peak_rss_mb": 2079
+    },
+    {
+      "model": "qwen3-1.7b",
+      "quant": "Q8_0",
+      "engine": "nollama",
+      "file": "/root/bench/models/qwen3-1.7b-Q8_0.gguf",
+      "file_mb": 1749,
+      "kernels": "avx2+fma",
+      "cold_first_token_s": 18.36981883,
+      "cold_load_s": 0.21603029,
+      "warm_first_token_s": 16.520969182,
+      "warm_load_s": 0.121973576,
+      "short": {
+        "prompt_tokens": 35,
+        "out_tokens": 128,
+        "first_token_s": 17.946753946,
+        "prefill_tok_s": 1.950219936058861,
+        "decode_tok_s": 0.5255990949156635
+      },
+      "long": {
+        "prompt_tokens": 590,
+        "out_tokens": 128,
+        "first_token_s": 249.955369336,
+        "prefill_tok_s": 2.3605588627450977,
+        "decode_tok_s": 0.5128199372404437
+      },
+      "peak_rss_mb": 2565
+    },
+    {
+      "model": "qwen3-1.7b",
+      "quant": "Q8_0",
+      "engine": "ollama",
+      "file": "/root/bench/models/qwen3-1.7b-Q8_0.gguf",
+      "file_mb": 1749,
+      "cold_first_token_s": 5.530478101,
+      "cold_load_s": 4.609690833,
+      "warm_first_token_s": 3.538167051,
+      "warm_load_s": 2.849770212,
+      "short": {
+        "prompt_tokens": 35,
+        "out_tokens": 128,
+        "first_token_s": 0.757791673,
+        "prefill_tok_s": 47.73842615956637,
+        "decode_tok_s": 13.352793639146384
+      },
+      "long": {
+        "prompt_tokens": 590,
+        "out_tokens": 128,
+        "first_token_s": 11.594388957,
+        "prefill_tok_s": 51.017986088346376,
+        "decode_tok_s": 11.67854121881818
+      },
+      "peak_rss_mb": 2528
+    }
+  ]
+}
