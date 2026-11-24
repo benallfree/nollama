@@ -211,15 +211,15 @@ and testing without a model.
 
 ## Benchmarks against Ollama
 
-[Benchmarks](docs/benchmarks.md) compares nollama with Ollama one metric at a time, on the same machines and the same
-model files, and marks the winner of each comparison. Every number there is produced by a script from saved raw
-results. So far the scripted runs cover the CPU on five small cloud servers, with Qwen3 0.6B, 1.7B and 4B. Each dot
-below is one of those comparisons; the numbers on the right count how many comparisons nollama won, tied (within 5%)
-and lost on each metric.
+[Benchmarks](docs/benchmarks.md) compares nollama with Ollama on the same machines and the same model files. Every
+number there is produced by a script from saved raw results. So far the scripted runs cover the CPU on five small cloud
+servers, with Qwen3 0.6B, 1.7B and 4B. Two of the charts, writing speed and time to the first token:
 
-![nollama compared with Ollama, every metric](docs/images/benchmarks/summary.svg)
+![Writing speed: nollama and Ollama](docs/images/benchmarks/writing-speed.svg)
 
-nollama starts much faster, because it memory-maps the model file instead of loading it. Ollama reads prompts faster
+![First token, warm start: nollama and Ollama](docs/images/benchmarks/first-token-warm-start.svg)
+
+nollama usually starts faster, because it memory-maps the model file instead of loading it. Ollama reads prompts faster
 everywhere and writes faster on most of these machines. On the AMD EPYC Rome and Intel Broadwell servers nollama is
 currently far slower, which is a known problem with how its AVX2 kernels behave on those CPUs. GPU benchmarks will be
 added when a script produces them the same way.

@@ -76,6 +76,9 @@ func niceBounds(lo, hi float64) (float64, float64) {
 }
 
 func tickLabel(v float64, unit string) string {
+	if v == 0 {
+		return "0"
+	}
 	switch unit {
 	case "s":
 		if v < 1 {
@@ -177,71 +180,99 @@ func summarySVG(pairs []reportPair) string {
 	return b.String()
 }
 
-// metricSVG: one row per machine and model, nollama's and Ollama's values as two dots joined by a line (log scale).
+// metricSVG: one group per machine, and for each model two bars, nollama's and Ollama's, on a linear axis from zero,
+// with the value at the end of each bar.
 func metricSVG(m reportMetric, pairs []reportPair) string {
 	var rows []reportPair
-	lo, hi := math.Inf(1), 0.0
+	hi := 0.0
 	for _, p := range pairs {
 		a, b := m.get(p.ours), m.get(p.theirs)
 		if a <= 0 || b <= 0 {
 			continue
 		}
 		rows = append(rows, p)
-		lo, hi = math.Min(lo, math.Min(a, b)), math.Max(hi, math.Max(a, b))
+		hi = math.Max(hi, math.Max(a, b))
 	}
-	lo, hi = niceBounds(lo, hi)
-	const w, left, right, top, rowH, groupGap = 900.0, 250.0, 40.0, 92.0, 22.0, 14.0
+	step := linStep(hi)
+	hi = math.Ceil(hi/step) * step
+	const w, left, right, top, barH, gap, rowGap, groupGap = 900.0, 250.0, 90.0, 92.0, 9.0, 2.0, 10.0, 16.0
+	rowH := 2*barH + gap + rowGap
 	groups := 0
 	for i, p := range rows {
 		if i == 0 || rows[i-1].machine != p.machine {
 			groups++
 		}
 	}
-	h := top + rowH*float64(len(rows)) + groupGap*float64(groups) + 40
-	ax := logAxis{lo, hi, left, w - right}
+	h := top + rowH*float64(len(rows)) + (groupGap+10)*float64(groups) + 40
+	x := func(v float64) float64 { return left + v/hi*(w-left-right) }
 	var b svgBuf
 	b.f(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %.0f %.0f" width="%.0f" height="%.0f" role="img" aria-label="%s: nollama and Ollama">`+"\n", w, h, w, h, html.EscapeString(m.title))
 	b.f("%s\n", chartStyle)
 	b.f(`<rect class="bg" width="%.0f" height="%.0f" rx="8"/>`+"\n", w, h)
-	b.text(20, 30, "t1", "start", 17, "600", m.title)
-	better := "Lower is better."
-	if m.higher {
-		better = "Higher is better."
+	title := m.title
+	better := "Longer bars are better."
+	if !m.higher {
+		better = "Shorter bars are better."
 	}
-	b.text(20, 52, "t2", "start", 12, "", m.about+" "+better+" Log scale.")
+	b.text(20, 30, "t1", "start", 17, "600", title+" ("+unitName(m.unit)+")")
+	b.text(20, 52, "t2", "start", 12, "", m.about+" "+better)
 	b.legend(20, 76)
 	plotBottom := h - 32
-	for _, t := range ax.ticks() {
-		x := ax.x(t)
-		b.f(`<line class="grid" x1="%.1f" x2="%.1f" y1="%.1f" y2="%.1f" stroke-width="1"/>`+"\n", x, x, top-6, plotBottom)
-		b.text(x, plotBottom+16, "t2", "middle", 11, "", tickLabel(t, m.unit))
+	for k := 0; float64(k)*step <= hi*1.0001; k++ {
+		t := math.Round(float64(k)*step*1e6) / 1e6
+		class := "grid"
+		if t == 0 {
+			class = "axis"
+		}
+		b.f(`<line class="%s" x1="%.1f" x2="%.1f" y1="%.1f" y2="%.1f" stroke-width="1"/>`+"\n", class, x(t), x(t), top-6, plotBottom)
+		b.text(x(t), plotBottom+16, "t2", "middle", 11, "", tickLabel(t, m.unit))
 	}
 	y := top
 	for i, p := range rows {
 		if i == 0 || rows[i-1].machine != p.machine {
 			y += groupGap
 			b.text(20, y, "t1", "start", 12, "600", p.machine)
-			y += 2
+			y += 10
 		}
-		cy := y + rowH/2
-		b.text(left-14, cy+4, "t2", "end", 12, "", p.model)
-		a, o := m.get(p.ours), m.get(p.theirs)
-		xa, xo := ax.x(a), ax.x(o)
-		b.f(`<line class="link" x1="%.1f" x2="%.1f" y1="%.1f" y2="%.1f" stroke-width="2"/>`+"\n", xa, xo, cy, cy)
-		// value labels go outside the pair: the lower value on the left, the higher on the right
-		lv, rv := a, o
-		lx, rx := xa, xo
-		if xa > xo {
-			lv, rv, lx, rx = o, a, xo, xa
+		b.text(left-14, y+barH+gap/2+4, "t2", "end", 12, "", p.model)
+		for j, e := range []struct {
+			class, who string
+			v          float64
+		}{{"n", "nollama", m.get(p.ours)}, {"o", "Ollama", m.get(p.theirs)}} {
+			by := y + float64(j)*(barH+gap)
+			bw := math.Max(1, x(e.v)-left)
+			b.f(`<rect class="%s" x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="2"><title>%s: %s</title></rect>`+"\n", e.class, left, by, bw, barH, e.who, fmtVal(e.v, m.unit))
+			b.text(left+bw+6, by+barH-1, "t2", "start", 10, "", fmtVal(e.v, m.unit))
 		}
-		b.text(lx-9, cy+4, "t2", "end", 10, "", fmtVal(lv, m.unit))
-		b.text(rx+9, cy+4, "t2", "start", 10, "", fmtVal(rv, m.unit))
-		b.f(`<circle class="o ring" cx="%.1f" cy="%.1f" r="5" stroke-width="1.5"><title>Ollama: %s</title></circle>`+"\n", xo, cy, fmtVal(o, m.unit))
-		b.f(`<circle class="n ring" cx="%.1f" cy="%.1f" r="5" stroke-width="1.5"><title>nollama: %s</title></circle>`+"\n", xa, cy, fmtVal(a, m.unit))
 		y += rowH
 	}
 	b.f("</svg>\n")
 	return b.String()
+}
+
+// linStep picks a 1-2-5 tick step that gives about five ticks up to hi.
+func linStep(hi float64) float64 {
+	if hi <= 0 {
+		return 1
+	}
+	raw := hi / 5
+	p := math.Pow(10, math.Floor(math.Log10(raw)))
+	for _, m := range []float64{1, 2, 5, 10} {
+		if m*p >= raw {
+			return m * p
+		}
+	}
+	return 10 * p
+}
+
+func unitName(unit string) string {
+	switch unit {
+	case "s":
+		return "seconds"
+	case "MB":
+		return "MB"
+	}
+	return unit
 }
 
 // writeCharts writes summary.svg and one SVG per metric into dir.
