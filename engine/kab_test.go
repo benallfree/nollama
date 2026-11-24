@@ -76,6 +76,32 @@ func TestKernelAB(t *testing.T) {
 			}
 		}})
 	}
+	if gemmQ4K2x4Plain != nil {
+		w := randBlocks(r, rows*nb, q4kBytes, []int{0})
+		rb, sb := nb*q4kBytes, nb*q4kScaleSize
+		sc := make([]byte, rows*sb)
+		for j := 0; j < rows; j++ {
+			q4kScalesPlain(w[j*rb:], sc[j*sb:], nb)
+		}
+		ks = append(ks, kern{"q4k 2x4 plain (new)", func() {
+			for j := 0; j < rows; j += 2 {
+				gemmQ4K2x4Plain(w[j*rb:], w[(j+1)*rb:], sc[j*sb:], sc[(j+1)*sb:], y, nb*q8kBytes, nb, &o8)
+			}
+		}})
+	}
+	if gemmQ6K2x4Plain != nil {
+		w := randBlocks(r, rows*nb, q6kBytes, []int{208})
+		rb, sb := nb*q6kBytes, nb*q6kScaleSize
+		sc := make([]byte, rows*sb)
+		for j := 0; j < rows; j++ {
+			q6kScales(w[j*rb:], sc[j*sb:], nb)
+		}
+		ks = append(ks, kern{"q6k 2x4 plain (new)", func() {
+			for j := 0; j < rows; j += 2 {
+				gemmQ6K2x4Plain(w[j*rb:], w[(j+1)*rb:], sc[j*sb:], sc[(j+1)*sb:], y, nb*q8kBytes, nb, &o8)
+			}
+		}})
+	}
 	if gemmQ6K1x4 != nil {
 		w, rb := randBlocks(r, rows*nb, q6kBytes, []int{208}), nb*q6kBytes
 		ks = append(ks, kern{"q6k 1x4 (new)", func() {

@@ -36,6 +36,21 @@ var (
 
 const q4kScaleBytes = 80
 
+// gemmQ4K2x4Plain is gemmQ4K2x4 reading 4 plain Q8_K activation rows stride bytes apart (amd64), with scales
+// from q4kScalesPlain, q4kScaleSize bytes per block.
+var (
+	gemmQ4K2x4Plain func(w0, w1, s0, s1, y []byte, stride, nb int, out *[8]float32)
+	q4kScalesPlain  func(w, dst []byte, nb int)
+	q4kScaleSize    int
+)
+
+// gemmQ6K2x4Plain is the Q6_K counterpart (amd64), with scales from q6kScales, q6kScaleSize bytes per block.
+var (
+	gemmQ6K2x4Plain func(w0, w1, s0, s1, y []byte, stride, nb int, out *[8]float32)
+	q6kScales       func(w, dst []byte, nb int)
+	q6kScaleSize    int
+)
+
 // gemmF16x2x4, when set, computes out[r*4+c] = dot(F16 row r, y[c*stride:])
 // for rows w0, w1 and 4 float activation rows stride floats apart.
 var gemmF16x2x4 func(w0, w1 []byte, y []float32, stride int, out *[8]float32)
@@ -96,7 +111,9 @@ func packQ8K6(src, dst []byte, j, nb int) {
 // promptKernelsOff turns the 2-row prompt kernels off (for before/after
 // comparisons) and returns a function that turns them back on.
 func promptKernelsOff() (restore func()) {
-	q, f, q6 := gemmQ4K2x4, gemmF16x2x4, gemmQ6K1x4
-	gemmQ4K2x4, gemmF16x2x4, gemmQ6K1x4 = nil, nil, nil
-	return func() { gemmQ4K2x4, gemmF16x2x4, gemmQ6K1x4 = q, f, q6 }
+	q, f, q6, qp, q6p := gemmQ4K2x4, gemmF16x2x4, gemmQ6K1x4, gemmQ4K2x4Plain, gemmQ6K2x4Plain
+	gemmQ4K2x4, gemmF16x2x4, gemmQ6K1x4, gemmQ4K2x4Plain, gemmQ6K2x4Plain = nil, nil, nil, nil, nil
+	return func() {
+		gemmQ4K2x4, gemmF16x2x4, gemmQ6K1x4, gemmQ4K2x4Plain, gemmQ6K2x4Plain = q, f, q6, qp, q6p
+	}
 }

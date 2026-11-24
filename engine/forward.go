@@ -175,6 +175,18 @@ func rowGemm2x4(w *weight, a *acts) *gemm2x4 {
 			run: func(r0, r1, s0, s1 []byte, t int, out *[8]float32) {
 				gemmQ4K2x4(r0, r1, s0, s1, a.q8k4[(t/4)*nb*q8k4Bytes:], nb, out)
 			}}
+	case w.typ == typeQ4_K && gemmQ4K2x4Plain != nil && a.need8k:
+		sz := nb * q8kBytes
+		return &gemm2x4{nb: nb, sb: nb * q4kScaleSize, scales: q4kScalesPlain,
+			run: func(r0, r1, s0, s1 []byte, t int, out *[8]float32) {
+				gemmQ4K2x4Plain(r0, r1, s0, s1, a.q8k[t*sz:], sz, nb, out)
+			}}
+	case w.typ == typeQ6_K && gemmQ6K2x4Plain != nil && a.need8k:
+		sz := nb * q8kBytes
+		return &gemm2x4{nb: nb, sb: nb * q6kScaleSize, scales: q6kScales,
+			run: func(r0, r1, s0, s1 []byte, t int, out *[8]float32) {
+				gemmQ6K2x4Plain(r0, r1, s0, s1, a.q8k[t*sz:], sz, nb, out)
+			}}
 	case w.typ == typeF16 && gemmF16x2x4 != nil:
 		k := a.k
 		return &gemm2x4{run: func(r0, r1, _, _ []byte, t int, out *[8]float32) {

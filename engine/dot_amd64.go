@@ -10,6 +10,9 @@ func xgetbv() (eax, edx uint32)
 // weights), with the OS saving YMM state. Without them the Go kernels run.
 func asmFeatures() (float, ints bool, name string) {
 	if hasAVX2FMA() {
+		if useAVX512 {
+			return true, true, "avx2+fma+avx512bw"
+		}
 		return true, true, "avx2+fma"
 	}
 	return false, false, ""
@@ -36,7 +39,3 @@ func hasAVX2FMA() bool {
 	_, ebx7, _, _ := cpuid(7, 0)
 	return ebx7&(1<<5) != 0 // AVX2
 }
-
-// The 2-row prompt kernels are arm64-only so far.
-func archIntAsm()   {}
-func archFloatAsm() {}

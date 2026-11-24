@@ -50,6 +50,66 @@ func TestGemmQ4K2x4(t *testing.T) {
 	}
 }
 
+func TestGemmQ4K2x4Plain(t *testing.T) {
+	if gemmQ4K2x4Plain == nil {
+		t.Skip("no plain-layout 2x4 Q4_K kernel on this CPU")
+	}
+	r := rand.New(rand.NewPCG(5, 6))
+	for _, nb := range []int{1, 2, 3, 5, 8, 11, 24, 40} {
+		w := randBlocks(r, 2*nb, q4kBytes, []int{0, 2})
+		w0, w1 := w[:nb*q4kBytes], w[nb*q4kBytes:]
+		plain, _ := makeQ8K4(r, nb)
+		stride := nb*q8kBytes + 64 // rows need not be adjacent
+		y := make([]byte, 4*stride)
+		for c := range plain {
+			copy(y[c*stride:], plain[c])
+		}
+		var o [8]float32
+		s0, s1 := make([]byte, nb*q4kScaleSize), make([]byte, nb*q4kScaleSize)
+		q4kScalesPlain(w0, s0, nb)
+		q4kScalesPlain(w1, s1, nb)
+		gemmQ4K2x4Plain(w0, w1, s0, s1, y, stride, nb, &o)
+		for c := 0; c < 4; c++ {
+			for ri, wr := range [][]byte{w0, w1} {
+				want := dotQ4KQ8KGo(wr, plain[c], nb)
+				if math.Float32bits(o[ri*4+c]) != math.Float32bits(want) { // the reference order, bit for bit
+					t.Errorf("nb=%d row %d col %d: %v, want %v", nb, ri, c, o[ri*4+c], want)
+				}
+			}
+		}
+	}
+}
+
+func TestGemmQ6K2x4Plain(t *testing.T) {
+	if gemmQ6K2x4Plain == nil {
+		t.Skip("no plain-layout 2x4 Q6_K kernel on this CPU")
+	}
+	r := rand.New(rand.NewPCG(9, 10))
+	for _, nb := range []int{1, 2, 3, 5, 8, 11, 24, 40} {
+		w := randBlocks(r, 2*nb, q6kBytes, []int{208})
+		w0, w1 := w[:nb*q6kBytes], w[nb*q6kBytes:]
+		plain, _ := makeQ8K4(r, nb)
+		stride := nb*q8kBytes + 32
+		y := make([]byte, 4*stride)
+		for c := range plain {
+			copy(y[c*stride:], plain[c])
+		}
+		var o [8]float32
+		s0, s1 := make([]byte, nb*q6kScaleSize), make([]byte, nb*q6kScaleSize)
+		q6kScales(w0, s0, nb)
+		q6kScales(w1, s1, nb)
+		gemmQ6K2x4Plain(w0, w1, s0, s1, y, stride, nb, &o)
+		for c := 0; c < 4; c++ {
+			for ri, wr := range [][]byte{w0, w1} {
+				want := dotQ6KQ8KGo(wr, plain[c], nb)
+				if math.Float32bits(o[ri*4+c]) != math.Float32bits(want) {
+					t.Errorf("nb=%d row %d col %d: %v, want %v", nb, ri, c, o[ri*4+c], want)
+				}
+			}
+		}
+	}
+}
+
 // GGUF=<file> go test -run TestPrefillMatchesReference -v
 // Reads prompts with the prompt kernels, with the 4-column kernels, and token
 // by token, and checks that the last position's logits and the greedy
