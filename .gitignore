@@ -3,3 +3,4 @@
 /nollama.exe
 *.gguf
 *.part
+.DS_Store

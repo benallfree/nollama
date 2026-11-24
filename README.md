@@ -17,8 +17,7 @@ nothing else: no Ollama, no Python, no cgo.
 macOS or Linux, with Homebrew:
 
 ```bash
-brew tap benallfree/nollama https://github.com/benallfree/nollama
-brew install benallfree/nollama/nollama
+brew install benallfree/tap/nollama
 ```
 
 Windows, with [Scoop](https://scoop.sh):

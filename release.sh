@@ -8,8 +8,8 @@ known=$(curl -s -m 10 "https://proxy.golang.org/$module/@v/list" || true)
 #   2. ./release.sh vX.Y.Z
 #   3. Publish the draft on GitHub (brew and scoop installs fail until you do).
 #
-# It vets and tests, tags, pushes the tag, and runs goreleaser: zips, Linux packages, checksums, and the Homebrew
-# formula (Formula/) and Scoop manifest (bucket/), which goreleaser commits to main in this repo; then it pulls them.
+# It vets and tests, tags, pushes the tag, and runs goreleaser: zips, Linux packages, checksums, the Homebrew formula
+# (committed to benallfree/homebrew-tap) and the Scoop manifest (bucket/, committed to main here); then it pulls.
 #
 # Needs gh (signed in) and goreleaser.
 set -euo pipefail
@@ -62,6 +62,6 @@ step "goreleaser"
 export GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}"
 goreleaser release --clean --release-notes "$notes"
 
-step "pulling the formula and manifest goreleaser committed"
+step "pulling the Scoop manifest goreleaser committed"
 timeout 30 git pull -q --ff-only origin main
 step "draft release made for $version: publish it on https://github.com/$repo/releases (brew and scoop installs fail until then)"

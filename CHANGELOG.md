@@ -5,6 +5,11 @@ becomes `## vX.Y.Z` and its lines are the release notes (`release.sh` reads them
 
 ## Unreleased
 
+- Homebrew: nollama moved to the shared tap, `brew install benallfree/tap/nollama`. If you tapped `benallfree/nollama`, `brew update` moves you over.
+
+## v0.0.1-alpha.2
+
+- Integer models (`engine.LoadIntModel`, `engine.ConvertIntModel`, `nollama convert`): Qwen2.5 converted from the official weights into an integer-only forward pass whose next-token distributions are the same, bit for bit, on the CPU (NEON), Metal and CUDA, so an arithmetic coder built on them (like [Surprisal](https://github.com/benallfree/surprisal)) decodes exactly on any machine. Tokenizer access (`Tokenize`, `TokenBytes`, `ByteToken`), sessions (`NewSession`, `Feed`, batched `FeedBatch`) and pipelined decoding (`IntSession.Start`, `FindFeed`) on the GPU.
 - Experimental speech recognition: `engine.LoadWhisper` opens OpenAI Whisper models in whisper.cpp's ggml format (`ggml-tiny.bin`, `ggml-base.bin`, ...; F16, F32 or Q8_0) and `Whisper.Transcribe` turns 16 kHz audio into text on the CPU, with language detection, translation to English, segment timestamps and 30 s windows for long audio. New `audio` package: a WAV reader with resampling and Whisper's log-mel spectrogram. `go run ./engine/cmd/transcribe -m ggml-base.bin clip.wav` tries it.
 - Deterministic mode runs on the GPU on Macs: Metal kernels that give the CPU's logits bit for bit, about twice the CPU's writing speed and four times its prompt reading. NVIDIA GPUs (CUDA) get deterministic kernels too, with the same logits as the CPU and the Mac. The CPU's numbers change slightly (new golden hashes): rmsnorm now sums in float32 in a fixed order, and subnormals are flushed in rmsnorm, SwiGLU and the softmax, as GPUs do.
 - CUDA: a kernel could run before a memory clear or copy issued just ahead of it had finished, and get its output overwritten (seen as zeros on an NVIDIA A16). Clears and copies now finish before the next kernel starts.
