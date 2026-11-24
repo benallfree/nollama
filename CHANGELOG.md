@@ -5,6 +5,7 @@ becomes `## vX.Y.Z` and its lines are the release notes (`release/release.sh` re
 
 ## Unreleased
 
+- x86 CPUs: AMD EPYC Rome (Zen 2) servers ran nollama 10-25x slower than Ollama. The AVX2 kernels used a few legacy-SSE moves, which Zen 2 makes cost about 270 cycles each after AVX instructions. With every instruction VEX-encoded, a 2 vCPU Rome server writes 0.6B Q4_K_M at 27 tok/s instead of 2.3 and Q8_0 at 20 instead of 0.7, with the same output bit for bit. Intel and newer AMD CPUs are unaffected.
 - Packages moved (import paths change): `models` is now `catalog` (`github.com/benallfree/nollama/catalog`, package `catalog`), `schema` is now `engine/schema`, and the experimental `compose` and `audio` packages are now `x/compose` and `x/audio`. `engine`, `server` and `nollamatest` are unchanged. Developer tools moved to `tools/` (`go run ./tools/bench`, `go run ./tools/transcribe`).
 - `bench report` prints one table per metric, nollama next to Ollama with the winner, from saved `bench vps` results, and with `-svg` draws the same comparisons as charts (a summary of every metric and one chart per metric). The README and docs are rewritten: the guide is `docs/guide.md`, and `docs/benchmarks.md` holds only scripted results (raw data in `benchmarks/results`).
 - Homebrew: nollama moved to the shared tap, `brew install benallfree/tap/nollama`. If you tapped `benallfree/nollama`, `brew update` moves you over.
