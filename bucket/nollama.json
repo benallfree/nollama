@@ -1,19 +1,19 @@
 {
-    "version": "0.0.1-alpha.1",
+    "version": "0.0.1-alpha.2",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/benallfree/nollama/releases/download/v0.0.1-alpha.1/nollama_0.0.1-alpha.1_windows_amd64.zip",
+            "url": "https://github.com/benallfree/nollama/releases/download/v0.0.1-alpha.2/nollama_0.0.1-alpha.2_windows_amd64.zip",
             "bin": [
                 "nollama.exe"
             ],
-            "hash": "20c9ccb5cad3c94865667c9b6dafa1d8d642cd14a776069c01915cce02e3ae4c"
+            "hash": "56ef1c9ad2a34e3118a34398e92493cd9d2a6bac42a366ffc800694a362ac12b"
         },
         "arm64": {
-            "url": "https://github.com/benallfree/nollama/releases/download/v0.0.1-alpha.1/nollama_0.0.1-alpha.1_windows_arm64.zip",
+            "url": "https://github.com/benallfree/nollama/releases/download/v0.0.1-alpha.2/nollama_0.0.1-alpha.2_windows_arm64.zip",
             "bin": [
                 "nollama.exe"
             ],
-            "hash": "3d9d90348143a838c63f806496ae9ca2597f1582ec876e02b60e7b718825e164"
+            "hash": "af170531c9c3159dff5db94b76bbb1028ea0588adfac78785e10b3b43d3e6100"
         }
     },
     "homepage": "https://github.com/benallfree/nollama",
