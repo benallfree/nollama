@@ -361,3 +361,39 @@ func BenchmarkPack4x16(b *testing.B) {
 		})
 	}
 }
+
+func TestGemmF16x4x16(t *testing.T) {
+	r := rand.New(rand.NewPCG(17, 18))
+	if !hasAVX512BW() {
+		t.Skip("no AVX-512")
+	}
+	for _, nb := range []int{1, 2, 5, 128} {
+		k := 16 * nb
+		w := make([]byte, 4*2*k)
+		for i := 0; i < 4*k; i++ {
+			binary.LittleEndian.PutUint16(w[2*i:], f32ToF16(float32(r.NormFloat64()*0.1)))
+		}
+		var rows [4][]byte
+		for i := range rows {
+			rows[i] = w[i*2*k : (i+1)*2*k]
+		}
+		pw := make([]byte, nb*f16x4Bytes)
+		f16Pack4x16(&rows, pw, nb)
+		ystride := k + 3
+		y := make([]float32, 16*ystride)
+		for i := range y {
+			y[i] = float32(r.NormFloat64())
+		}
+		const ostride = 6
+		o := make([]float32, 16*ostride)
+		gemmF16x4x16Asm(pw, y, ystride, nb, o, ostride)
+		for c := 0; c < 16; c++ {
+			for ri := 0; ri < 4; ri++ {
+				want := dotF16F32Go(rows[ri], y[c*ystride:c*ystride+k])
+				if got := o[c*ostride+ri]; math.Float32bits(got) != math.Float32bits(want) {
+					t.Errorf("nb=%d row %d token %d: %v, want %v", nb, ri, c, got, want)
+				}
+			}
+		}
+	}
+}

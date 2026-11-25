@@ -122,8 +122,11 @@ func dequantRow(t uint32, row []byte, out []float32) {
 	}
 }
 
-// quantizeQ8K quantizes x (len multiple of 256) into ggml block_q8_K layout.
-func quantizeQ8K(x []float32, out []byte) {
+// quantizeQ8K quantizes x (len multiple of 256) into ggml block_q8_K layout (amd64 AVX2: elementwise_amd64.s,
+// bit-identical).
+var quantizeQ8K = quantizeQ8KGo
+
+func quantizeQ8KGo(x []float32, out []byte) {
 	for b := 0; b < len(x)/qk; b++ {
 		xb := x[b*qk : b*qk+qk]
 		ob := out[b*q8kBytes : b*q8kBytes+q8kBytes]

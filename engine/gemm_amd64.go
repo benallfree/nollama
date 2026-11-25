@@ -165,4 +165,9 @@ func archIntAsm() {
 	}
 }
 
-func archFloatAsm() {}
+func archFloatAsm() {
+	useElementwiseAVX2()
+	if hasAVX512BW() && !no4x16 {
+		gemmF16x4x16 = gemmF16x4x16Asm
+	}
+}

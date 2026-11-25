@@ -61,3 +61,16 @@ func gemmQ6K4x16Asm(w, y []byte, gstride, nb int, out []float32, ostride int, vn
 	}
 	gemmQ6K4x16AVX512(unsafe.Pointer(&w[0]), unsafe.Pointer(&y[0]), gstride, nb, &out[0], 4*ostride)
 }
+
+//go:noescape
+func gemmF16x4x4AVX512(w, y unsafe.Pointer, ystride, nb int, out *float32, ostride int)
+
+// gemmF16x4x16Asm runs the 4x4 F16 kernel on 4 groups of 4 tokens (gemmF16x4x16 describes the arguments).
+func gemmF16x4x16Asm(w []byte, y []float32, ystride, nb int, out []float32, ostride int) {
+	_ = w[nb*f16x4Bytes-1]
+	_ = y[15*ystride+16*nb-1]
+	_ = out[15*ostride+3]
+	for c := 0; c < 16; c += 4 {
+		gemmF16x4x4AVX512(unsafe.Pointer(&w[0]), unsafe.Pointer(&y[c*ystride]), 4*ystride, nb, &out[c*ostride], 4*ostride)
+	}
+}

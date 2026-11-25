@@ -193,6 +193,21 @@ func q6kPack4x16(rows *[4][]byte, dst []byte, nb int) {
 	}
 }
 
+// gemmF16x4x16, when set, computes out[c*ostride+r] = dot(F16 row r, y[c*ystride:]) (the reference order of
+// dotF16F32Go) for 4 rows packed by f16Pack4x16 (nb blocks of 16 elements) and 16 float activation rows.
+var gemmF16x4x16 func(w []byte, y []float32, ystride, nb int, out []float32, ostride int)
+
+const f16x4Bytes = 128 // per 4 rows per 16 elements
+
+// f16Pack4x16 interleaves 4 F16 rows by 16 elements: block j holds the 4 rows' elements [16j, 16j+16).
+func f16Pack4x16(rows *[4][]byte, dst []byte, nb int) {
+	for j := 0; j < nb; j++ {
+		for r := 0; r < 4; r++ {
+			copy(dst[j*f16x4Bytes+32*r:j*f16x4Bytes+32*r+32], rows[r][32*j:32*j+32])
+		}
+	}
+}
+
 // gemmF16x2x4, when set, computes out[r*4+c] = dot(F16 row r, y[c*stride:])
 // for rows w0, w1 and 4 float activation rows stride floats apart.
 var gemmF16x2x4 func(w0, w1 []byte, y []float32, stride int, out *[8]float32)
@@ -253,9 +268,9 @@ func packQ8K6(src, dst []byte, j, nb int) {
 // promptKernelsOff turns the 2-row prompt kernels off (for before/after
 // comparisons) and returns a function that turns them back on.
 func promptKernelsOff() (restore func()) {
-	q, f, q6, qp, q6p, q16, q616 := gemmQ4K2x4, gemmF16x2x4, gemmQ6K1x4, gemmQ4K2x4Plain, gemmQ6K2x4Plain, gemmQ4K4x16, gemmQ6K4x16
-	gemmQ4K2x4, gemmF16x2x4, gemmQ6K1x4, gemmQ4K2x4Plain, gemmQ6K2x4Plain, gemmQ4K4x16, gemmQ6K4x16 = nil, nil, nil, nil, nil, nil, nil
+	q, f, q6, qp, q6p, q16, q616, f16 := gemmQ4K2x4, gemmF16x2x4, gemmQ6K1x4, gemmQ4K2x4Plain, gemmQ6K2x4Plain, gemmQ4K4x16, gemmQ6K4x16, gemmF16x4x16
+	gemmQ4K2x4, gemmF16x2x4, gemmQ6K1x4, gemmQ4K2x4Plain, gemmQ6K2x4Plain, gemmQ4K4x16, gemmQ6K4x16, gemmF16x4x16 = nil, nil, nil, nil, nil, nil, nil, nil
 	return func() {
-		gemmQ4K2x4, gemmF16x2x4, gemmQ6K1x4, gemmQ4K2x4Plain, gemmQ6K2x4Plain, gemmQ4K4x16, gemmQ6K4x16 = q, f, q6, qp, q6p, q16, q616
+		gemmQ4K2x4, gemmF16x2x4, gemmQ6K1x4, gemmQ4K2x4Plain, gemmQ6K2x4Plain, gemmQ4K4x16, gemmQ6K4x16, gemmF16x4x16 = q, f, q6, qp, q6p, q16, q616, f16
 	}
 }

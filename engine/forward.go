@@ -219,6 +219,12 @@ func rowGemm4x16(w *weight, a *acts) *gemm4x16 {
 	if floatRef || a.rowByRow {
 		return nil
 	}
+	if w.typ == typeF16 && gemmF16x4x16 != nil && a.k%16 == 0 {
+		k := a.k
+		return &gemm4x16{nb: k / 16, wb: f16x4Bytes, pack: f16Pack4x16, run: func(pw []byte, t int, out []float32, ostride int) {
+			gemmF16x4x16(pw, a.f[t*k:], k, k/16, out, ostride)
+		}}
+	}
 	nb := a.k / qk
 	gs := nb * q8k16GBytes
 	switch {
@@ -402,16 +408,32 @@ func matmul(p *pool, a *acts, t0 int, segs ...mmSeg) {
 // inputs and results are flushed to zero, as GPUs do (ftz32).
 func rmsnorm(out, x, w []float32, eps float64) {
 	var a [32]float32
-	for i, v := range x {
-		v = ftz32(v)
-		a[i&31] = ftz32(fma32(v, v, a[i&31]))
+	fast := rmsSumSq != nil && len(x) > 0 && len(x)%32 == 0
+	if fast {
+		rmsSumSq(x, &a)
+	} else {
+		for i, v := range x {
+			v = ftz32(v)
+			a[i&31] = ftz32(fma32(v, v, a[i&31]))
+		}
 	}
 	ss := sum32(&a)
 	scale := 1 / float32(math.Sqrt(float64(ss/float32(len(x))+float32(eps)))) // float32 sqrt, correctly rounded
+	if fast {
+		rmsScale(out, x, w, scale)
+		return
+	}
 	for i, v := range x {
 		out[i] = ftz32(ftz32(ftz32(v)*scale) * ftz32(w[i]))
 	}
 }
+
+// rmsSumSq and rmsScale, when set (amd64 AVX2), are rmsnorm's two loops for lengths that are multiples of 32,
+// bit-identical to the Go loops.
+var (
+	rmsSumSq func(x []float32, acc *[32]float32)
+	rmsScale func(out, x, w []float32, s float32)
+)
 
 // state is one generation's KV cache and scratch buffers.
 type state struct {
@@ -647,11 +669,7 @@ func (m *Model) forward(s *state, tokens []int, pos int) {
 				for i := 0; i < 4; i++ {
 					row := sc[i*ctxP : i*ctxP+4*n4]
 					ctx := pos + ts[i] + 1
-					mx := float32(math.Inf(-1))
-					for j := 0; j < ctx; j++ {
-						row[j] *= scale
-						mx = max(mx, row[j])
-					}
+					mx := scaleMaxRow(row[:ctx], scale)
 					if s.packStart != nil { // hide the other packed sequences
 						for j := s.packBase; j < s.packStart[ts[i]]; j++ {
 							row[j] = float32(math.Inf(-1))
@@ -661,16 +679,12 @@ func (m *Model) forward(s *state, tokens []int, pos int) {
 							mx = max(mx, row[j])
 						}
 					}
+					expSubRow(row[:ctx], mx)
 					var sum float32
-					for j := 0; j < ctx; j++ {
-						e := expf(row[j] - mx)
-						row[j] = e
+					for _, e := range row[:ctx] { // in order
 						sum += e
 					}
-					inv := 1 / sum
-					for j := 0; j < ctx; j++ {
-						row[j] = ftz32(row[j] * inv) // as a GPU computes it: probabilities can fall below 2^-126
-					}
+					mulFTZRow(row[:ctx], 1/sum) // as a GPU computes it: probabilities can fall below 2^-126
 					clear(row[ctx:])
 				}
 				if vc != nil {
@@ -708,9 +722,7 @@ func (m *Model) forward(s *state, tokens []int, pos int) {
 				t, b := task/nblk, task%nblk
 				o := t*hp.ffn + b*bs
 				hf, g, u := s.af.f[o:o+bs], s.gate[o:o+bs], s.up[o:o+bs]
-				for i := range hf {
-					hf[i] = swiglu(g[i], u[i])
-				}
+				swigluRow(hf, g, u)
 				s.af.quantizeRow(t, b*bs, (b+1)*bs)
 			}
 		})

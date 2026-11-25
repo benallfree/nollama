@@ -84,6 +84,43 @@ func swiglu(g, u float32) float32 {
 	return ftz32(ftz32(g/(1+expf(-g))) * ftz32(u))
 }
 
+// Elementwise row steps of softmax and SwiGLU. The Go versions define the results; the asm versions (amd64 AVX2)
+// apply the same float32 operations to each element, so they are bit-identical.
+var (
+	expSubRow   = expSubRowGo   // x[j] = expf(x[j] - m)
+	swigluRow   = swigluRowGo   // h[i] = swiglu(g[i], u[i])
+	scaleMaxRow = scaleMaxRowGo // x[j] *= s; returns max(x) (-Inf when empty)
+	mulFTZRow   = mulFTZRowGo   // x[j] = ftz32(x[j] * s)
+)
+
+func expSubRowGo(x []float32, m float32) {
+	for j, v := range x {
+		x[j] = expf(v - m)
+	}
+}
+
+func swigluRowGo(h, g, u []float32) {
+	g, u = g[:len(h)], u[:len(h)]
+	for i := range h {
+		h[i] = swiglu(g[i], u[i])
+	}
+}
+
+func scaleMaxRowGo(x []float32, s float32) float32 {
+	mx := float32(math.Inf(-1))
+	for j := range x {
+		x[j] *= s
+		mx = max(mx, x[j])
+	}
+	return mx
+}
+
+func mulFTZRowGo(x []float32, s float32) {
+	for j, v := range x {
+		x[j] = ftz32(v * s)
+	}
+}
+
 // expf is a fast float32 exp (max rel. error ~2e-7 on [-87, 88]).
 func expf(x float32) float32 {
 	if x < -87 {

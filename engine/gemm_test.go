@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"encoding/binary"
 	"math"
 	"math/rand/v2"
 	"os"
@@ -273,5 +274,34 @@ func TestMatmul4x16(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestMatmulF16x4x16(t *testing.T) {
+	if gemmF16x4x16 == nil {
+		t.Skip("no F16 4x16 kernel on this CPU")
+	}
+	r := rand.New(rand.NewPCG(19, 20))
+	const k, rows, n, t0 = 96, 37, 41, 4
+	w := &weight{typ: typeF16, cols: k, rows: rows, rowBytes: 2 * k, data: make([]byte, 2*k*rows)}
+	for i := 0; i < k*rows; i++ {
+		binary.LittleEndian.PutUint16(w.data[2*i:], f32ToF16(float32(r.NormFloat64()*0.1)))
+	}
+	a := newActs(n, k)
+	a.n = n
+	for i := range a.f {
+		a.f[i] = float32(r.NormFloat64())
+	}
+	p := newPool(3, nil)
+	a.quantize(p, w)
+	out := make([]float32, (n-t0)*rows)
+	matmul(p, a, t0, mmSeg{w: w, out: out, stride: rows})
+	for tt := t0; tt < n; tt++ {
+		for ri := 0; ri < rows; ri++ {
+			want := dotF16F32Go(w.row(ri), a.f[tt*k:(tt+1)*k])
+			if got := out[(tt-t0)*rows+ri]; math.Float32bits(got) != math.Float32bits(want) {
+				t.Fatalf("token %d row %d: %v, want %v", tt, ri, got, want)
+			}
+		}
 	}
 }
