@@ -5,6 +5,8 @@ becomes `## vX.Y.Z` and its lines are the release notes (`release/release.sh` re
 
 ## Unreleased
 
+- Integer models on Metal: batched matrix products (compression) run through simdgroup matrices, the same integers bit for bit (one half x half -> float multiply-accumulate per product, exact for the same reason as before). The products are 1.9-3.8x faster on an M1 Max; compression is 1.14-1.36x faster with the 0.5B model (BJJ at level 1: 21.7 -> 16.0 s). `NOLLAMA_INT_NOSG=1` keeps the previous kernel; GPUs that can't compile the new one keep it too.
+
 ## v0.0.1-alpha.3
 
 - Integer models: new arithmetic (the distributions change; Surprisal 0.0.1-alpha.2's spec): activations into a matrix product have 12-bit mantissas, queries 12-bit, cached keys 16-bit and values 12-bit with one exponent per vector. Distributions are as sharp as before (Surprisal's archives within a byte) and the GPU runs faster: batched matrix products in exact float (their 64-term group sums are integers below 2^24), and one 32-bit multiply per attention score term. Metal batches (compression) run about 1.7x faster on an M1 Max with the 0.5B model. `NewWindowSession` runs a session with an attention window (the last N positions plus the first few), the same on the CPU, Metal and CUDA.

@@ -6,6 +6,8 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/benallfree/nollama/engine/internal/metal"
@@ -13,6 +15,9 @@ import (
 
 //go:embed gpu_int.metal
 var metalIntSource string
+
+//go:embed gpu_int_sg.metal
+var metalIntSGSource string
 
 // intKernels are the integer models' kernels, the same names in gpu_int.metal and gpu_int.cu.
 var intKernels = []string{"int_embed", "int_norm", "int_matvec", "int_qkv", "int_blockf", "int_mlp", "int_table1",
@@ -56,6 +61,14 @@ func openIntMetal(m *IntModel) (intDev, ibuf, error) {
 		if ps[k].MaxThreads < intTG {
 			dev.Close()
 			return nil, nil, fmt.Errorf("metal: %s runs at most %d threads per group, needs %d", k, ps[k].MaxThreads, intTG)
+		}
+	}
+	// int_gemm through simdgroup matrices: the same integers, 2-4x faster. Kept only if it compiles here (Apple GPU
+	// family 7+) and fits the 256-thread groups int_gemm's dispatch uses; NOLLAMA_INT_NOSG=1 keeps the plain kernel.
+	if os.Getenv("NOLLAMA_INT_NOSG") == "" {
+		src := "#define AQ " + strconv.Itoa(intActBits) + "\n" + metalIntSGSource
+		if sp, err := dev.Compile(src, "int_gemm_sg"); err == nil && sp["int_gemm_sg"].MaxThreads >= 256 {
+			ps["int_gemm"] = sp["int_gemm_sg"]
 		}
 	}
 	w, err := dev.Wrap(m.g.data)
