@@ -64,7 +64,7 @@ func openIntMetal(m *IntModel) (intDev, ibuf, error) {
 		return nil, nil, err
 	}
 	d := &metalIntDev{dev: dev, ps: ps}
-	if len(m.g.data) >= metalBigModel {
+	if int64(len(m.g.data)) >= metalBigModel {
 		d.chunk = metalBigChunk
 	}
 	return d, &metalIntBuf{w}, nil
