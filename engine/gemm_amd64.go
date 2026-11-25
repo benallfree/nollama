@@ -154,6 +154,12 @@ func archIntAsm() {
 		_, _ = s0[nb*q6kScaleBytes-1], s1[nb*q6kScaleBytes-1]
 		q6(bptr(w0), bptr(w1), bptr(s0), bptr(s1), bptr(y), stride, nb, &out[0])
 	}
+	if hasAVX512BW() && !no4x16 {
+		vnni := hasAVX512VNNI()
+		gemmQ4K4x16 = func(w, y []byte, gstride, nb int, out []float32, ostride int) {
+			gemmQ4K4x16Asm(w, y, gstride, nb, out, ostride, vnni)
+		}
+	}
 }
 
 func archFloatAsm() {}

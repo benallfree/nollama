@@ -5,6 +5,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"runtime"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -20,12 +21,16 @@ func TestKernelAB(t *testing.T) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	r := rand.New(rand.NewPCG(1, 2))
-	const rows, cols, reps = 32, 2048, 10
+	rows, cols, reps, trials := 32, 2048, 10, 400
+	if n, err := strconv.Atoi(os.Getenv("KABROWS")); err == nil { // a weight set bigger than L2: read from memory
+		rows, reps, trials = n, 1, 20
+	}
 	nb := cols / qk
 	type kern struct {
 		name string
 		run  func()
 	}
+	toks := map[string]int{} // tokens per call, when not 4
 	var ks []kern
 	acts := func() (plain [4][]byte, k4, k6 []byte) {
 		k4, k6 = make([]byte, nb*q8k4Bytes), make([]byte, nb*q8k6Bytes)
@@ -134,11 +139,14 @@ func TestKernelAB(t *testing.T) {
 			}})
 		}
 	}
+	for _, k := range kab4x16(r, rows, nb) {
+		ks, toks[k.name] = append(ks, kern{k.name, k.run}), k.toks
+	}
 	best := make([]time.Duration, len(ks))
 	for i := range best {
 		best[i] = 1 << 62
 	}
-	for trial := 0; trial < 400; trial++ {
+	for trial := 0; trial < trials; trial++ {
 		for i, k := range ks {
 			t0 := time.Now()
 			for rep := 0; rep < reps; rep++ {
@@ -148,6 +156,7 @@ func TestKernelAB(t *testing.T) {
 		}
 	}
 	for i, k := range ks {
-		fmt.Printf("%-14s %6.1f GMAC/s\n", k.name, float64(reps*rows*cols*4)/best[i].Seconds()/1e9)
+		n := max(toks[k.name], 4)
+		fmt.Printf("%-14s %6.1f GMAC/s\n", k.name, float64(reps*rows*cols*n)/best[i].Seconds()/1e9)
 	}
 }

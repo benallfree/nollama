@@ -13,12 +13,14 @@ type acts struct {
 	q80x4          []byte // groups of 4 rows interleaved, for the 4-column Q8_0 kernel
 	q8k4           []byte // groups of 4 rows in the q8k4 layout, for the 2x4 Q4_K kernel
 	q8k6           []byte // groups of 4 rows in the q8k6 layout, for the 1x4 Q6_K kernel
+	q8k16          []byte // groups of 4 rows packed by q8kPack16, for the 4x16 Q4_K kernel
 	need8k, need80 bool
 	// rowByRow skips the 4-row kernels (speculative decoding's check, speculative.go). They follow the reference order
 	// and give the same bits as the 1-row ones (TestKernelsReferenceOrder), so a batch already gives each token exactly
 	// the logits a one-token forward would; this is belt and braces.
 	rowByRow       bool
 	needK4, needK6 bool
+	needK16        bool
 }
 
 func newActs(maxN, k int) *acts {
@@ -30,6 +32,9 @@ func newActs(maxN, k int) *acts {
 		}
 		if gemmQ6K1x4 != nil && maxN >= 4 {
 			a.q8k6 = make([]byte, maxN/4*k/qk*q8k6Bytes)
+		}
+		if gemmQ4K4x16 != nil && maxN >= 16 {
+			a.q8k16 = make([]byte, maxN/4*k/qk*q8k16GBytes)
 		}
 	}
 	if k%32 == 0 {
@@ -43,12 +48,13 @@ func newActs(maxN, k int) *acts {
 
 // prepare records which quantized forms the given weights need.
 func (a *acts) prepare(ws ...*weight) {
-	a.need8k, a.need80, a.needK4, a.needK6 = false, false, false, false
+	a.need8k, a.need80, a.needK4, a.needK6, a.needK16 = false, false, false, false, false
 	for _, w := range ws {
 		switch w.typ {
 		case typeQ4_K:
 			a.need8k = true
 			a.needK4 = a.q8k4 != nil
+			a.needK16 = a.q8k16 != nil
 		case typeQ6_K:
 			a.need8k = true
 			a.needK6 = a.q8k6 != nil
@@ -72,6 +78,9 @@ func (a *acts) quantizeRow(t, e0, e1 int) {
 			}
 			if a.needK6 {
 				packQ8K6(src, a.q8k6[gb*q8k6Bytes:], t%4, (e1-e0)/qk)
+			}
+			if a.needK16 {
+				q8kPack16(src, a.q8k16[gb*q8k16GBytes:], t%4, (e1-e0)/qk)
 			}
 		}
 	}
@@ -196,6 +205,29 @@ func rowGemm2x4(w *weight, a *acts) *gemm2x4 {
 	return nil
 }
 
+// gemm4x16 is a 4-row x 16-token prompt kernel for one weight: per tile, pack packs 4 rows into nb blocks of
+// wb bytes; run then computes those rows against activation rows t..t+15 (t a multiple of 4) into
+// out[c*ostride+r] (row r, token t+c).
+type gemm4x16 struct {
+	nb, wb int
+	pack   func(rows *[4][]byte, dst []byte, nb int)
+	run    func(w []byte, t int, out []float32, ostride int)
+}
+
+func rowGemm4x16(w *weight, a *acts) *gemm4x16 {
+	if floatRef || a.rowByRow {
+		return nil
+	}
+	nb := a.k / qk
+	if w.typ == typeQ4_K && gemmQ4K4x16 != nil && a.needK16 {
+		gs := nb * q8k16GBytes
+		return &gemm4x16{nb: nb, wb: q4k4x16Bytes, pack: q4kPack4x16, run: func(pw []byte, t int, out []float32, ostride int) {
+			gemmQ4K4x16(pw, a.q8k16[(t/4)*gs:], gs, nb, out, ostride)
+		}}
+	}
+	return nil
+}
+
 // rowGemm1x4 returns a 1-row x 4-column prompt kernel taking activation rows
 // t..t+3 (t a multiple of 4), to use in place of rowDot4, or nil.
 func rowGemm1x4(w *weight, a *acts) func(row []byte, t int, out *[4]float32) {
@@ -233,6 +265,7 @@ func matmul(p *pool, a *acts, t0 int, segs ...mmSeg) {
 		dot   func([]byte, int) float32
 		dot4  func([]byte, int, *[4]float32)
 		g2x4  *gemm2x4
+		g4x16 *gemm4x16
 		first int // first tile index
 	}
 	n := a.n - t0
@@ -246,6 +279,7 @@ func matmul(p *pool, a *acts, t0 int, segs ...mmSeg) {
 		ts[i] = tileSeg{dot: rowDot(s.w, a), dot4: rowDot4(s.w, a), first: total}
 		if t0%4 == 0 {
 			ts[i].g2x4 = rowGemm2x4(s.w, a)
+			ts[i].g4x16 = rowGemm4x16(s.w, a)
 			if d := rowGemm1x4(s.w, a); d != nil {
 				ts[i].dot4 = d
 			}
@@ -267,6 +301,37 @@ func matmul(p *pool, a *acts, t0 int, segs ...mmSeg) {
 			r1 := min(r0+tile, s.w.rows)
 			dot, dot4 := ts[si].dot, ts[si].dot4
 			t := t0
+			if g := ts[si].g4x16; g != nil && t+16 <= a.n {
+				// pack the tile's rows 4 at a time (the last group repeats its last row), then walk tokens 16 at a time
+				nq, qb := (r1-r0+3)/4, g.nb*g.wb
+				bp := scaleBufs.Get().(*[]byte)
+				if cap(*bp) < nq*qb {
+					*bp = make([]byte, nq*qb)
+				}
+				pw := (*bp)[:nq*qb]
+				for q := 0; q < nq; q++ {
+					var rows [4][]byte
+					for i := range rows {
+						rows[i] = s.w.row(min(r0+4*q+i, r1-1))
+					}
+					g.pack(&rows, pw[q*qb:], g.nb)
+				}
+				var o [64]float32
+				for ; t+16 <= a.n; t += 16 {
+					for q := 0; q < nq; q++ {
+						r := r0 + 4*q
+						if r+4 <= r1 { // whole group: the kernel writes the output rows itself
+							g.run(pw[q*qb:], t, s.out[(t-t0)*s.stride+r:], s.stride)
+							continue
+						}
+						g.run(pw[q*qb:], t, o[:], 4)
+						for c := 0; c < 16; c++ {
+							copy(s.out[(t-t0+c)*s.stride+r:(t-t0+c)*s.stride+r1], o[4*c:])
+						}
+					}
+				}
+				scaleBufs.Put(bp)
+			}
 			if g := ts[si].g2x4; g != nil && t+4 <= a.n {
 				var bp *[]byte
 				var sc []byte
@@ -374,6 +439,9 @@ func actsBytes(maxN, k int) int64 {
 	n := int64(maxN*k) * 4
 	if k%qk == 0 {
 		n += int64(maxN * k / qk * q8kBytes)
+		if gemmQ4K4x16 != nil && maxN >= 16 {
+			n += int64(maxN / 4 * k / qk * q8k16GBytes)
+		}
 	}
 	if k%32 == 0 {
 		n += int64(maxN * k / 32 * q80aBytes)

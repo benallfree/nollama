@@ -1,6 +1,9 @@
 package engine
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"math"
+)
 
 // The q8k4 layout holds 4 activation rows' Q8_K blocks interleaved, for the
 // 2-row x 4-column prompt kernels. Per 256-value block:
@@ -50,6 +53,75 @@ var (
 	q6kScales       func(w, dst []byte, nb int)
 	q6kScaleSize    int
 )
+
+// gemmQ4K4x16, when set (amd64 with AVX-512BW), computes 4 Q4_K rows x 16 tokens: w is the 4 rows packed by
+// q4kPack4x16, y 4 token groups packed by q8kPack16, gstride bytes apart; out[c*ostride+r] is row r times token c,
+// in the reference order.
+var gemmQ4K4x16 func(w, y []byte, gstride, nb int, out []float32, ostride int)
+
+const (
+	q4k4x16Bytes = 1408 // per 4 rows per block: qs 512, scale vectors 8*64, min vectors 4*64, d 64, dmin 64
+	q8k16GBytes  = 1104 // per 4 tokens per block: yd 16, bsum pairs 4*16, qs 64*16
+)
+
+// q4kPack4x16 packs 4 Q4_K rows (nb blocks each) for gemmQ4K4x16, q4k4x16Bytes per block:
+//
+//	qs[8][4][16]  chunk c holds bytes 16c..16c+15 of each row's qs (row r at 16r)
+//	sc[8][4][8]   int16: sub-block s, row r: the row's scale for s, 8 times (lane r of a VPMADDWD operand)
+//	mn[4][4][8]   int16: sub-block pair p, row r: (min 2p, min 2p+1) 4 times
+//	d[4][4]       float32: row r's d, 4 times
+//	dmin[4][4]    float32
+func q4kPack4x16(rows *[4][]byte, dst []byte, nb int) {
+	le := binary.LittleEndian
+	for b := 0; b < nb; b++ {
+		o := dst[b*q4k4x16Bytes : (b+1)*q4k4x16Bytes]
+		for r := 0; r < 4; r++ {
+			xb := rows[r][b*q4kBytes : (b+1)*q4kBytes]
+			for c := 0; c < 8; c++ {
+				copy(o[64*c+16*r:64*c+16*r+16], xb[16+16*c:32+16*c])
+			}
+			var mn [8]uint64
+			for s := 0; s < 8; s++ {
+				a, m := scaleMinK4(s, xb[4:16])
+				v := uint64(a) * 0x0001000100010001
+				le.PutUint64(o[512+64*s+16*r:], v)
+				le.PutUint64(o[520+64*s+16*r:], v)
+				mn[s] = uint64(m)
+			}
+			for p := 0; p < 4; p++ {
+				v := (mn[2*p] | mn[2*p+1]<<16) * 0x0000000100000001
+				le.PutUint64(o[1024+64*p+16*r:], v)
+				le.PutUint64(o[1032+64*p+16*r:], v)
+			}
+			d := uint64(math.Float32bits(f16(xb))) * 0x0000000100000001
+			m := uint64(math.Float32bits(f16(xb[2:]))) * 0x0000000100000001
+			le.PutUint64(o[1280+16*r:], d)
+			le.PutUint64(o[1288+16*r:], d)
+			le.PutUint64(o[1344+16*r:], m)
+			le.PutUint64(o[1352+16*r:], m)
+		}
+	}
+}
+
+// q8kPack16 packs one Q8_K token row (nb blocks) into slot t of a token group for gemmQ4K4x16, q8k16GBytes
+// per block:
+//
+//	yd[4]         float32: token t's scale
+//	bs[4][4][2]   int16: sub-block pair p, token t: (sum of sub-block 2p, sum of sub-block 2p+1)
+//	qs[64][4][4]  int8: group of 4 values k (values 4k..4k+3), token t
+func q8kPack16(src, dst []byte, t, nb int) {
+	for b := 0; b < nb; b++ {
+		o, yb := dst[b*q8k16GBytes:], src[b*q8kBytes:]
+		copy(o[4*t:4*t+4], yb[:4])
+		bs := func(k int) int16 { return int16(binary.LittleEndian.Uint16(yb[q8kBsumOff+2*k:])) }
+		for s := 0; s < 8; s++ {
+			binary.LittleEndian.PutUint16(o[16+16*(s/2)+4*t+2*(s%2):], uint16(bs(2*s)+bs(2*s+1)))
+		}
+		for k := 0; k < 64; k++ {
+			copy(o[80+16*k+4*t:80+16*k+4*t+4], yb[q8kQsOff+4*k:])
+		}
+	}
+}
 
 // gemmF16x2x4, when set, computes out[r*4+c] = dot(F16 row r, y[c*stride:])
 // for rows w0, w1 and 4 float activation rows stride floats apart.
@@ -111,9 +183,9 @@ func packQ8K6(src, dst []byte, j, nb int) {
 // promptKernelsOff turns the 2-row prompt kernels off (for before/after
 // comparisons) and returns a function that turns them back on.
 func promptKernelsOff() (restore func()) {
-	q, f, q6, qp, q6p := gemmQ4K2x4, gemmF16x2x4, gemmQ6K1x4, gemmQ4K2x4Plain, gemmQ6K2x4Plain
-	gemmQ4K2x4, gemmF16x2x4, gemmQ6K1x4, gemmQ4K2x4Plain, gemmQ6K2x4Plain = nil, nil, nil, nil, nil
+	q, f, q6, qp, q6p, q16 := gemmQ4K2x4, gemmF16x2x4, gemmQ6K1x4, gemmQ4K2x4Plain, gemmQ6K2x4Plain, gemmQ4K4x16
+	gemmQ4K2x4, gemmF16x2x4, gemmQ6K1x4, gemmQ4K2x4Plain, gemmQ6K2x4Plain, gemmQ4K4x16 = nil, nil, nil, nil, nil, nil
 	return func() {
-		gemmQ4K2x4, gemmF16x2x4, gemmQ6K1x4, gemmQ4K2x4Plain, gemmQ6K2x4Plain = q, f, q6, qp, q6p
+		gemmQ4K2x4, gemmF16x2x4, gemmQ6K1x4, gemmQ4K2x4Plain, gemmQ6K2x4Plain, gemmQ4K4x16 = q, f, q6, qp, q6p, q16
 	}
 }
