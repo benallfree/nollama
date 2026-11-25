@@ -52,7 +52,7 @@ func openIntMetal(m *IntModel) (intDev, ibuf, error) {
 		dev.Close()
 		return nil, nil, errors.New("metal: GPUs without unified memory aren't supported")
 	}
-	ps, err := dev.Compile(metalIntSource, intKernels...)
+	ps, err := dev.Compile(metalIntSource, append(intKernels[:len(intKernels):len(intKernels)], "int_matvec8")...)
 	if err != nil {
 		dev.Close()
 		return nil, nil, err

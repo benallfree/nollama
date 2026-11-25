@@ -6,6 +6,7 @@ becomes `## vX.Y.Z` and its lines are the release notes (`release/release.sh` re
 ## Unreleased
 
 - Integer models on Metal: batched matrix products (compression) run through simdgroup matrices, the same integers bit for bit (one half x half -> float multiply-accumulate per product, exact for the same reason as before). The products are 1.9-3.8x faster on an M1 Max; compression is 1.14-1.36x faster with the 0.5B model (BJJ at level 1: 21.7 -> 16.0 s). `NOLLAMA_INT_NOSG=1` keeps the previous kernel; GPUs that can't compile the new one keep it too.
+- Integer models on Metal: decoding one token at a time uses 8 lanes per row with 16-byte loads for the wide matrices (qkv, gate+up, the head), the same integers; about 3% less GPU time per token on an M1 Max.
 
 ## v0.0.1-alpha.3
 

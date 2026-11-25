@@ -241,6 +241,42 @@ kernel void int_matvec(device const char *q [[buffer(0)]], device const short *s
 	}
 }
 
+// int_matvec for short rows (K <= 1024) on Metal: 8 lanes per row, 4 rows per simdgroup, nt / 8 rows per threadgroup.
+// A lane reads 16 weights (one 16-byte load) and 16 activations per 128-column step; a 64-group is 4 lanes, summed by
+// shuffles in int32, scaled in 64 bits; the row's two groups of lanes are summed at the end. Integer sums: the same
+// result as int_matvec.
+kernel void int_matvec8(device const char *q [[buffer(0)]], device const short *s [[buffer(1)]],
+                        device const short *x [[buffer(2)]], device long *out [[buffer(3)]], device const int *ex [[buffer(4)]],
+                        constant int &rows [[buffer(5)]], constant int &K [[buffer(6)]], constant int &E [[buffer(7)]],
+                        constant int &einSlot [[buffer(8)]], constant int &to [[buffer(9)]],
+                        uint tg_id [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]], uint nt [[threads_per_threadgroup]]) {
+	int row = tg_id * (nt / 8) + sg * 4 + lane / 8;
+	int l8 = lane % 8;
+	int ng = K / 64;
+	device const char *qr = q + (long)min(row, rows - 1) * K; // rows past the end compute garbage nobody stores
+	device const short *sr = s + (long)min(row, rows - 1) * ng;
+	long acc = 0;
+	for (int col = 16 * l8; col < K; col += 128) {
+		int4 wv = *(device const int4 *)(qr + col);
+		device const short4 *xp = (device const short4 *)(x + col);
+		int d = 0;
+		for (int v = 0; v < 4; v++) {
+			int4 t = int4(as_type<char4>(wv[v])) * int4(xp[v]);
+			d += t.x + t.y + t.z + t.w;
+		}
+		d += simd_shuffle_xor(d, 1);
+		d += simd_shuffle_xor(d, 2);
+		if ((l8 & 3) == 0) {
+			acc += (long)d * (long)sr[col / 64];
+		}
+	}
+	acc += shx(acc, 4);
+	if (row < rows && l8 == 0) {
+		out[row] = rsh(acc, to - (E + ex[einSlot]));
+	}
+}
+
 struct QKVArgs {
 	int nq, nkv, hd, maxlen;
 	long sc; // attention scale, folded into q

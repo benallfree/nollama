@@ -206,6 +206,10 @@ func (g *intGPU) newState(m *IntModel, maxlen, win, sink int) (*intGPUState, err
 			Groups: isize{W: uint((w.out + 7) / 8), H: 1, D: 1}, Threads: isize{W: 256, H: 1, D: 1}}
 		if s.kp != nil && w.in <= 1024 && w.in%128 == 0 { // CUDA: short rows get 8 lanes each (int_matvec8, gpu_int_mma.cu)
 			d.K, d.Groups.W = "int_matvec8", uint((w.out+31)/32)
+		} else if _, ok := g.dev.(*metalIntDev); ok && w.in <= 1024 && w.in%128 == 0 && w.out > w.in {
+			// Metal: 8 lanes per row too (gpu_int.metal), 16 rows per group; faster on the wide matrices (qkv, gate+up,
+			// the head), not on the square or long-row ones
+			d.K, d.Groups.W, d.Threads.W = "int_matvec8", uint((w.out+15)/16), 128
 		}
 		return d
 	}
