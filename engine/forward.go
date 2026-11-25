@@ -33,7 +33,7 @@ func newActs(maxN, k int) *acts {
 		if gemmQ6K1x4 != nil && maxN >= 4 {
 			a.q8k6 = make([]byte, maxN/4*k/qk*q8k6Bytes)
 		}
-		if gemmQ4K4x16 != nil && maxN >= 16 {
+		if (gemmQ4K4x16 != nil || gemmQ6K4x16 != nil) && maxN >= 16 {
 			a.q8k16 = make([]byte, maxN/4*k/qk*q8k16GBytes)
 		}
 	}
@@ -54,10 +54,11 @@ func (a *acts) prepare(ws ...*weight) {
 		case typeQ4_K:
 			a.need8k = true
 			a.needK4 = a.q8k4 != nil
-			a.needK16 = a.q8k16 != nil
+			a.needK16 = a.needK16 || (a.q8k16 != nil && gemmQ4K4x16 != nil)
 		case typeQ6_K:
 			a.need8k = true
 			a.needK6 = a.q8k6 != nil
+			a.needK16 = a.needK16 || (a.q8k16 != nil && gemmQ6K4x16 != nil)
 		case typeQ8_0:
 			a.need80 = true
 		}
@@ -219,10 +220,15 @@ func rowGemm4x16(w *weight, a *acts) *gemm4x16 {
 		return nil
 	}
 	nb := a.k / qk
-	if w.typ == typeQ4_K && gemmQ4K4x16 != nil && a.needK16 {
-		gs := nb * q8k16GBytes
+	gs := nb * q8k16GBytes
+	switch {
+	case w.typ == typeQ4_K && gemmQ4K4x16 != nil && a.needK16:
 		return &gemm4x16{nb: nb, wb: q4k4x16Bytes, pack: q4kPack4x16, run: func(pw []byte, t int, out []float32, ostride int) {
 			gemmQ4K4x16(pw, a.q8k16[(t/4)*gs:], gs, nb, out, ostride)
+		}}
+	case w.typ == typeQ6_K && gemmQ6K4x16 != nil && a.needK16:
+		return &gemm4x16{nb: nb, wb: q6k4x16Bytes, pack: q6kPack4x16, run: func(pw []byte, t int, out []float32, ostride int) {
+			gemmQ6K4x16(pw, a.q8k16[(t/4)*gs:], gs, nb, out, ostride)
 		}}
 	}
 	return nil
@@ -439,7 +445,7 @@ func actsBytes(maxN, k int) int64 {
 	n := int64(maxN*k) * 4
 	if k%qk == 0 {
 		n += int64(maxN * k / qk * q8kBytes)
-		if gemmQ4K4x16 != nil && maxN >= 16 {
+		if (gemmQ4K4x16 != nil || gemmQ6K4x16 != nil) && maxN >= 16 {
 			n += int64(maxN / 4 * k / qk * q8k16GBytes)
 		}
 	}

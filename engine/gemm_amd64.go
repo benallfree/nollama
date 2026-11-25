@@ -159,6 +159,9 @@ func archIntAsm() {
 		gemmQ4K4x16 = func(w, y []byte, gstride, nb int, out []float32, ostride int) {
 			gemmQ4K4x16Asm(w, y, gstride, nb, out, ostride, vnni)
 		}
+		gemmQ6K4x16 = func(w, y []byte, gstride, nb int, out []float32, ostride int) {
+			gemmQ6K4x16Asm(w, y, gstride, nb, out, ostride, vnni)
+		}
 	}
 }
 

@@ -233,31 +233,45 @@ func TestGemmQ6K1x4(t *testing.T) {
 	}
 }
 
-// TestMatmulQ4K4x16 runs the 4x16 tile driver (row count not a multiple of 4 or 16, token count not a multiple of
+// TestMatmul4x16 runs the 4x16 tile driver (row count not a multiple of 4 or 16, token count not a multiple of
 // 16, a non-zero first token) and checks every output against the reference dot product, bit for bit.
-func TestMatmulQ4K4x16(t *testing.T) {
-	if gemmQ4K4x16 == nil {
-		t.Skip("no 4x16 Q4_K kernel on this CPU")
-	}
-	r := rand.New(rand.NewPCG(13, 14))
-	const nb, rows, n, t0 = 3, 37, 41, 4
-	w := &weight{typ: typeQ4_K, cols: nb * qk, rows: rows, rowBytes: nb * q4kBytes,
-		data: randBlocks(r, rows*nb, q4kBytes, []int{0, 2})}
-	a := newActs(n, nb*qk)
-	a.n = n
-	for i := range a.f {
-		a.f[i] = float32(r.NormFloat64())
-	}
-	p := newPool(3, nil)
-	a.quantize(p, w)
-	out := make([]float32, (n-t0)*rows)
-	matmul(p, a, t0, mmSeg{w: w, out: out, stride: rows})
-	for tt := t0; tt < n; tt++ {
-		for ri := 0; ri < rows; ri++ {
-			want := dotQ4KQ8KGo(w.row(ri), a.q8k[tt*nb*q8kBytes:], nb)
-			if got := out[(tt-t0)*rows+ri]; math.Float32bits(got) != math.Float32bits(want) {
-				t.Fatalf("token %d row %d: %v, want %v", tt, ri, got, want)
+func TestMatmul4x16(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		typ       uint32
+		size      int
+		f16       []int
+		available bool
+		ref       func(x, y []byte, nb int) float32
+	}{
+		{"q4k", typeQ4_K, q4kBytes, []int{0, 2}, gemmQ4K4x16 != nil, dotQ4KQ8KGo},
+		{"q6k", typeQ6_K, q6kBytes, []int{208}, gemmQ6K4x16 != nil, dotQ6KQ8KGo},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if !c.available {
+				t.Skip("no 4x16 kernel on this CPU")
 			}
-		}
+			r := rand.New(rand.NewPCG(13, 14))
+			const nb, rows, n, t0 = 3, 37, 41, 4
+			w := &weight{typ: c.typ, cols: nb * qk, rows: rows, rowBytes: nb * c.size,
+				data: randBlocks(r, rows*nb, c.size, c.f16)}
+			a := newActs(n, nb*qk)
+			a.n = n
+			for i := range a.f {
+				a.f[i] = float32(r.NormFloat64())
+			}
+			p := newPool(3, nil)
+			a.quantize(p, w)
+			out := make([]float32, (n-t0)*rows)
+			matmul(p, a, t0, mmSeg{w: w, out: out, stride: rows})
+			for tt := t0; tt < n; tt++ {
+				for ri := 0; ri < rows; ri++ {
+					want := c.ref(w.row(ri), a.q8k[tt*nb*q8kBytes:], nb)
+					if got := out[(tt-t0)*rows+ri]; math.Float32bits(got) != math.Float32bits(want) {
+						t.Fatalf("token %d row %d: %v, want %v", tt, ri, got, want)
+					}
+				}
+			}
+		})
 	}
 }
