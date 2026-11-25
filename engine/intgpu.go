@@ -98,28 +98,30 @@ func (g *intGPU) name() string { return g.dev.name() }
 
 // intGPUState is one session on the GPU.
 type intGPUState struct {
-	g      *intGPU
-	maxlen int
-	params ibuf    // tok, pos
-	cum    []int64 // the table, as the CPU sees it
-	cumBuf ibuf    // where it is on the GPU, when the CPU can't see GPU memory
-	fresh  bool    // cum holds the last step's table (cumBuf's copy has been read)
-	tgt    ibuf    // int_find's target and result
-	res    ibuf
-	find   []idisp
-	st     ibuf    // int_find2's decoder state (pipelined decoding, findFeed)
-	find2  []idisp // int_find2, when the device has it
-	maxch  int
-	kp, vp ibuf // the byte-plane KV cache, when planes()
-	kpTo   int  // positions the planes hold
-	mp     int  // positions per plane
-	kpl    int  // bytes per layer
-	ds     []idisp
-	bufs   []ibuf
+	g         *intGPU
+	maxlen    int
+	win, sink int     // the attention window (IntModel.NewWindowSession)
+	params    ibuf    // tok, pos
+	cum       []int64 // the table, as the CPU sees it
+	cumBuf    ibuf    // where it is on the GPU, when the CPU can't see GPU memory
+	fresh     bool    // cum holds the last step's table (cumBuf's copy has been read)
+	tgt       ibuf    // int_find's target and result
+	res       ibuf
+	find      []idisp
+	st        ibuf    // int_find2's decoder state (pipelined decoding, findFeed)
+	find2     []idisp // int_find2, when the device has it
+	maxch     int
+	kp, vp    ibuf // the byte-plane KV cache, when planes()
+	kpTo      int  // positions the planes hold
+	mp        int  // positions per plane
+	kpl       int  // bytes per layer
+	ds        []idisp
+	bufs      []ibuf
 	// kept for batches (intgpu_batch.go)
 	m       *IntModel
 	kc, vc  ibuf
-	kvLayer int
+	kLayer  int // bytes per layer of the key cache (mantissas, then shifts; gpu_int.metal's KSH)
+	kvLayer int // bytes per layer of the value cache
 	b       *intBatch
 }
 
@@ -128,8 +130,11 @@ const (
 	intTCH = 2048 // table values per threadgroup (TCH)
 )
 
-func (g *intGPU) newState(m *IntModel, maxlen int) (*intGPUState, error) {
-	s := &intGPUState{g: g, maxlen: maxlen, m: m}
+func (g *intGPU) newState(m *IntModel, maxlen, win, sink int) (*intGPUState, error) {
+	if m.nkv*m.hd > intTG {
+		return nil, errors.New("intmodel: int_qkv needs nkv * hd <= 1024")
+	}
+	s := &intGPUState{g: g, maxlen: maxlen, m: m, win: win, sink: sink}
 	nb := s.newBuffer
 	D, I, V, hd, nq, nkv, L := m.D, m.I, m.V, m.hd, m.nq, m.nkv, m.L
 	qkvN := (nq + 2*nkv) * hd
@@ -143,7 +148,7 @@ func (g *intGPU) newState(m *IntModel, maxlen int) (*intGPUState, error) {
 		dst *ibuf
 		n   int
 	}{{&s.params, 8}, {&h, 8 * D}, {&mb, 4 * max(D, I, nq*hd)}, {&ex, 16}, {&acc, 8 * accN}, {&mq, 4 * nq * hd},
-		{&shq, 4 * nq}, {&kc, 4 * (L*nkv*maxlen + intACH) * hd}, {&vc, 4 * (L*nkv*maxlen + intACH) * hd}, {&sb, 8 * nq * maxlen},
+		{&shq, 4 * nq}, {&kc, L*intKLayer(nkv, maxlen, hd) + intACH*(2*hd+4)}, {&vc, 4 * (L*nkv*maxlen + intACH) * hd}, {&sb, 8 * nq * maxlen},
 		{&o, 8 * nq * hd}, {&p, 8 * I}, {&lg, 8 * V}, {&cum, 8 * V}, {&cmax, 8 * nq * maxch}, {&zpart, 8 * nq * maxch},
 		{&opart, 8 * nq * maxch * hd}, {&tpart, 8 * 3 * tch}} {
 		if *x.dst, err = nb(x.n); err != nil {
@@ -215,9 +220,9 @@ func (g *intGPU) newState(m *IntModel, maxlen int) (*intGPUState, error) {
 	binary.LittleEndian.PutUint32(qkvArgs[8:], uint32(hd))
 	binary.LittleEndian.PutUint32(qkvArgs[12:], uint32(maxlen))
 	binary.LittleEndian.PutUint64(qkvArgs[16:], uint64(m.sc))
-	attnArgs := i32b(nq, nkv, hd, maxlen, intNA, maxch)
-	kvLayer := 4 * nkv * maxlen * hd
-	s.kc, s.vc, s.kvLayer = kc, vc, kvLayer
+	attnArgs := i32b(nq, nkv, hd, maxlen, intNA, maxch, win, sink)
+	kvLayer, kLayer := 4*nkv*maxlen*hd, intKLayer(nkv, maxlen, hd)
+	s.kc, s.vc, s.kvLayer, s.kLayer = kc, vc, kvLayer, kLayer
 	if g.dev.planes() {
 		// a step's attention reads whole chunks; batches read up to a block's rows plus a tile past the last position
 		s.mp = (maxlen+intACH-1)/intACH*intACH + 128
@@ -245,7 +250,7 @@ func (g *intGPU) newState(m *IntModel, maxlen int) (*intGPUState, error) {
 		}
 		ds = append(ds,
 			matvec(&ly.qkv, mb, 0, -24, acc),
-			one("int_qkv", B(acc), F(ly.b), F(m.ropeC), F(m.ropeS), B(s.params), BO(kc, l*kvLayer), BO(vc, l*kvLayer),
+			one("int_qkv", B(acc), F(ly.b), F(m.ropeC), F(m.ropeS), B(s.params), BO(kc, l*kLayer), BO(vc, l*kvLayer),
 				B(mq), B(shq), B(ex), iarg{Bytes: qkvArgs}, C(ly.qkv.e), C(0), C(0)),
 		)
 		var planeArgs1, planeArgs2 []iarg // the tensor-core attention reads the planes (kept per step too)
@@ -257,7 +262,7 @@ func (g *intGPU) newState(m *IntModel, maxlen int) (*intGPUState, error) {
 			planeArgs2 = []iarg{BO(s.vp, l*s.kpl), C(s.mp), C(ez)}
 		}
 		ds = append(ds,
-			idisp{K: a1, Args: append([]iarg{B(mq), B(shq), BO(kc, l*kvLayer), B(sb), B(cmax),
+			idisp{K: a1, Args: append([]iarg{B(mq), B(shq), BO(kc, l*kLayer), B(sb), B(cmax),
 				B(s.params), iarg{Bytes: attnArgs}}, planeArgs1...),
 				Groups: isize{W: uint(nkv), H: uint(maxch), D: 1}, Threads: isize{W: intACH, H: 1, D: 1}},
 			idisp{K: a2, Args: append([]iarg{B(sb), B(cmax), BO(vc, l*kvLayer), F(rawA), B(zpart),
@@ -353,12 +358,12 @@ func (s *intGPUState) cudaSteps(b stepBufs, qkvArgs, attnArgs []byte, ez, tch in
 		if l+1 < L {
 			next = m.layers[l+1].g1
 		}
-		kv, kpo := l*s.kvLayer, l*s.kpl
+		kv, kk, kpo := l*s.kvLayer, l*s.kLayer, l*s.kpl
 		ds = append(ds,
 			mv(&ly.qkv, B(b.mb), false, accQ),
-			blk("int_qkv2", 1024, B(accQ), F(ly.b), F(m.ropeC), F(m.ropeS), B(s.params), BO(b.kc, kv), BO(b.vc, kv),
+			blk("int_qkv2", 1024, B(accQ), F(ly.b), F(m.ropeC), F(m.ropeS), B(s.params), BO(b.kc, kk), BO(b.vc, kv),
 				BO(s.kp, kpo), BO(s.vp, kpo), C(s.mp), B(b.mq), B(b.shq), B(b.ex), iarg{Bytes: qkvArgs}, C(ly.qkv.e)),
-			idisp{K: fmt.Sprintf("int_dattn1_%d", hd), Args: []iarg{B(b.mq), B(b.shq), BO(b.kc, kv), B(b.sb), B(b.cmax),
+			idisp{K: fmt.Sprintf("int_dattn1_%d", hd), Args: []iarg{B(b.mq), B(b.shq), BO(b.kc, kk), B(b.sb), B(b.cmax),
 				B(s.params), iarg{Bytes: attnArgs}, BO(s.kp, kpo), C(s.mp)},
 				Groups: isize{uint(nkv), uint(maxch), 1}, Threads: isize{256, 1, 1}},
 			idisp{K: fmt.Sprintf("int_dattn2a_%d", hd), Args: []iarg{B(b.sb), B(b.cmax), BO(b.vc, kv), F(rawA), B(zacc),
@@ -391,10 +396,14 @@ func (s *intGPUState) cudaSteps(b stepBufs, qkvArgs, attnArgs []byte, ez, tch in
 // kvplanes is the launch that copies rows' new keys and values (positions params.pos + row) into the planes.
 func (s *intGPUState) kvplanes(l int, params ibuf, rows int) idisp {
 	m := s.m
-	return idisp{K: "int_kvplanes", Args: []iarg{{Buf: s.kc, Offset: l * s.kvLayer}, {Buf: s.vc, Offset: l * s.kvLayer},
+	return idisp{K: "int_kvplanes", Args: []iarg{{Buf: s.kc, Offset: l * s.kLayer}, {Buf: s.vc, Offset: l * s.kvLayer},
 		{Buf: s.kp, Offset: l * s.kpl}, {Buf: s.vp, Offset: l * s.kpl}, {Buf: params}, cArg(m.nkv), cArg(m.hd),
 		cArg(s.maxlen), cArg(s.mp)}, Groups: isize{uint(rows), 1, 1}, Threads: isize{256, 1, 1}}
 }
+
+// intKLayer is the bytes per layer of the key cache: KQ-bit mantissas [nkv][maxlen][hd] (int16), then each key
+// vector's shift [nkv][maxlen] (int32), padded to 256 bytes (gpu_int.metal's KSH).
+func intKLayer(nkv, maxlen, hd int) int { return (2*nkv*maxlen*hd + 4*nkv*maxlen + 255) / 256 * 256 }
 
 // expaLen is where EXPA (nonincreasing) becomes 0 for good: weights from there on are 0.
 func (m *IntModel) expaLen() int {

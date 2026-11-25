@@ -25,6 +25,11 @@ const (
 	intNF    = 24 * 1024
 	intNS    = 16 * 1024
 	intLimKV = 1<<22 - 1
+	// mantissa widths (SPEC §2-§3): activations into a matrix product, attention queries, cached keys and values
+	intActBits = 12
+	intQBits   = 12
+	intKBits   = 16
+	intVBits   = 12
 )
 
 type intMat struct {
@@ -302,13 +307,33 @@ func absMax(x []int64) int64 {
 	return mx
 }
 
-// blockf: 16-bit mantissas with one shared exponent; returns the exponent shift.
+// blockf: intActBits-bit mantissas with one shared exponent; returns the exponent shift.
 func blockf(x []int64, m []int16) int {
-	sh := max(0, bitlen(absMax(x))-15)
+	sh, lim := bfpShift(absMax(x), intActBits)
 	for i, v := range x {
-		m[i] = int16(min(max(irsh(v, sh), -32767), 32767))
+		m[i] = int16(min(max(irsh(v, sh), -lim), lim))
 	}
 	return sh
+}
+
+// bfpShift: the shift and mantissa limit that put values of magnitude at most mx into bits-bit signed mantissas.
+func bfpShift(mx int64, bits int) (int, int64) {
+	return max(0, bitlen(mx)-(bits-1)), int64(1)<<(bits-1) - 1
+}
+
+// cacheVec stores a key or value vector (at e = -24) into the cache: clip(rshift(x, 12)) at e = -12, then rounded to
+// bits-bit mantissas with one exponent for the vector, kept at e = -12 (mantissa << shift).
+func cacheVec(dst []int32, x []int64, bits int) {
+	var mx int64
+	for i, v := range x {
+		c := min(max(irsh(v, 12), -intLimKV), intLimKV)
+		dst[i] = int32(c)
+		mx = max(mx, c, -c)
+	}
+	sh, lim := bfpShift(mx, bits)
+	for i, c := range dst {
+		dst[i] = int32(min(max(irsh(int64(c), sh), -lim), lim) << sh)
+	}
 }
 
 func isqrt(v int64) int64 {
@@ -385,6 +410,8 @@ func (m *IntModel) rmsnorm(h, g []int64, xm []int16, y []int64) int {
 type intState struct {
 	m       *IntModel
 	maxlen  int
+	win     int // attention window: the last win positions and the first sink; 0: all
+	sink    int
 	pos     int
 	K, Vc   []int32 // [L][nkv][maxlen][hd]
 	h, y, x []int64
@@ -400,8 +427,8 @@ type intState struct {
 	headSh  []int
 }
 
-func (m *IntModel) newState(maxlen int) *intState {
-	s := &intState{m: m, maxlen: maxlen}
+func (m *IntModel) newState(maxlen, win, sink int) *intState {
+	s := &intState{m: m, maxlen: maxlen, win: win, sink: sink}
 	n := m.L * m.nkv * maxlen * m.hd
 	s.K, s.Vc = make([]int32, n), make([]int32, n)
 	s.h, s.y, s.x = make([]int64, m.D), make([]int64, max(m.D, m.I)), make([]int64, m.D)
@@ -419,6 +446,19 @@ func (m *IntModel) newState(maxlen int) *intState {
 }
 
 func (s *intState) reset() { s.pos = 0 }
+
+// visible: the key ranges [lo, hi) the position T-1 attends to (SPEC §3.2.5): keys t < sink and t > T-1-win, or all
+// of them when win is 0.
+func (s *intState) visible(T int) [][2]int {
+	return attnVisible(T, s.win, s.sink)
+}
+
+func attnVisible(T, win, sink int) [][2]int {
+	if win <= 0 || T-win <= sink {
+		return [][2]int{{0, T}}
+	}
+	return [][2]int{{0, sink}, {T - win, T}}
+}
 
 func (s *intState) rope(x []int64, nh int) {
 	m := s.m
@@ -450,6 +490,7 @@ func (s *intState) step(tok int) {
 		s.h[k] = irsh(int64(q[k])*int64(sc[k/64]), -24-m.emb.e)
 	}
 	T := s.pos + 1
+	vis := s.visible(T)
 	for l := range m.layers {
 		ly := &m.layers[l]
 		e := m.rmsnorm(s.h, ly.g1, s.xm, s.y)
@@ -464,10 +505,8 @@ func (s *intState) step(tok int) {
 		s.rope(kv, nkv)
 		for j := 0; j < nkv; j++ {
 			base := ((l*nkv+j)*s.maxlen + s.pos) * hd
-			for d := 0; d < hd; d++ {
-				s.K[base+d] = int32(min(max(irsh(kv[j*hd+d], 12), -intLimKV), intLimKV))
-				s.Vc[base+d] = int32(min(max(irsh(vv[j*hd+d], 12), -intLimKV), intLimKV))
-			}
+			cacheVec(s.K[base:base+hd], kv[j*hd:(j+1)*hd], intKBits)
+			cacheVec(s.Vc[base:base+hd], vv[j*hd:(j+1)*hd], intVBits)
 		}
 		// attention, one q head per task
 		m.pool.parallelFor(nq, 1, func(lo, hi int) {
@@ -483,29 +522,33 @@ func (s *intState) step(tok int) {
 					}
 					mx = max(mx, v)
 				}
-				sh := max(0, bitlen(mx)-15)
+				sh, lim := bfpShift(mx, intQBits)
 				for d := range mq {
-					mq[d] = int32(min(max(irsh(qs[d]*m.sc, sh), -32767), 32767))
+					mq[d] = int32(min(max(irsh(qs[d]*m.sc, sh), -lim), lim))
 				}
 				n := 42 - sh
 				sc := s.scores[i][:T]
 				kb := (l*nkv + j) * s.maxlen * hd
 				M := int64(math.MinInt64)
-				for t := 0; t < T; t++ {
-					v := irsh(intDotQK(mq, s.K[kb+t*hd:kb+(t+1)*hd]), n)
-					sc[t] = v
-					M = max(M, v)
+				for _, r := range vis {
+					for t := r[0]; t < r[1]; t++ {
+						v := irsh(intDotQK(mq, s.K[kb+t*hd:kb+(t+1)*hd]), n)
+						sc[t] = v
+						M = max(M, v)
+					}
 				}
 				O := s.headO[i]
 				clear(O)
 				var Z int64
-				for t := 0; t < T; t++ {
-					w := m.expA[min(M-sc[t], intNA-1)]
-					if w == 0 {
-						continue
+				for _, r := range vis {
+					for t := r[0]; t < r[1]; t++ {
+						w := m.expA[min(M-sc[t], intNA-1)]
+						if w == 0 {
+							continue
+						}
+						Z += w
+						intAxpy(O, w, s.Vc[kb+t*hd:kb+(t+1)*hd])
 					}
-					Z += w
-					intAxpy(O, w, s.Vc[kb+t*hd:kb+(t+1)*hd])
 				}
 				for d := 0; d < hd; d++ {
 					a := O[d]

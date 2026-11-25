@@ -20,10 +20,19 @@ var intKernels = []string{"int_embed", "int_norm", "int_matvec", "int_qkv", "int
 	"int_counts", "int_bscores64", "int_bscores128", "int_bpv64", "int_bpv128", "int_bcomb", "int_find", "int_mlpb"}
 
 type metalIntDev struct {
-	dev *metal.Device
-	ps  map[string]*metal.Pipeline
-	buf []metal.Dispatch // run's scratch
+	dev   *metal.Device
+	ps    map[string]*metal.Pipeline
+	buf   []metal.Dispatch // run's scratch
+	chunk int              // dispatches per command buffer (0: the package's default)
 }
+
+// metalBigModel: models at least this big (file bytes) commit a command buffer every metalBigChunk dispatches. A
+// 7B batch's dispatches are long, and 48 to a buffer kept the GPU busy long enough for macOS's watchdog to kill the
+// process ("Impacting Interactivity", after 707 s); 6 to a buffer ran clean.
+const (
+	metalBigModel = 3 << 30
+	metalBigChunk = 6
+)
 
 type metalIntBuf struct{ b *metal.Buffer }
 
@@ -54,7 +63,11 @@ func openIntMetal(m *IntModel) (intDev, ibuf, error) {
 		dev.Close()
 		return nil, nil, err
 	}
-	return &metalIntDev{dev: dev, ps: ps}, &metalIntBuf{w}, nil
+	d := &metalIntDev{dev: dev, ps: ps}
+	if len(m.g.data) >= metalBigModel {
+		d.chunk = metalBigChunk
+	}
+	return d, &metalIntBuf{w}, nil
 }
 
 func (d *metalIntDev) name() string { return "metal (" + d.dev.Name + ")" }
@@ -137,8 +150,15 @@ func (d *metalIntDev) run(ds []idisp) error {
 		if p == nil {
 			return fmt.Errorf("metal: no kernel %s", x.K)
 		}
+		// more threads per group than the kernel can run gives wrong results without an error from Metal
+		if n := x.Threads.W * x.Threads.H * x.Threads.D; int(n) > p.MaxThreads {
+			return fmt.Errorf("metal: %s runs at most %d threads per group, dispatched with %d", x.K, p.MaxThreads, n)
+		}
 		d.buf = append(d.buf, metal.Dispatch{P: p, Args: args, Groups: metal.Size{W: x.Groups.W, H: x.Groups.H, D: x.Groups.D},
 			Threads: metal.Size{W: x.Threads.W, H: x.Threads.H, D: x.Threads.D}})
+	}
+	if d.chunk > 0 {
+		defer metal.SetRunChunk(metal.SetRunChunk(d.chunk))
 	}
 	return d.dev.Run(d.buf...)
 }

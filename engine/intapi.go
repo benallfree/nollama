@@ -38,17 +38,27 @@ type IntSession struct {
 	maxlen int
 }
 
-// NewSession starts a context that can hold up to maxContext tokens (at most MaxContext).
+// NewSession starts a context that can hold up to maxContext tokens (at most MaxContext), with full attention.
 func (m *IntModel) NewSession(maxContext int) (*IntSession, error) {
+	return m.NewWindowSession(maxContext, 0, 0)
+}
+
+// NewWindowSession starts a context whose positions attend to a window: the last window positions (the position
+// itself included) and the first sink positions of the context. window 0 means every position before (full
+// attention). A window makes long contexts cheaper and the distributions a little less sharp.
+func (m *IntModel) NewWindowSession(maxContext, window, sink int) (*IntSession, error) {
 	n := min(max(maxContext, 1), m.MaxContext())
+	if window < 0 || sink < 0 {
+		return nil, errors.New("intmodel: bad attention window")
+	}
 	if m.gpu != nil {
-		g, err := m.gpu.newState(m, n)
+		g, err := m.gpu.newState(m, n, window, sink)
 		if err != nil {
 			return nil, err
 		}
 		return &IntSession{g: g, maxlen: n}, nil
 	}
-	return &IntSession{s: m.newState(n), maxlen: n}, nil
+	return &IntSession{s: m.newState(n, window, sink), maxlen: n}, nil
 }
 
 // Close frees the session's GPU buffers (CPU sessions need nothing).

@@ -10,14 +10,24 @@
 
 #define LMIN (-9223372036854775807L - 1)
 #define KC 1024
+// mantissa widths and the attention window, as in gpu_int.metal (SPEC §2-§3)
+#define AQ 12
+#define QQ 12
+#define KQ 16
+#define VQ 12
+#define LIMB(b) ((1L << ((b) - 1)) - 1)
+static __device__ __forceinline__ bool kvis(int t, int T, int win, int sink) { return win == 0 || t < sink || t >= T - win; }
+static __device__ __forceinline__ bool cvis(int k0, int k1, int T0, int win, int sink) { return win == 0 || k0 < sink || k1 > T0 - win; }
 
 struct IntParams {
 	int tok;
 	int pos;
 };
 struct BAttnArgs {
-	int nq, nkv, hd, maxlen, na, smax, nchmax, ez;
+	int nq, nkv, hd, maxlen, na, smax, nchmax, ez, win, sink, rows;
 };
+// the stored scores' layout (gpu_int.metal)
+#define SIDX(row, h, t, a) (((((long)((t) >> 4)) * (a).nq + (h)) * (a).rows + (row)) * 16 + ((t) & 15))
 
 static __device__ __forceinline__ long rsh(long x, int n) { return n <= 0 ? (x << (-n)) : ((x + (1L << (n - 1))) >> n); }
 
@@ -57,6 +67,9 @@ static __device__ __forceinline__ void bscores_mma(const int *mq, const int *shq
 	int t0 = tg3.y * br, c = tg3.z;
 	int pmax = base + min(t0 + br, R) - 1;
 	int k0c = c * KC, k1c = min(k0c + KC, pmax + 1);
+	if (!cvis(k0c, k0c + KC, base + t0 + 1, a.win, a.sink)) {
+		return; // no row of the block sees the chunk (its readers skip it too)
+	}
 	// query planes: qp[plane][qrow][d]
 	for (int i = tid; i < QR * HD; i += 256) {
 		int qr = i / HD, d = i % HD, g = qr / br, r = qr % br;
@@ -68,7 +81,8 @@ static __device__ __forceinline__ void bscores_mma(const int *mq, const int *shq
 		int g = tid / br, r = tid % br;
 		shs[tid] = g < grp && t0 + r < R ? shq[(t0 + r) * a.nq + j * grp + g] : 0;
 	}
-	const int *K = Kc + (long)j * a.maxlen * HD;
+	const short *K = (const short *)Kc + (long)j * a.maxlen * HD; // the key cache as gpu_int.metal lays it out
+	const int *Ksh = (const int *)((const short *)Kc + (long)a.nkv * a.maxlen * HD) + (long)j * a.maxlen;
 	int w = tid / 32, lane = tid % 32, gid = lane / 4, tig = lane % 4;
 	int mt = w % MT, nw = w / MT;
 	// this thread's two query rows (C layout): mt * 16 + gid and + 8
@@ -78,7 +92,7 @@ static __device__ __forceinline__ void bscores_mma(const int *mq, const int *shq
 		__syncthreads();
 		for (int i = tid; i < KT * HD; i += 256) {
 			int kk = i / HD, d = i % HD;
-			int v = X == 2 ? i : K[(long)k0 * HD + i];
+			int v = X == 2 ? i : (int)K[(long)k0 * HD + i] << Ksh[k0 + kk];
 			kp[kk * LD + d] = (unsigned char)(v & 255);
 			kp[KT * LD + kk * LD + d] = (unsigned char)((v >> 8) & 255);
 			kp[2 * KT * LD + kk * LD + d] = (unsigned char)(v >> 16);
@@ -140,13 +154,13 @@ static __device__ __forceinline__ void bscores_mma(const int *mq, const int *shq
 				int qr = e < 2 ? qrA : qrB, g = qr / br, r = qr % br;
 				int t = k0 + (nw * NPW + n) * 8 + tig * 2 + (e & 1);
 				int p = base + t0 + r;
-				if (g < grp && t0 + r < R && t <= p) {
+				if (g < grp && t0 + r < R && t <= p && kvis(t, p + 1, a.win, a.sink)) {
 					long s = rsh(acc[n][e], 42 - shs[qr]);
 					if (s != (long)(int)s) {
 						atomicExch(ovf, 1);
 					}
 					if (X != 1) {
-						S[((long)(t0 + r) * a.nq + j * grp + g) * a.smax + t] = (int)s;
+						S[SIDX(t0 + r, j * grp + g, t, a)] = (int)s;
 					}
 					mx[e >> 1] = max(mx[e >> 1], s);
 				}
@@ -204,6 +218,9 @@ static __device__ __forceinline__ void bpv_mma(const int *S, const long *cmax, c
 	int h = tg3.x, t0 = tg3.y * BRV, c = tg3.z, grp = a.nq / a.nkv, j = h / grp;
 	int pmax = base + t0 + BRV - 1;
 	int k0c = c * KC, k1c = min(k0c + KC, pmax + 1);
+	if (!cvis(k0c, k0c + KC, base + t0 + 1, a.win, a.sink)) {
+		return;
+	}
 	int ez = a.ez;
 	for (int i = tid; i < ez; i += 256) {
 		et[i] = (ushort)expa[i];
@@ -213,7 +230,9 @@ static __device__ __forceinline__ void bpv_mma(const int *S, const long *cmax, c
 		const long *cm = cmax + ((long)(t0 + tid) * a.nq + h) * a.nchmax;
 		long m = LMIN;
 		for (int i = 0; i < nch; i++) {
-			m = max(m, cm[i]);
+			if (cvis(i * KC, i * KC + KC, p + 1, a.win, a.sink)) {
+				m = max(m, cm[i]);
+			}
 		}
 		Ms[tid] = m;
 		zs[tid] = 0;
@@ -238,8 +257,8 @@ static __device__ __forceinline__ void bpv_mma(const int *S, const long *cmax, c
 		for (int r = w; r < BRV; r += 8) {
 			int t = k0 + lane, p = base + t0 + r;
 			int wv = 0;
-			if (t <= p && t0 + r < R) {
-				long d = Ms[r] - S[((long)(t0 + r) * a.nq + h) * a.smax + t];
+			if (t <= p && t0 + r < R && kvis(t, p + 1, a.win, a.sink)) {
+				long d = Ms[r] - S[SIDX(t0 + r, h, t, a)];
 				if (d >= 0 && d < ez) {
 					wv = et[d];
 				}
@@ -336,12 +355,14 @@ BPV_MMA(int_bpv_mma128, 128)
 // 2 (signed high byte); Mp positions per plane (the cache length plus a tile's padding, a multiple of 16).
 
 // int_kvplanes: after int_qkv, the planes of rows' keys and values (positions pos + row).
-extern "C" __global__ void int_kvplanes(const int *Kc, const int *Vc, unsigned char *Kp, unsigned char *Vp,
+// Km: the layer's key cache as gpu_int.metal lays it out (KQ-bit mantissas, then each key vector's shift)
+extern "C" __global__ void int_kvplanes(const short *Km, const int *Vc, unsigned char *Kp, unsigned char *Vp,
                                         const IntParams *pr, int nkv, int hd, int maxlen, int Mp) {
 	int row = blockIdx.x, t = pr->pos + row;
+	const int *Ksh = (const int *)(Km + (long)nkv * maxlen * hd);
 	for (int i = threadIdx.x; i < nkv * hd; i += blockDim.x) {
 		int j = i / hd, d = i % hd;
-		int k = Kc[((long)j * maxlen + t) * hd + d], v = Vc[((long)j * maxlen + t) * hd + d];
+		int k = (int)Km[((long)j * maxlen + t) * hd + d] << Ksh[j * maxlen + t], v = Vc[((long)j * maxlen + t) * hd + d];
 		for (int p = 0; p < 3; p++) {
 			int kb = p < 2 ? (k >> (8 * p)) & 255 : k >> 16, vb = p < 2 ? (v >> (8 * p)) & 255 : v >> 16;
 			Kp[(((long)j * 3 + p) * Mp + t) * hd + d] = (unsigned char)kb;
@@ -361,6 +382,9 @@ static __device__ __forceinline__ void bmax_mma(const int *mq, const int *shq, l
 	int t0 = tg3.y * br, c = tg3.z;
 	int pmax = base + min(t0 + br, R) - 1;
 	int k0c = c * KC, k1c = min(k0c + KC, pmax + 1);
+	if (!cvis(k0c, k0c + KC, base + t0 + 1, a.win, a.sink)) {
+		return; // no row of the block sees the chunk (its readers skip it too)
+	}
 	for (int i = tid; i < QR * HD; i += 256) {
 		int qr = i / HD, d = i % HD, g = qr / br, r = qr % br;
 		int q = g < grp && t0 + r < R ? mq[((long)(t0 + r) * a.nq + j * grp + g) * HD + d] : 0;
@@ -422,7 +446,7 @@ static __device__ __forceinline__ void bmax_mma(const int *mq, const int *shq, l
 			for (int e = 0; e < 4; e++) {
 				int qr = e < 2 ? qrA : qrB, g = qr / br, r = qr % br;
 				int t = k0 + (nw * NPW + n) * 8 + tig * 2 + (e & 1);
-				if (g < grp && t0 + r < R && t <= base + t0 + r) {
+				if (g < grp && t0 + r < R && t <= base + t0 + r && kvis(t, base + t0 + r + 1, a.win, a.sink)) {
 					long s = rsh(a4[e], 42 - shs[qr]);
 					if (s != (long)(int)s) {
 						atomicExch(ovf, 1); // the caller then reruns the batch with int_attnb*
@@ -491,6 +515,9 @@ static __device__ __forceinline__ void bpv2_mma(const long *cmax, const int *exp
 	int h = tg3.x, t0 = tg3.y * BRV, c = tg3.z, grp = a.nq / a.nkv, j = h / grp;
 	int pmax = base + t0 + BRV - 1;
 	int k0c = c * KC, k1c = min(k0c + KC, pmax + 1);
+	if (!cvis(k0c, k0c + KC, base + t0 + 1, a.win, a.sink)) {
+		return;
+	}
 	int ez = a.ez, ezs = min(ez, ETN);
 	for (int i = tid; i < ezs; i += 256) {
 		et[i] = (ushort)expa[i];
@@ -507,7 +534,9 @@ static __device__ __forceinline__ void bpv2_mma(const long *cmax, const int *exp
 		if (t0 + r < R) {
 			const long *cm = cmax + ((long)(t0 + r) * a.nq + h) * a.nchmax;
 			for (int i = 0; i < nch; i++) {
-				m = max(m, cm[i]);
+				if (cvis(i * KC, i * KC + KC, p + 1, a.win, a.sink)) {
+					m = max(m, cm[i]);
+				}
 			}
 		}
 		Ms[r] = m;
@@ -601,7 +630,7 @@ static __device__ __forceinline__ void bpv2_mma(const long *cmax, const int *exp
 			for (int e = 0; e < 4; e++) {
 				int r = e < 2 ? rA : rB, kk = (nw * SNPW + n) * 8 + tig * 2 + (e & 1), t = k0 + kk;
 				int wv = 0;
-				if (t0 + r < R && t <= base + t0 + r) {
+				if (t0 + r < R && t <= base + t0 + r && kvis(t, base + t0 + r + 1, a.win, a.sink)) {
 					long d = Ms[r] - rsh(a4[e], 42 - shs[r]);
 					if (d >= 0 && d < ezs) {
 						wv = et[d];
@@ -843,7 +872,7 @@ extern "C" __global__ void int_gemm_mma(const signed char *q, const short *s, co
 // ---- a step's attention on tensor cores (in place of int_attn1 / int_attn2, same grids and outputs) ----
 #define ACH 256
 struct AttnArgs {
-	int nq, nkv, hd, maxlen, na, maxch;
+	int nq, nkv, hd, maxlen, na, maxch, win, sink;
 };
 
 // pass 1: a threadgroup per (kv head, chunk of 256 positions): the grp query heads (rows of an m16 tile) against the
@@ -854,7 +883,7 @@ static __device__ __forceinline__ void dattn1(const int *mq, const int *shq, lon
                                               int *shs, long *pm) {
 	constexpr int LD = HD + 16;
 	int j = blockIdx.x, c = blockIdx.y, T = pr->pos + 1, grp = a.nq / a.nkv;
-	if (c * ACH >= T) {
+	if (c * ACH >= T || !cvis(c * ACH, c * ACH + ACH, T, a.win, a.sink)) {
 		return;
 	}
 	int tid = threadIdx.x, w = tid / 32, lane = tid % 32, gid = lane / 4, tig = lane % 4;
@@ -915,7 +944,7 @@ static __device__ __forceinline__ void dattn1(const int *mq, const int *shq, lon
 	for (int n = 0; n < 4; n++) {
 		for (int e = 0; e < 2; e++) {
 			int t = kb + n * 8 + tig * 2 + e;
-			if (g < grp && t < T) {
+			if (g < grp && t < T && kvis(t, T, a.win, a.sink)) {
 				long s = rsh(acc[n][e], 42 - shs[g]);
 				S[(long)(j * grp + g) * a.maxlen + t] = s;
 				mx = max(mx, s);
@@ -957,7 +986,7 @@ static __device__ __forceinline__ void dattn2(const long *S, const long *cmax, c
                                               unsigned char *wp, long *Ms, int *zs, int *live) {
 	constexpr int LW = ACH + 16, NPW = HD / 64; // n-tiles (8 dimensions) per warp
 	int j = blockIdx.x, c = blockIdx.y, T = pr->pos + 1, grp = a.nq / a.nkv;
-	if (c * ACH >= T) {
+	if (c * ACH >= T || !cvis(c * ACH, c * ACH + ACH, T, a.win, a.sink)) {
 		return;
 	}
 	int nch = (T + ACH - 1) / ACH;
@@ -965,7 +994,9 @@ static __device__ __forceinline__ void dattn2(const long *S, const long *cmax, c
 	if (w < grp) {
 		long mx = LMIN;
 		for (int i = lane; i < nch; i += 32) {
-			mx = max(mx, cmax[(j * grp + w) * a.maxch + i]);
+			if (cvis(i * ACH, i * ACH + ACH, T, a.win, a.sink)) {
+				mx = max(mx, cmax[(j * grp + w) * a.maxch + i]);
+			}
 		}
 		mx = max(mx, shx(mx, 16));
 		mx = max(mx, shx(mx, 8));
@@ -1001,7 +1032,7 @@ static __device__ __forceinline__ void dattn2(const long *S, const long *cmax, c
 	int t = c * ACH + tid;
 	for (int g = 0; g < 16; g++) {
 		int wv = 0;
-		if (g < grp && t < T) {
+		if (g < grp && t < T && kvis(t, T, a.win, a.sink)) {
 			long d = Ms[g] - S[(long)(j * grp + g) * a.maxlen + t];
 			if (d < ez) {
 				wv = expa[d];

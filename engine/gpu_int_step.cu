@@ -110,8 +110,8 @@ extern "C" __global__ void __launch_bounds__(256) int_mv2(const signed char *q, 
 	if (threadIdx.x < 128) {
 		int c = tile * 128 + threadIdx.x;
 		if (p) {
-			int psh = max(bitlen64(*pmax) - 15, 0);
-			xs[threadIdx.x] = (short)clamp(rsh(p[c], psh), -32767L, 32767L);
+			int psh = max(bitlen64(*pmax) - (AQ - 1), 0);
+			xs[threadIdx.x] = (short)clamp(rsh(p[c], psh), -LIMB(AQ), LIMB(AQ));
 		} else {
 			xs[threadIdx.x] = x[c];
 		}
@@ -158,8 +158,9 @@ struct QKVArgs {
 };
 
 // int_qkv2: int_qkv from raw sums (x = rshift(acc, -24 - (E + ex[0])) + b), also writing the key and value planes,
-// then zeroing the sums. One threadgroup (1024: each part one round; a warp per q head).
-extern "C" __global__ void __launch_bounds__(1024) int_qkv2(ull *acc, const long *b, const short *rc, const short *rs, const IntParams *pr, int *Kc,
+// then zeroing the sums. One threadgroup of 1024 (nkv * hd <= 1024: a kv head's key pairs and values are whole warps,
+// one round; a warp per q head).
+extern "C" __global__ void __launch_bounds__(1024) int_qkv2(ull *acc, const long *b, const short *rc, const short *rs, const IntParams *pr, short *Km,
                                     int *Vc, unsigned char *Kp, unsigned char *Vp, int Mp, int *mq, int *shq, const int *ex,
                                     QKVArgs a, int E) {
 	int tid = threadIdx.x, w = tid / 32, lane = tid % 32, NT = blockDim.x, NW = NT / 32;
@@ -167,25 +168,62 @@ extern "C" __global__ void __launch_bounds__(1024) int_qkv2(ull *acc, const long
 	const short *c = rc + pos * hh2, *sn = rs + pos * hh2;
 	const long LIM = (1L << 22) - 1;
 #define X(i) (rsh((long)acc[i], n) + b[i])
-	for (int i = tid; i < a.nkv * hh2; i += NT) {
-		int h = i / hh2, j = i % hh2, base = (a.nq + h) * hd;
-		long x1 = X(base + j), x2 = X(base + j + hh2), cj = c[j], sj = sn[j];
-		long k1 = clamp(rsh(rsh(x1 * cj - x2 * sj, 14), 12), -LIM, LIM), k2 = clamp(rsh(rsh(x2 * cj + x1 * sj, 14), 12), -LIM, LIM);
-		long kb = ((long)h * a.maxlen + pos) * hd;
-		Kc[kb + j] = (int)k1;
-		Kc[kb + j + hh2] = (int)k2;
-		for (int pl = 0; pl < 3; pl++) {
-			long pb = (((long)h * 3 + pl) * Mp + pos) * hd;
-			Kp[pb + j] = (unsigned char)(pl < 2 ? (k1 >> (8 * pl)) & 255 : k1 >> 16);
-			Kp[pb + j + hh2] = (unsigned char)(pl < 2 ? (k2 >> (8 * pl)) & 255 : k2 >> 16);
+	{
+		__shared__ long kvm[2][32];
+		bool isk = tid < a.nkv * hh2, isv = tid < a.nkv * hd;
+		int kh = tid / hh2, j = tid % hh2, vh = tid / hd, d = tid % hd;
+		long k1 = 0, k2 = 0, v = 0;
+		if (isk) {
+			int base = (a.nq + kh) * hd;
+			long x1 = X(base + j), x2 = X(base + j + hh2), cj = c[j], sj = sn[j];
+			k1 = clamp(rsh(rsh(x1 * cj - x2 * sj, 14), 12), -LIM, LIM);
+			k2 = clamp(rsh(rsh(x2 * cj + x1 * sj, 14), 12), -LIM, LIM);
 		}
-	}
-	for (int i = tid; i < a.nkv * hd; i += NT) {
-		int h = i / hd, d = i % hd;
-		long v = clamp(rsh(X((a.nq + a.nkv) * hd + i), 12), -LIM, LIM);
-		Vc[((long)h * a.maxlen + pos) * hd + d] = (int)v;
-		for (int pl = 0; pl < 3; pl++) {
-			Vp[(((long)h * 3 + pl) * hd + d) * Mp + pos] = (unsigned char)(pl < 2 ? (v >> (8 * pl)) & 255 : v >> 16);
+		if (isv) {
+			v = clamp(rsh(X((a.nq + a.nkv) * hd + tid), 12), -LIM, LIM);
+		}
+		long mk = max(labs64(k1), labs64(k2)), mv = labs64(v);
+		for (int o = 16; o > 0; o >>= 1) {
+			mk = max(mk, shx(mk, o));
+			mv = max(mv, shx(mv, o));
+		}
+		if (lane == 0) {
+			kvm[0][w] = mk;
+			kvm[1][w] = mv;
+		}
+		__syncthreads();
+		if (isk) {
+			long m = 0;
+			for (int g = kh * hh2 / 32; g < (kh + 1) * hh2 / 32; g++) {
+				m = max(m, kvm[0][g]);
+			}
+			int sk = max(0, bitlen64(m) - (KQ - 1));
+			long m1 = clamp(rsh(k1, sk), -LIMB(KQ), LIMB(KQ)), m2 = clamp(rsh(k2, sk), -LIMB(KQ), LIMB(KQ));
+			k1 = m1 << sk;
+			k2 = m2 << sk;
+			long kb = ((long)kh * a.maxlen + pos) * hd;
+			Km[kb + j] = (short)m1; // the key cache as gpu_int.metal lays it out (KSH)
+			Km[kb + j + hh2] = (short)m2;
+			if (j == 0) {
+				((int *)(Km + (long)a.nkv * a.maxlen * hd))[kh * a.maxlen + pos] = sk;
+			}
+			for (int pl = 0; pl < 3; pl++) {
+				long pb = (((long)kh * 3 + pl) * Mp + pos) * hd;
+				Kp[pb + j] = (unsigned char)(pl < 2 ? (k1 >> (8 * pl)) & 255 : k1 >> 16);
+				Kp[pb + j + hh2] = (unsigned char)(pl < 2 ? (k2 >> (8 * pl)) & 255 : k2 >> 16);
+			}
+		}
+		if (isv) {
+			long m = 0;
+			for (int g = vh * hd / 32; g < (vh + 1) * hd / 32; g++) {
+				m = max(m, kvm[1][g]);
+			}
+			int sv = max(0, bitlen64(m) - (VQ - 1));
+			v = clamp(rsh(v, sv), -LIMB(VQ), LIMB(VQ)) << sv;
+			Vc[((long)vh * a.maxlen + pos) * hd + d] = (int)v;
+			for (int pl = 0; pl < 3; pl++) {
+				Vp[(((long)vh * 3 + pl) * hd + d) * Mp + pos] = (unsigned char)(pl < 2 ? (v >> (8 * pl)) & 255 : v >> 16);
+			}
 		}
 	}
 	for (int h = w; h < a.nq; h += NW) { // warp per q head; lanes over its pairs (hh2 <= 64: 2 per lane)
@@ -203,12 +241,12 @@ extern "C" __global__ void __launch_bounds__(1024) int_qkv2(ull *acc, const long
 		for (int o = 16; o > 0; o >>= 1) {
 			mx = max(mx, shx(mx, o));
 		}
-		int sh = max(0, bitlen64(mx) - 15);
+		int sh = max(0, bitlen64(mx) - (QQ - 1));
 		for (int t = 0; t < 2; t++) {
 			int j = lane + 32 * t;
 			if (j < hh2) {
-				mq[h * hd + j] = (int)clamp(rsh(qv[t][0], sh), -32767L, 32767L);
-				mq[h * hd + j + hh2] = (int)clamp(rsh(qv[t][1], sh), -32767L, 32767L);
+				mq[h * hd + j] = (int)clamp(rsh(qv[t][0], sh), -LIMB(QQ), LIMB(QQ));
+				mq[h * hd + j + hh2] = (int)clamp(rsh(qv[t][1], sh), -LIMB(QQ), LIMB(QQ));
 			}
 		}
 		if (lane == 0) {
@@ -275,7 +313,7 @@ static __device__ __forceinline__ void norm2(long *h, ull *acc, const long *g, s
 		av[k] = add && i < D ? (long)acc[i] : 0;
 	}
 	if (add) {
-		int ein = pmax ? max(bitlen64(pm) - 15, 0) - 16 : es;
+		int ein = pmax ? max(bitlen64(pm) - (AQ - 1), 0) - 16 : es;
 		int n = -24 - (E + ein);
 #pragma unroll
 		for (int k = 0; k < 4; k++) {
@@ -314,12 +352,12 @@ static __device__ __forceinline__ void norm2(long *h, ull *acc, const long *g, s
 		y[k] = a < 0 ? -qa : qa;
 		ym = max(ym, labs64(y[k]));
 	}
-	int sh2 = max(0, bitlen64(red_max<NT>(ym, r3)) - 15);
+	int sh2 = max(0, bitlen64(red_max<NT>(ym, r3)) - (AQ - 1));
 #pragma unroll
 	for (int k = 0; k < 4; k++) {
 		int i = tid + NT * k;
 		if (i < D) {
-			m[i] = (short)clamp(rsh(y[k], sh2), -32767L, 32767L);
+			m[i] = (short)clamp(rsh(y[k], sh2), -LIMB(AQ), LIMB(AQ));
 		}
 	}
 	if (tid == 0) {
@@ -380,9 +418,9 @@ extern "C" __global__ void __launch_bounds__(1024) int_mergea(ull *Oacc, ull *Za
 		o[i] = v;
 		mx = max(mx, labs64(v));
 	}
-	int sh = max(0, bitlen64(blk_max(mx, sm)) - 15);
+	int sh = max(0, bitlen64(blk_max(mx, sm)) - (AQ - 1));
 	for (int i = tid; i < n; i += 1024) {
-		m[i] = (short)clamp(rsh(o[i], sh), -32767L, 32767L);
+		m[i] = (short)clamp(rsh(o[i], sh), -LIMB(AQ), LIMB(AQ));
 		Oacc[i] = 0;
 	}
 	if (tid < nq) {

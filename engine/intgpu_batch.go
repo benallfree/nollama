@@ -16,7 +16,7 @@ import (
 const (
 	intBatchRows = 512  // positions per batch at most (a multiple of intHeadRows)
 	intHeadRows  = 64   // rows per head + counts pass (bounds the logits buffer: rows x vocabulary)
-	intGemmRows  = 32   // GBT in gpu_int.metal
+	intGemmRows  = 64   // GBT in gpu_int.metal
 	intKC        = 1024 // KC: keys per attention chunk
 	intScoreMem  = 1 << 30
 )
@@ -34,8 +34,10 @@ const (
 	fixedDim        // no change
 )
 
-// intBatchSlow counts batches that needed the fallback attention (for tests and profiling).
+// intBatchSlow counts batches that needed the fallback attention (for tests and profiling); intForceSlow (tests)
+// runs every batch's fallback too.
 var (
+	intForceSlow bool
 	intBatchSlow int
 	intBatchGPU  time.Duration // GPU time of the batches run so far
 )
@@ -57,10 +59,10 @@ func (s *intGPUState) newBatch() (*intBatch, error) {
 	D, I, V, hd, nq, nkv := m.D, m.I, m.V, m.hd, m.nq, m.nkv
 	// rows per batch: the stored scores (rows x heads x context, int32) stay within intScoreMem
 	P := min(intBatchRows, max(intHeadRows, intScoreMem/(4*nq*s.maxlen))/intHeadRows*intHeadRows)
-	scoreN := 4 * P * nq * s.maxlen
+	scoreN := 4 * P * nq * ((s.maxlen + 15) / 16 * 16) // key-major tiles of 16 (SIDX)
 	nchmax := (s.maxlen + intKC - 1) / intKC
 	partN := P * nq * nchmax
-	oneKernel := s.kp != nil && os.Getenv("NOLLAMA_INT_BATTN") != "" // experiment: int_battn* (slower so far)
+	oneKernel := s.kp != nil && s.win == 0 && os.Getenv("NOLLAMA_INT_BATTN") != "" // experiment: int_battn* (slower so far; full attention only)
 	if s.kp != nil {
 		P, scoreN = intBatchRows, 64 // tensor-core attention recomputes scores instead of storing them
 		if v, err := strconv.Atoi(os.Getenv("NOLLAMA_INT_BATCH")); err == nil && v >= intHeadRows {
@@ -135,12 +137,12 @@ func (s *intGPUState) newBatch() (*intBatch, error) {
 	binary.LittleEndian.PutUint32(qkvArgs[8:], uint32(hd))
 	binary.LittleEndian.PutUint32(qkvArgs[12:], uint32(s.maxlen))
 	binary.LittleEndian.PutUint64(qkvArgs[16:], uint64(m.sc))
-	attnArgs := i32b(nq, nkv, hd, s.maxlen, intNA, 0)
+	attnArgs := i32b(nq, nkv, hd, s.maxlen, intNA, 0, s.win, s.sink)
 	ez := m.expaLen()
 	if ez > 11392 {
 		return nil, errors.New("intmodel: EXPA's nonzero part is longer than the batch kernels hold")
 	}
-	battnArgs := i32b(nq, nkv, hd, s.maxlen, intNA, s.maxlen, nchmax, ez)
+	battnArgs := i32b(nq, nkv, hd, s.maxlen, intNA, s.maxlen, nchmax, ez, s.win, s.sink, P)
 	rawA, rawF, rawS := m.g.Tensors["EXPA"].Data, m.g.Tensors["EXPF"].Data, m.g.Tensors["SIG"].Data
 
 	add(rowsH, idisp{K: "int_embed", Args: []iarg{F(m.emb.q), F(m.emb.s), B(b.toks), B(h), C(D),
@@ -152,9 +154,9 @@ func (s *intGPUState) newBatch() (*intBatch, error) {
 		if l+1 < m.L {
 			next = m.layers[l+1].g1
 		}
-		kv := l * s.kvLayer
+		kv, kk := l*s.kvLayer, l*s.kLayer
 		gemm(&ly.qkv, 0, -24, acc, accN)
-		perRow("int_qkv", intTG, B(acc), F(ly.b), F(m.ropeC), F(m.ropeS), B(b.params), BO(s.kc, kv), BO(s.vc, kv),
+		perRow("int_qkv", intTG, B(acc), F(ly.b), F(m.ropeC), F(m.ropeS), B(b.params), BO(s.kc, kk), BO(s.vc, kv),
 			B(mq), B(shq), B(ex), iarg{Bytes: qkvArgs}, C(ly.qkv.e), C(0), C(accN))
 		if oneKernel { // the plane cache and the one-kernel tensor-core attention (gpu_int_mma.cu)
 			add(rowsW, s.kvplanes(l, b.params, P))
@@ -179,10 +181,10 @@ func (s *intGPUState) newBatch() (*intBatch, error) {
 			planeArgs = []iarg{BO(s.kp, l*s.kpl), BO(s.vp, l*s.kpl), C(s.mp)}
 		}
 		slowAt = append(slowAt, len(ds))
-		slowD = append(slowD, idisp{K: attnK, Args: []iarg{B(mq), B(shq), BO(s.kc, kv), BO(s.vc, kv),
+		slowD = append(slowD, idisp{K: attnK, Args: []iarg{B(mq), B(shq), BO(s.kc, kk), BO(s.vc, kv),
 			F(rawA), B(o), B(b.params), iarg{Bytes: attnArgs}},
 			Groups: isize{W: uint(nq), H: uint(P / b.attnBR), D: 1}, Threads: isize{W: 256, H: 1, D: 1}})
-		add(scoreG, idisp{K: scoreK, Args: append([]iarg{B(mq), B(shq), BO(s.kc, kv), B(sc), B(cmax),
+		add(scoreG, idisp{K: scoreK, Args: append([]iarg{B(mq), B(shq), BO(s.kc, kk), B(sc), B(cmax),
 			B(b.ovf), B(b.params), iarg{Bytes: battnArgs}}, planeArgs...),
 			Groups: isize{W: uint(nkv), H: 1, D: 1}, Threads: isize{W: 256, H: 1, D: 1}})
 		pvArgs := []iarg{B(sc), B(cmax), BO(s.vc, kv), F(rawA), B(zp), B(op), B(b.params), iarg{Bytes: battnArgs}}
@@ -279,7 +281,7 @@ func (s *intGPUState) feedBatch(toks, next []int, pos int, out []IntCount) error
 			return err
 		}
 		intBatchGPU += dev.lastGPU()
-		if dev.read(b.ovf, 0, ovf); binary.LittleEndian.Uint32(ovf) != 0 {
+		if dev.read(b.ovf, 0, ovf); binary.LittleEndian.Uint32(ovf) != 0 || intForceSlow {
 			// a score didn't fit int32: this batch again with the attention that keeps them in registers
 			dev.write(b.ovf, 0, make([]byte, 4))
 			intBatchSlow++

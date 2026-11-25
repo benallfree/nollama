@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"container/heap"
 	"errors"
 	"sort"
 	"strings"
@@ -117,24 +118,7 @@ func (t *tokenizer) bpeWord(w string) []int {
 	if v, ok := t.cache.Load(w); ok {
 		return v.([]int)
 	}
-	syms := make([]string, 0, len(w))
-	for i := 0; i < len(w); i++ {
-		syms = append(syms, string(t.byteEnc[w[i]]))
-	}
-	for len(syms) > 1 {
-		bestRank, bestI := -1, -1
-		for i := 0; i+1 < len(syms); i++ {
-			if r, ok := t.ranks[syms[i]+" "+syms[i+1]]; ok && (bestRank < 0 || r < bestRank) {
-				bestRank, bestI = r, i
-			}
-		}
-		if bestI < 0 {
-			break
-		}
-		merged := syms[bestI] + syms[bestI+1]
-		syms[bestI] = merged
-		syms = append(syms[:bestI+1], syms[bestI+2:]...)
-	}
+	syms := t.bpeMerge(w)
 	ids := make([]int, 0, len(syms))
 	for _, sy := range syms {
 		if id, ok := t.vocab[sy]; ok {
@@ -151,6 +135,77 @@ func (t *tokenizer) bpeWord(w string) []int {
 		t.cache.Store(w, ids)
 	}
 	return ids
+}
+
+// bpeMerge applies the merges to a word's bytes: repeatedly the adjacent pair with the lowest merge rank (the leftmost
+// of equal ones) becomes one symbol. A heap of candidate pairs over a linked list of symbols makes it O(n log n) in
+// the word's length (a rescan per merge would be O(n^2): hours for a megabyte with no spaces).
+func (t *tokenizer) bpeMerge(w string) []string {
+	n := len(w)
+	type sym struct {
+		s          string
+		prev, next int // -1 at the ends
+		ver        int // bumped when s grows; a pair records its symbols' versions
+		dead       bool
+	}
+	syms := make([]sym, n)
+	for i := 0; i < n; i++ {
+		syms[i] = sym{s: string(t.byteEnc[w[i]]), prev: i - 1, next: i + 1}
+	}
+	if n > 0 {
+		syms[n-1].next = -1
+	}
+	h := &bpeHeap{}
+	push := func(i, j int) {
+		if i < 0 || j < 0 {
+			return
+		}
+		if r, ok := t.ranks[syms[i].s+" "+syms[j].s]; ok {
+			heap.Push(h, bpePair{rank: r, i: i, j: j, vi: syms[i].ver, vj: syms[j].ver})
+		}
+	}
+	for i := 0; i+1 < n; i++ {
+		push(i, i+1)
+	}
+	for h.Len() > 0 {
+		p := heap.Pop(h).(bpePair)
+		a, b := &syms[p.i], &syms[p.j]
+		if a.dead || b.dead || a.next != p.j || a.ver != p.vi || b.ver != p.vj {
+			continue // stale: a symbol merged since
+		}
+		a.s += b.s
+		a.ver++
+		a.next = b.next
+		b.dead = true
+		if b.next >= 0 {
+			syms[b.next].prev = p.i
+		}
+		push(a.prev, p.i)
+		push(p.i, a.next)
+	}
+	var out []string
+	for i := 0; i >= 0 && i < n; i = syms[i].next {
+		out = append(out, syms[i].s)
+	}
+	return out
+}
+
+type bpePair struct{ rank, i, j, vi, vj int }
+
+// bpeHeap orders pairs by merge rank, then position (leftmost first).
+type bpeHeap []bpePair
+
+func (h bpeHeap) Len() int { return len(h) }
+func (h bpeHeap) Less(a, b int) bool {
+	return h[a].rank < h[b].rank || (h[a].rank == h[b].rank && h[a].i < h[b].i)
+}
+func (h bpeHeap) Swap(a, b int) { h[a], h[b] = h[b], h[a] }
+func (h *bpeHeap) Push(x any)   { *h = append(*h, x.(bpePair)) }
+func (h *bpeHeap) Pop() any {
+	old := *h
+	x := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return x
 }
 
 // tokenBytes returns the raw bytes a token stands for.

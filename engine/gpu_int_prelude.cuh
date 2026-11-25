@@ -32,6 +32,18 @@ struct __align__(16) mint4 {
 #define short4 mshort4
 #define int4 mint4
 
+// int_gemm's float group sums (exact: integers below 2^24): Metal stores the operands as half, here as float
+struct __align__(16) mfloat4 {
+	float x, y, z, w;
+	__device__ mfloat4() {}
+	__device__ mfloat4(mchar4 v) : x(v.x), y(v.y), z(v.z), w(v.w) {}
+	__device__ mfloat4(mshort4 v) : x(v.x), y(v.y), z(v.z), w(v.w) {}
+};
+#define half float
+#define half4 mfloat4
+#define float4 mfloat4
+__device__ __forceinline__ float dot(mfloat4 a, mfloat4 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
+
 __device__ __forceinline__ mint4 operator*(mint4 a, mint4 b) { return mint4(a.x * b.x, a.y * b.y, a.z * b.z, a.w * b.w); }
 __device__ __forceinline__ mint4 operator*(int a, mint4 b) { return mint4(a * b.x, a * b.y, a * b.z, a * b.w); }
 __device__ __forceinline__ mint4 operator+(mint4 a, mint4 b) { return mint4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w); }

@@ -6,6 +6,24 @@ using namespace metal;
 
 #define TG 1024
 #define LMIN (-9223372036854775807L - 1)
+// mantissa widths (SPEC §2-§3): activations into a matrix product, attention queries, cached keys and values
+#define AQ 12
+#define QQ 12
+#define KQ 16
+#define VQ 12
+#define LIMB(b) ((1L << ((b) - 1)) - 1)
+
+// the attention window (SPEC §3.2.5): position T-1 sees key t when win == 0, t < sink or t >= T - win; kvis for one
+// key, cvis for any of the keys [k0, k1) and any of the positions T0-1 .. T1-1
+static inline bool kvis(int t, int T, int win, int sink) { return win == 0 || t < sink || t >= T - win; }
+static inline bool cvis(int k0, int k1, int T0, int win, int sink) { return win == 0 || k0 < sink || k1 > T0 - win; }
+
+// A layer's key cache: KQ-bit mantissas Km[nkv][maxlen][hd] (short), then each key vector's shift [nkv][maxlen]
+// (int): key = mantissa << shift. A query (QQ = 12 bits) times a mantissa is below 2^26 and 32 such products fit an
+// int: one multiply per term, folded into 64 bits every 32 dimensions. The score shift absorbs the key's shift:
+// rshift((q . m) << sk, n) = rshift(q . m, n - sk).
+#define KSH(Km, nkv, maxlen, hd) ((device int *)((Km) + (long)(nkv) * (maxlen) * (hd)))
+#define KSHR(Km, nkv, maxlen, hd) ((device const int *)((Km) + (long)(nkv) * (maxlen) * (hd)))
 
 static inline long rsh(long x, int n) { return n <= 0 ? (x << (-n)) : ((x + (1L << (n - 1))) >> n); }
 
@@ -24,8 +42,12 @@ static inline long f2l(float f) {
 }
 
 // a / b for a >= 0, b > 0, exactly: a float estimate, refined once, then corrected in integers. Apple GPUs emulate
-// 64-bit division, which costs hundreds of cycles; this is a few float ops and multiplies.
+// 64-bit division, which costs hundreds of cycles; this is a few float ops and multiplies. b <= 0 never happens with
+// correct inputs (an attention sum includes its maximum's weight); it gives 0 rather than looping forever.
 static inline long udivx(long a, long b) {
+	if (b <= 0) {
+		return 0;
+	}
 	float inv = 1.0f / l2f(b);
 	long q = f2l(l2f(a) * inv);
 	long r = a - q * b;
@@ -167,11 +189,11 @@ kernel void int_norm(device long *h [[buffer(0)]], device const long *acc [[buff
 		y[j] = i < D ? sdivx(rsh(h[i], sh) * g[i] * 16384, r) : 0;
 		ym = max(ym, bitlen(iabs(y[j])));
 	}
-	int sh2 = max(0, (int)tgn_max(ym, tg, tid, nt) - 15);
+	int sh2 = max(0, (int)tgn_max(ym, tg, tid, nt) - (AQ - 1));
 	for (int j = 0; j < NY; j++) {
 		int i = tid + j * nt;
 		if (i < D) {
-			m[i] = (short)clamp(rsh(y[j], sh2), -32767L, 32767L);
+			m[i] = (short)clamp(rsh(y[j], sh2), -LIMB(AQ), LIMB(AQ));
 		}
 	}
 	if (tid == 0) {
@@ -224,17 +246,20 @@ struct QKVArgs {
 	long sc; // attention scale, folded into q
 };
 
-// x = rshift(acc, -24 - (E + ein)) + b; rope q and k at pos; K, V = clip(rshift(., 12)) into the cache; q heads:
-// blockf(q * sc) -> mq, shq. One threadgroup; simdgroup h handles q head h.
+// x = rshift(acc, -24 - (E + ein)) + b; rope q and k at pos; K, V = clip(rshift(., 12)), each vector rounded to KQ /
+// VQ-bit mantissas with one exponent, into the cache (mantissa << shift); q heads: blockf(q * sc) -> mq, shq (QQ
+// bits). One threadgroup of TG threads; a kv head's keys (hd/2 pairs) and values (hd) are whole simdgroups
+// (nkv * hd <= TG); simdgroup h handles q head h.
 kernel void int_qkv(device const long *acc [[buffer(0)]], device const long *b [[buffer(1)]],
                     device const short *rc [[buffer(2)]], device const short *rs [[buffer(3)]],
-                    device const IntParams *pr [[buffer(4)]], device int *Kc [[buffer(5)]], device int *Vc [[buffer(6)]],
+                    device const IntParams *pr [[buffer(4)]], device short *Km [[buffer(5)]], device int *Vc [[buffer(6)]],
                     device int *mq [[buffer(7)]], device int *shq [[buffer(8)]], device const int *ex [[buffer(9)]],
                     constant QKVArgs &a [[buffer(10)]], constant int &E [[buffer(11)]], constant int &einSlot [[buffer(12)]],
                     constant int &accS [[buffer(13)]], uint row [[threadgroup_position_in_grid]],
                     uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                     uint lane [[thread_index_in_simdgroup]]) {
 	threadgroup long part[32][32];
+	threadgroup long kvm[2][32];
 	// row r of a batch: position pos + r
 	acc += (long)row * accS;
 	mq += (long)row * a.nq * a.hd;
@@ -243,22 +268,49 @@ kernel void int_qkv(device const long *acc [[buffer(0)]], device const long *b [
 	device const short *c = rc + pos * hh2;
 	device const short *sn = rs + pos * hh2;
 	const long LIM = (1L << 22) - 1;
-	// k and v heads (threads 0 .. nkv*hh2-1 do k pairs; nkv*hd threads do v)
-	for (int i = tid; i < a.nkv * hh2; i += TG) {
-		int hh = i / hh2, j = i % hh2;
-		int base = (a.nq + hh) * a.hd;
-		long x1 = acc[base + j] + b[base + j], x2 = acc[base + j + hh2] + b[base + j + hh2];
-		long cj = c[j], sj = sn[j];
-		long k1 = rsh(x1 * cj - x2 * sj, 14), k2 = rsh(x2 * cj + x1 * sj, 14);
-		long kb = ((long)hh * a.maxlen + pos) * a.hd;
-		Kc[kb + j] = (int)clamp(rsh(k1, 12), -LIM, LIM);
-		Kc[kb + j + hh2] = (int)clamp(rsh(k2, 12), -LIM, LIM);
-	}
-	for (int i = tid; i < a.nkv * a.hd; i += TG) {
-		int hh = i / a.hd, d = i % a.hd;
-		int idx = (a.nq + a.nkv) * a.hd + i;
-		long v = acc[idx] + b[idx];
-		Vc[((long)hh * a.maxlen + pos) * a.hd + d] = (int)clamp(rsh(v, 12), -LIM, LIM);
+	// k pairs: threads 0 .. nkv*hh2-1; values: threads 0 .. nkv*hd-1
+	{
+		bool isk = tid < (uint)(a.nkv * hh2), isv = tid < (uint)(a.nkv * a.hd);
+		int khh = tid / hh2, kj = tid % hh2, vhh = tid / a.hd;
+		long k1 = 0, k2 = 0, v = 0;
+		if (isk) {
+			int base = (a.nq + khh) * a.hd;
+			long x1 = acc[base + kj] + b[base + kj], x2 = acc[base + kj + hh2] + b[base + kj + hh2];
+			long cj = c[kj], sj = sn[kj];
+			k1 = clamp(rsh(rsh(x1 * cj - x2 * sj, 14), 12), -LIM, LIM);
+			k2 = clamp(rsh(rsh(x2 * cj + x1 * sj, 14), 12), -LIM, LIM);
+		}
+		if (isv) {
+			int idx = (a.nq + a.nkv) * a.hd + tid;
+			v = clamp(rsh(acc[idx] + b[idx], 12), -LIM, LIM);
+		}
+		long mk = sg_max(max(iabs(k1), iabs(k2))), mv = sg_max(iabs(v));
+		if (lane == 0) {
+			kvm[0][sg] = mk;
+			kvm[1][sg] = mv;
+		}
+		threadgroup_barrier(mem_flags::mem_threadgroup);
+		if (isk) {
+			long m = 0;
+			for (int g = khh * hh2 / 32; g < (khh + 1) * hh2 / 32; g++) {
+				m = max(m, kvm[0][g]);
+			}
+			int sk = max(0, bitlen(m) - (KQ - 1));
+			long kb = ((long)khh * a.maxlen + pos) * a.hd;
+			Km[kb + kj] = (short)clamp(rsh(k1, sk), -LIMB(KQ), LIMB(KQ));
+			Km[kb + kj + hh2] = (short)clamp(rsh(k2, sk), -LIMB(KQ), LIMB(KQ));
+			if (kj == 0) {
+				KSH(Km, a.nkv, a.maxlen, a.hd)[khh * a.maxlen + pos] = sk;
+			}
+		}
+		if (isv) {
+			long m = 0;
+			for (int g = vhh * a.hd / 32; g < (vhh + 1) * a.hd / 32; g++) {
+				m = max(m, kvm[1][g]);
+			}
+			int sv = max(0, bitlen(m) - (VQ - 1));
+			Vc[((long)vhh * a.maxlen + pos) * a.hd + tid % a.hd] = (int)(clamp(rsh(v, sv), -LIMB(VQ), LIMB(VQ)) << sv);
+		}
 	}
 	// q heads: simdgroup sg handles head sg (nq <= 32); lanes over the head's pairs
 	long qv[4][2]; // hh2 <= 128 -> up to 4 pairs per lane
@@ -285,12 +337,12 @@ kernel void int_qkv(device const long *acc [[buffer(0)]], device const long *b [
 		hm = max(hm, part[sg][i]);
 	}
 	if (hq < a.nq) {
-		int sh = max(0, bitlen(hm) - 15);
+		int sh = max(0, bitlen(hm) - (QQ - 1));
 		for (int t = 0; t < 4; t++) {
 			int j = lane + t * 32;
 			if (j < hh2) {
-				mq[hq * a.hd + j] = (int)clamp(rsh(qv[t][0], sh), -32767L, 32767L);
-				mq[hq * a.hd + j + hh2] = (int)clamp(rsh(qv[t][1], sh), -32767L, 32767L);
+				mq[hq * a.hd + j] = (int)clamp(rsh(qv[t][0], sh), -LIMB(QQ), LIMB(QQ));
+				mq[hq * a.hd + j + hh2] = (int)clamp(rsh(qv[t][1], sh), -LIMB(QQ), LIMB(QQ));
 			}
 		}
 		if (lane == 0) {
@@ -312,9 +364,9 @@ kernel void int_blockf(device const long *x [[buffer(0)]], device short *m [[buf
 	for (int i = tid; i < n; i += TG) {
 		mx = max(mx, iabs(x[i]));
 	}
-	int sh = max(0, bitlen(tg_max(mx, tg, tid)) - 15);
+	int sh = max(0, bitlen(tg_max(mx, tg, tid)) - (AQ - 1));
 	for (int i = tid; i < n; i += TG) {
-		m[i] = (short)clamp(rsh(x[i], sh), -32767L, 32767L);
+		m[i] = (short)clamp(rsh(x[i], sh), -LIMB(AQ), LIMB(AQ));
 	}
 	if (tid == 0) {
 		ex[eoutSlot] = ein + sh;
@@ -433,7 +485,7 @@ kernel void int_table4(device const long *pt [[buffer(0)]], device long *cum [[b
 // Pass 1: scores and chunk maxima; pass 2: weights, chunk sums Z and O; pass 3: o = sum O / sum Z.
 #define ACH 256
 struct AttnArgs {
-	int nq, nkv, hd, maxlen, na, maxch;
+	int nq, nkv, hd, maxlen, na, maxch, win, sink;
 };
 
 // Split attention by KV head: a threadgroup per (kv head, chunk) serves the grp = nq / nkv query heads that share it,
@@ -441,13 +493,13 @@ struct AttnArgs {
 #define GMAX 8   // query heads per KV head, at most
 #define HDMAX 128
 kernel void int_attn1(device const int *mq [[buffer(0)]], device const int *shq [[buffer(1)]],
-                      device const int *Kc [[buffer(2)]], device long *S [[buffer(3)]], device long *cmax [[buffer(4)]],
+                      device const short *Km [[buffer(2)]], device long *S [[buffer(3)]], device long *cmax [[buffer(4)]],
                       device const IntParams *pr [[buffer(5)]], constant AttnArgs &a [[buffer(6)]],
                       uint2 tg2 [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
 	threadgroup int qs[GMAX * HDMAX];
 	int j = tg2.x, c = tg2.y, T = pr->pos + 1, hd = a.hd, grp = a.nq / a.nkv;
-	if (c * ACH >= T) {
-		return; // a chunk past the position (a recorded launch list covers every chunk)
+	if (c * ACH >= T || !cvis(c * ACH, c * ACH + ACH, T, a.win, a.sink)) {
+		return; // a chunk past the position (a recorded launch list covers every chunk), or outside the window
 	}
 	for (int i = tid; i < grp * hd; i += ACH) {
 		qs[i] = mq[j * grp * hd + i];
@@ -458,30 +510,26 @@ kernel void int_attn1(device const int *mq [[buffer(0)]], device const int *shq 
 	for (int g = 0; g < GMAX; g++) {
 		acc[g] = 0;
 	}
-	// q . k in 32-bit pieces: k = kh * 2^11 + kl, kl in [0, 2^11); |q| < 2^15, |k| < 2^22, so each product is
-	// below 2^26 and 16 of them fit an int; fold into 64 bits every 16 dimensions.
+	int sk = 0;
 	if (t < T) {
-		device const int *k = Kc + ((long)j * a.maxlen + t) * hd;
-		for (int d0 = 0; d0 < hd; d0 += 16) {
-			int ah[GMAX], al[GMAX];
+		device const short *k = Km + ((long)j * a.maxlen + t) * hd;
+		sk = KSHR(Km, a.nkv, a.maxlen, hd)[j * a.maxlen + t];
+		for (int d0 = 0; d0 < hd; d0 += 32) {
+			int as[GMAX];
 			for (int g = 0; g < GMAX; g++) {
-				ah[g] = 0;
-				al[g] = 0;
+				as[g] = 0;
 			}
-			for (int d = d0; d < d0 + 16; d += 4) {
-				int4 kk = *(device const int4 *)(k + d);
-				int4 kh = kk >> 11, kl = kk & 0x7ff;
+			for (int d = d0; d < d0 + 32; d += 4) {
+				int4 kk = int4(*(device const short4 *)(k + d));
 				for (int g = 0; g < GMAX; g++) {
 					if (g < grp) {
-						int4 q = *(threadgroup const int4 *)(qs + g * hd + d);
-						int4 ph = q * kh, pl = q * kl;
-						ah[g] += ph.x + ph.y + ph.z + ph.w;
-						al[g] += pl.x + pl.y + pl.z + pl.w;
+						int4 pr4 = *(threadgroup const int4 *)(qs + g * hd + d) * kk;
+						as[g] += pr4.x + pr4.y + pr4.z + pr4.w;
 					}
 				}
 			}
 			for (int g = 0; g < GMAX; g++) {
-				acc[g] += ((long)ah[g] << 11) + al[g];
+				acc[g] += as[g];
 			}
 		}
 	}
@@ -489,8 +537,8 @@ kernel void int_attn1(device const int *mq [[buffer(0)]], device const int *shq 
 	for (int g = 0; g < grp; g++) {
 		int h = j * grp + g;
 		long v = LMIN;
-		if (t < T) {
-			v = rsh(acc[g], 42 - shq[h]);
+		if (t < T && kvis(t, T, a.win, a.sink)) {
+			v = rsh(acc[g], 42 - shq[h] - sk);
 			S[(long)h * a.maxlen + t] = v;
 		}
 		v = sg_max(v);
@@ -516,7 +564,7 @@ kernel void int_attn2(device const long *S [[buffer(0)]], device const long *cma
 	threadgroup int w[GMAX][ACH]; // weights, <= 2^15
 	threadgroup long red[GMAX][ACH]; // O partials: (ACH / hd - 1) slices x hd lanes per head
 	int j = tg2.x, c = tg2.y, T = pr->pos + 1, hd = a.hd, grp = a.nq / a.nkv;
-	if (c * ACH >= T) {
+	if (c * ACH >= T || !cvis(c * ACH, c * ACH + ACH, T, a.win, a.sink)) {
 		return;
 	}
 	int nch = (T + ACH - 1) / ACH;
@@ -528,7 +576,9 @@ kernel void int_attn2(device const long *S [[buffer(0)]], device const long *cma
 	if (sgi < (uint)grp) {
 		long mx = LMIN;
 		for (int i = lane; i < nch; i += 32) {
-			mx = max(mx, cmax[(j * grp + sgi) * a.maxch + i]);
+			if (cvis(i * ACH, i * ACH + ACH, T, a.win, a.sink)) {
+				mx = max(mx, cmax[(j * grp + sgi) * a.maxch + i]);
+			}
 		}
 		mx = sg_max(mx);
 		if (lane == 0) {
@@ -537,7 +587,9 @@ kernel void int_attn2(device const long *S [[buffer(0)]], device const long *cma
 	}
 	threadgroup_barrier(mem_flags::mem_threadgroup);
 	for (int g = 0; g < grp; g++) {
-		long wt = t < T ? (long)expa[min(Ms[g] - S[(long)(j * grp + g) * a.maxlen + t], (long)(a.na - 1))] : 0;
+		long wt = t < T && kvis(t, T, a.win, a.sink)
+		              ? (long)expa[min(Ms[g] - S[(long)(j * grp + g) * a.maxlen + t], (long)(a.na - 1))]
+		              : 0;
 		w[g][tid] = (int)wt;
 		wt = sg_sum(wt);
 		if (lane == 0) {
@@ -616,8 +668,10 @@ kernel void int_attn3(device const long *zpart [[buffer(0)]], device const long 
 	int T = pr->pos + 1, nch = (T + ACH - 1) / ACH;
 	long Z = 0, O = 0;
 	for (int c = 0; c < nch; c++) {
-		Z += zpart[h * a.maxch + c];
-		O += opart[((long)h * a.maxch + c) * a.hd + tid];
+		if (cvis(c * ACH, c * ACH + ACH, T, a.win, a.sink)) {
+			Z += zpart[h * a.maxch + c];
+			O += opart[((long)h * a.maxch + c) * a.hd + tid];
+		}
 	}
 	long aO = iabs(O), hi = udivx(aO, Z);
 	long r = (hi << 12) + udivx((aO - hi * Z) << 12, Z);
@@ -627,67 +681,72 @@ kernel void int_attn3(device const long *zpart [[buffer(0)]], device const long 
 // ---- batches: many positions at once (compression knows every token in advance) ----
 
 // int_gemm: out[t, o] = rshift(sum_g s[o,g] * sum_{k in g} q[o,k] x[t,k], to - (E + ex[4t + einSlot])) for the rows t
-// of a batch; the same integers as int_matvec, row by row. A threadgroup computes GBO outputs x GBT rows; each
-// 64-group's weights and activations go through threadgroup memory; a thread holds 4 outputs x 2 rows. Group sums are
-// int32 (|.| < 64 * 128 * 32767 < 2^31); the scaling is split into 16-bit halves so each product fits 32 bits.
-// st = (unused, x row stride, out row stride, unused).
+// of a batch; the same integers as int_matvec, row by row. The 64-group sums run in float: |q| <= 127 and |x| <= 2047
+// (AQ = 12-bit activations), so every product and every partial sum of a group is an integer below 2^24, which
+// float32 holds exactly whatever the order (and half holds the operands exactly). A threadgroup computes GBO outputs x
+// GBT rows; each 64-group's weights and activations go through threadgroup memory as half; a thread holds 4 outputs x
+// 4 rows. The group sum (an exact integer) is scaled in integers, split into 16-bit halves so each product fits 32
+// bits. st = (unused, x row stride, out row stride, unused).
 #define GBO 64
-#define GBT 32
+#define GBT 64
 kernel void int_gemm(device const char *q [[buffer(0)]], device const short *s [[buffer(1)]],
                      device const short *x [[buffer(2)]], device long *out [[buffer(3)]], device const int *ex [[buffer(4)]],
                      constant int &O [[buffer(5)]], constant int &K [[buffer(6)]], constant int &E [[buffer(7)]],
                      constant int &einSlot [[buffer(8)]], constant int &to [[buffer(9)]], constant int4 &st [[buffer(10)]],
                      uint2 tg2 [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
-	threadgroup char W[GBO][68];  // padded rows
-	threadgroup short X[GBT][72];
+	threadgroup half W[GBO][64];
+	threadgroup half X[GBT][64];
 	threadgroup short S[GBO];
 	int xS = st.y, outS = st.z;
 	int o0 = tg2.x * GBO, t0 = tg2.y * GBT;
-	int to4 = (tid % 16) * 4, tt2 = (tid / 16) * 2;
-	long acc[4][2];
+	int to4 = (tid % 16) * 4, tt4 = (tid / 16) * 4;
+	long acc[4][4];
 	for (int i = 0; i < 4; i++) {
-		acc[i][0] = 0;
-		acc[i][1] = 0;
+		for (int j = 0; j < 4; j++) {
+			acc[i][j] = 0;
+		}
 	}
 	int ng = K / 64;
-	int wr = tid >> 2, wc = (tid & 3) * 16, xr = tid >> 3, xc = (tid & 7) * 8;
+	int wr = tid >> 2, wc = (tid & 3) * 16; // each thread copies 16 weights and 16 activations per group
 	device const char *wsrc = q + (long)min(o0 + wr, O - 1) * K + wc;
-	device const short *xsrc = x + (long)(t0 + xr) * xS + xc;
+	device const short *xsrc = x + (long)(t0 + wr) * xS + wc;
 	for (int g = 0; g < ng; g++) {
 		{
 			device const char4 *src = (device const char4 *)(wsrc + g * 64);
-			threadgroup char4 *dst = (threadgroup char4 *)(&W[wr][wc]);
-			dst[0] = src[0];
-			dst[1] = src[1];
-			dst[2] = src[2];
-			dst[3] = src[3];
+			threadgroup half4 *dst = (threadgroup half4 *)(&W[wr][wc]);
 			device const short4 *xs = (device const short4 *)(xsrc + g * 64);
-			threadgroup short4 *xd = (threadgroup short4 *)(&X[xr][xc]);
-			xd[0] = xs[0];
-			xd[1] = xs[1];
+			threadgroup half4 *xd = (threadgroup half4 *)(&X[wr][wc]);
+			for (int i = 0; i < 4; i++) {
+				dst[i] = half4(src[i]);
+				xd[i] = half4(xs[i]);
+			}
 		}
 		if (tid < GBO) {
 			S[tid] = s[(long)min(o0 + (int)tid, O - 1) * ng + g];
 		}
 		threadgroup_barrier(mem_flags::mem_threadgroup);
-		int gs[4][2];
+		float gs[4][4];
 		for (int i = 0; i < 4; i++) {
-			gs[i][0] = 0;
-			gs[i][1] = 0;
+			for (int j = 0; j < 4; j++) {
+				gs[i][j] = 0;
+			}
 		}
 		for (int k = 0; k < 64; k += 4) {
-			int4 x0 = int4(*(threadgroup const short4 *)&X[tt2][k]), x1 = int4(*(threadgroup const short4 *)&X[tt2 + 1][k]);
+			float4 xv[4];
+			for (int j = 0; j < 4; j++) {
+				xv[j] = float4(*(threadgroup const half4 *)&X[tt4 + j][k]);
+			}
 			for (int i = 0; i < 4; i++) {
-				int4 w = int4(*(threadgroup const char4 *)&W[to4 + i][k]);
-				int4 a = w * x0, b = w * x1;
-				gs[i][0] += a.x + a.y + a.z + a.w;
-				gs[i][1] += b.x + b.y + b.z + b.w;
+				float4 w = float4(*(threadgroup const half4 *)&W[to4 + i][k]);
+				for (int j = 0; j < 4; j++) {
+					gs[i][j] += dot(w, xv[j]);
+				}
 			}
 		}
 		for (int i = 0; i < 4; i++) {
 			int sc = S[to4 + i];
-			for (int j = 0; j < 2; j++) {
-				int d = gs[i][j];
+			for (int j = 0; j < 4; j++) {
+				int d = (int)gs[i][j];
 				acc[i][j] += ((long)((d >> 16) * sc) << 16) + (long)((d & 0xffff) * sc);
 			}
 		}
@@ -696,8 +755,8 @@ kernel void int_gemm(device const char *q [[buffer(0)]], device const short *s [
 	for (int i = 0; i < 4; i++) {
 		int o = o0 + to4 + i;
 		if (o < O) {
-			for (int j = 0; j < 2; j++) {
-				int t = t0 + tt2 + j;
+			for (int j = 0; j < 4; j++) {
+				int t = t0 + tt4 + j;
 				out[(long)t * outS + o] = rsh(acc[i][j], to - (E + ex[4 * t + einSlot]));
 			}
 		}
@@ -706,13 +765,14 @@ kernel void int_gemm(device const char *q [[buffer(0)]], device const short *s [
 
 // Batched attention: a threadgroup per (query head, block of BR rows); rows are consecutive positions pos + t.
 // Two passes over the keys in tiles of KT (through threadgroup memory): the row maxima, then the weights, Z and O.
-// Products in 32-bit pieces as in int_attn1/int_attn2 (k = kh * 2^11 + kl), folded into 64 bits every 16 terms.
+// Score products as in int_attn1 (one multiply, folded every 32 terms); values in 32-bit pieces as in int_attn2.
 // Rows past the batch's end compute garbage nobody reads; keys past a row's position are masked; the cache is padded
 // so tiles may read past the last position.
 template <int HD, int BR, int KT>
-static inline void attnb(device const int *mq, device const int *shq, device const int *Kc, device const int *Vc,
+static inline void attnb(device const int *mq, device const int *shq, device const short *Km, device const int *Vc,
                          device const int *expa, device long *o, int base, constant AttnArgs &a, uint h, uint blk,
-                         uint tid, threadgroup int *qs, threadgroup int *ks, threadgroup int *vs, threadgroup int *wt) {
+                         uint tid, threadgroup int *qs, threadgroup int *ks, threadgroup int *vs, threadgroup int *wt,
+                         threadgroup int *kss) {
 	constexpr int TPR = 256 / BR, KPT = KT / TPR, DPT = HD / TPR, KS = HD + 4; // ks rows padded (banks)
 	int grp = a.nq / a.nkv, j = h / grp;
 	int t0 = blk * BR, r = tid / TPR, sub = tid % TPR;
@@ -721,7 +781,8 @@ static inline void attnb(device const int *mq, device const int *shq, device con
 		qs[i] = mq[((long)(t0 + i / HD) * a.nq + h) * HD + i % HD];
 	}
 	int sh = shq[row * a.nq + h];
-	device const int *K = Kc + (long)j * a.maxlen * HD;
+	device const short *K = Km + (long)j * a.maxlen * HD;
+	device const int *Ksh = KSHR(Km, a.nkv, a.maxlen, HD) + (long)j * a.maxlen;
 	device const int *V = Vc + (long)j * a.maxlen * HD;
 	threadgroup const int *qr = qs + r * HD;
 	long M = LMIN;
@@ -730,23 +791,24 @@ static inline void attnb(device const int *mq, device const int *shq, device con
 		for (int i = tid; i < KT * HD; i += 256) {
 			ks[(i / HD) * KS + i % HD] = K[(long)k0 * HD + i];
 		}
+		if (tid < (uint)KT) {
+			kss[tid] = Ksh[k0 + tid];
+		}
 		threadgroup_barrier(mem_flags::mem_threadgroup);
 		for (int c = 0; c < KPT; c++) {
 			int kk = c * TPR + sub;
 			threadgroup const int *kr = ks + kk * KS;
 			long acc = 0;
-			for (int d0 = 0; d0 < HD; d0 += 16) {
-				int ah = 0, al = 0;
-				for (int d = d0; d < d0 + 16; d += 4) {
-					int4 kv = *(threadgroup const int4 *)(kr + d), qv = *(threadgroup const int4 *)(qr + d);
-					int4 ph = qv * (kv >> 11), pl = qv * (kv & 0x7ff);
-					ah += ph.x + ph.y + ph.z + ph.w;
-					al += pl.x + pl.y + pl.z + pl.w;
+			for (int d0 = 0; d0 < HD; d0 += 32) {
+				int as = 0;
+				for (int d = d0; d < d0 + 32; d += 4) {
+					int4 p4 = *(threadgroup const int4 *)(qr + d) * *(threadgroup const int4 *)(kr + d);
+					as += p4.x + p4.y + p4.z + p4.w;
 				}
-				acc += ((long)ah << 11) + al;
+				acc += as;
 			}
-			if (k0 + kk <= p) {
-				M = max(M, rsh(acc, 42 - sh));
+			if (k0 + kk <= p && kvis(k0 + kk, p + 1, a.win, a.sink)) {
+				M = max(M, rsh(acc, 42 - sh - kss[kk]));
 			}
 		}
 	}
@@ -764,24 +826,25 @@ static inline void attnb(device const int *mq, device const int *shq, device con
 			ks[(i / HD) * KS + i % HD] = K[(long)k0 * HD + i];
 			vs[i] = V[(long)k0 * HD + i];
 		}
+		if (tid < (uint)KT) {
+			kss[tid] = Ksh[k0 + tid];
+		}
 		threadgroup_barrier(mem_flags::mem_threadgroup);
 		for (int c = 0; c < KPT; c++) {
 			int kk = c * TPR + sub;
 			threadgroup const int *kr = ks + kk * KS;
 			long acc = 0;
-			for (int d0 = 0; d0 < HD; d0 += 16) {
-				int ah = 0, al = 0;
-				for (int d = d0; d < d0 + 16; d += 4) {
-					int4 kv = *(threadgroup const int4 *)(kr + d), qv = *(threadgroup const int4 *)(qr + d);
-					int4 ph = qv * (kv >> 11), pl = qv * (kv & 0x7ff);
-					ah += ph.x + ph.y + ph.z + ph.w;
-					al += pl.x + pl.y + pl.z + pl.w;
+			for (int d0 = 0; d0 < HD; d0 += 32) {
+				int as = 0;
+				for (int d = d0; d < d0 + 32; d += 4) {
+					int4 p4 = *(threadgroup const int4 *)(qr + d) * *(threadgroup const int4 *)(kr + d);
+					as += p4.x + p4.y + p4.z + p4.w;
 				}
-				acc += ((long)ah << 11) + al;
+				acc += as;
 			}
 			int w = 0;
-			if (k0 + kk <= p) {
-				w = expa[min(M - rsh(acc, 42 - sh), (long)(a.na - 1))];
+			if (k0 + kk <= p && kvis(k0 + kk, p + 1, a.win, a.sink)) {
+				w = expa[min(M - rsh(acc, 42 - sh - kss[kk]), (long)(a.na - 1))];
 			}
 			wt[r * KT + kk] = w;
 			Z += w;
@@ -821,7 +884,7 @@ static inline void attnb(device const int *mq, device const int *shq, device con
 
 #define ATTNB(NAME, HD, BR, KT)                                                                                            \
 	kernel void NAME(device const int *mq [[buffer(0)]], device const int *shq [[buffer(1)]],                              \
-	                 device const int *Kc [[buffer(2)]], device const int *Vc [[buffer(3)]],                               \
+	                 device const short *Km [[buffer(2)]], device const int *Vc [[buffer(3)]],                             \
 	                 device const int *expa [[buffer(4)]], device long *o [[buffer(5)]],                                   \
 	                 device const IntParams *pr [[buffer(6)]], constant AttnArgs &a [[buffer(7)]],                        \
 	                 uint2 tg2 [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {              \
@@ -829,7 +892,8 @@ static inline void attnb(device const int *mq, device const int *shq, device con
 		threadgroup int ks[KT * (HD + 4)];                                                                                 \
 		threadgroup int vs[KT * HD];                                                                                       \
 		threadgroup int wt[BR * KT];                                                                                       \
-		attnb<HD, BR, KT>(mq, shq, Kc, Vc, expa, o, pr->pos, a, tg2.x, tg2.y, tid, qs, ks, vs, wt);                       \
+		threadgroup int kss[KT];                                                                                           \
+		attnb<HD, BR, KT>(mq, shq, Km, Vc, expa, o, pr->pos, a, tg2.x, tg2.y, tid, qs, ks, vs, wt, kss);                  \
 	}
 ATTNB(int_attnb64, 64, 32, 32)
 ATTNB(int_attnb128, 128, 16, 16)
@@ -878,22 +942,29 @@ kernel void int_counts(device const long *lg [[buffer(0)]], device const int *ex
 // then uses int_attnb*). KC keys per chunk; chunks run in parallel.
 #define KC 1024
 struct BAttnArgs {
-	int nq, nkv, hd, maxlen, na, smax, nchmax, ez; // ez: EXPA[i] = 0 for i >= ez
+	int nq, nkv, hd, maxlen, na, smax, nchmax, ez, win, sink, rows; // ez: EXPA[i] = 0 for i >= ez; rows: per batch
 };
+
+// the stored scores, key-major: tiles of 16 keys, each [head][row][16 keys], so the 16 lanes reading a row's tile in
+// int_bpv* read one contiguous 64-byte run
+#define SIDX(row, h, t, a) (((((long)((t) >> 4)) * (a).nq + (h)) * (a).rows + (row)) * 16 + ((t) & 15))
 
 // pass 1: a threadgroup per (kv head, block of QR / grp rows, key chunk): the scores of every query head sharing the
 // kv head (QR query rows: grp heads x rows) against the chunk's keys, in tiles of KT through threadgroup memory; a
-// thread holds QR/32 query rows x KT/8 keys. S[(row * nq + h) * smax + t] = score; cmax = the chunk's maxima.
+// thread holds QR/32 query rows x KT/8 keys. S[SIDX(row, h, t)] = score; cmax = the chunk's maxima.
 template <int HD, int QR, int KT>
-static inline void bscores(device const int *mq, device const int *shq, device const int *Kc, device int *S,
+static inline void bscores(device const int *mq, device const int *shq, device const short *Km, device int *S,
                            device long *cmax, device atomic_int *ovf, int base, int R, constant BAttnArgs &a, uint3 tg3, uint tid,
-                           threadgroup short *qs, threadgroup int *ks, threadgroup int *shs) {
+                           threadgroup short *qs, threadgroup short *ks, threadgroup int *shs, threadgroup int *kss) {
 	constexpr int TR = QR / 32, TK = KT / 8, QS = HD + 4, KS = HD + 4;
 	int j = tg3.x, grp = a.nq / a.nkv, br = QR / grp; // rows per block
 	int t0 = tg3.y * br, c = tg3.z;
 	int pmax = base + min(t0 + br, R) - 1; // rows t0 + r < R only
 	int k0c = c * KC, k1c = min(k0c + KC, pmax + 1);
 	int qg = tid / 8, sub = tid % 8;
+	if (!cvis(k0c, k0c + KC, base + t0 + 1, a.win, a.sink)) {
+		return; // no row of the block sees the chunk (its readers skip it too)
+	}
 	for (int i = tid; i < QR * HD; i += 256) {
 		int qr = i / HD, d = i % HD, g = qr / br, r = qr % br;
 		qs[qr * QS + d] = g < grp && t0 + r < R ? (short)mq[((long)(t0 + r) * a.nq + j * grp + g) * HD + d] : (short)0;
@@ -902,15 +973,20 @@ static inline void bscores(device const int *mq, device const int *shq, device c
 		int g = tid / br, r = tid % br;
 		shs[tid] = g < grp && t0 + r < R ? shq[(t0 + r) * a.nq + j * grp + g] : 0;
 	}
-	device const int *K = Kc + (long)j * a.maxlen * HD;
+	device const short *K = Km + (long)j * a.maxlen * HD;
+	device const int *Ksh = KSHR(Km, a.nkv, a.maxlen, HD) + (long)j * a.maxlen;
 	long mx[TR];
 	for (int i = 0; i < TR; i++) {
 		mx[i] = LMIN;
 	}
 	for (int k0 = k0c; k0 < k1c; k0 += KT) {
 		threadgroup_barrier(mem_flags::mem_threadgroup);
-		for (int i = tid; i < KT * HD; i += 256) {
-			ks[(i / HD) * KS + i % HD] = K[(long)k0 * HD + i];
+		for (int i = tid; i < KT * HD / 4; i += 256) {
+			int kk = i / (HD / 4), d = (i % (HD / 4)) * 4;
+			*(threadgroup short4 *)(ks + kk * KS + d) = *(device const short4 *)(K + (long)(k0 + kk) * HD + d);
+		}
+		if (tid < (uint)KT) {
+			kss[tid] = Ksh[k0 + tid];
 		}
 		threadgroup_barrier(mem_flags::mem_threadgroup);
 		long acc[TR][TK];
@@ -919,33 +995,29 @@ static inline void bscores(device const int *mq, device const int *shq, device c
 				acc[i][k] = 0;
 			}
 		}
-		for (int d0 = 0; d0 < HD; d0 += 16) {
-			int ah[TR][TK], al[TR][TK];
+		for (int d0 = 0; d0 < HD; d0 += 32) {
+			int as[TR][TK];
 			for (int i = 0; i < TR; i++) {
 				for (int k = 0; k < TK; k++) {
-					ah[i][k] = 0;
-					al[i][k] = 0;
+					as[i][k] = 0;
 				}
 			}
-			for (int d = d0; d < d0 + 16; d += 4) {
-				int4 kh[TK], kl[TK];
+			for (int d = d0; d < d0 + 32; d += 4) {
+				int4 kv[TK];
 				for (int k = 0; k < TK; k++) {
-					int4 kv = *(threadgroup const int4 *)(ks + (sub + 8 * k) * KS + d);
-					kh[k] = kv >> 11;
-					kl[k] = kv & 0x7ff;
+					kv[k] = int4(*(threadgroup const short4 *)(ks + (sub + 8 * k) * KS + d));
 				}
 				for (int i = 0; i < TR; i++) {
 					int4 q = int4(*(threadgroup const short4 *)(qs + (qg + 32 * i) * QS + d));
 					for (int k = 0; k < TK; k++) {
-						int4 ph = q * kh[k], pl = q * kl[k];
-						ah[i][k] += ph.x + ph.y + ph.z + ph.w;
-						al[i][k] += pl.x + pl.y + pl.z + pl.w;
+						int4 p4 = q * kv[k];
+						as[i][k] += p4.x + p4.y + p4.z + p4.w;
 					}
 				}
 			}
 			for (int i = 0; i < TR; i++) {
 				for (int k = 0; k < TK; k++) {
-					acc[i][k] += ((long)ah[i][k] << 11) + al[i][k];
+					acc[i][k] += as[i][k];
 				}
 			}
 		}
@@ -955,15 +1027,14 @@ static inline void bscores(device const int *mq, device const int *shq, device c
 				continue;
 			}
 			int p = base + t0 + r;
-			device int *Sr = S + ((long)(t0 + r) * a.nq + j * grp + g) * a.smax;
 			for (int k = 0; k < TK; k++) {
 				int t = k0 + sub + 8 * k;
-				if (t <= p) {
-					long s = rsh(acc[i][k], 42 - shs[qr]);
+				if (t <= p && kvis(t, p + 1, a.win, a.sink)) {
+					long s = rsh(acc[i][k], 42 - shs[qr] - kss[sub + 8 * k]);
 					if (s != (long)(int)s) {
 						atomic_store_explicit(ovf, 1, memory_order_relaxed);
 					}
-					Sr[t] = (int)s;
+					S[SIDX(t0 + r, j * grp + g, t, a)] = (int)s;
 					mx[i] = max(mx[i], s);
 				}
 			}
@@ -983,14 +1054,15 @@ static inline void bscores(device const int *mq, device const int *shq, device c
 
 #define BSCORES(NAME, HD, QR, KT)                                                                                          \
 	kernel void NAME(device const int *mq [[buffer(0)]], device const int *shq [[buffer(1)]],                              \
-	                 device const int *Kc [[buffer(2)]], device int *S [[buffer(3)]], device long *cmax [[buffer(4)]],    \
+	                 device const short *Km [[buffer(2)]], device int *S [[buffer(3)]], device long *cmax [[buffer(4)]],  \
 	                 device atomic_int *ovf [[buffer(5)]], device const IntParams *pr [[buffer(6)]],                     \
 	                 constant BAttnArgs &a [[buffer(7)]], uint3 tg3 [[threadgroup_position_in_grid]],                    \
 	                 uint tid [[thread_index_in_threadgroup]]) {                                                          \
 		threadgroup short qs[QR * (HD + 4)];                                                                               \
-		threadgroup int ks[KT * (HD + 4)];                                                                                 \
+		threadgroup short ks[KT * (HD + 4)];                                                                               \
 		threadgroup int shs[QR];                                                                                           \
-		bscores<HD, QR, KT>(mq, shq, Kc, S, cmax, ovf, pr->pos, pr->tok, a, tg3, tid, qs, ks, shs);                                 \
+		threadgroup int kss[KT];                                                                                           \
+		bscores<HD, QR, KT>(mq, shq, Km, S, cmax, ovf, pr->pos, pr->tok, a, tg3, tid, qs, ks, shs, kss);                  \
 	}
 BSCORES(int_bscores64, 64, 128, 16)
 BSCORES(int_bscores128, 128, 64, 16)
@@ -1001,7 +1073,7 @@ BSCORES(int_bscores128, 128, 64, 16)
 // lookups are random, and from device memory they cost more than the arithmetic. Tiles whose weights are all 0 add
 // nothing and are skipped.
 #define ETN 11392
-template <int HD, int KT>
+template <int HD, int KT, int ETS>
 static inline void bpv(device const int *S, device const long *cmax, device const int *Vc, device const int *expa,
                        device long *zp, device long *op, int base, int R, constant BAttnArgs &a, uint3 tg3, uint tid,
                        threadgroup int *vs, threadgroup ushort *wt, threadgroup long *Ms, threadgroup long *zs,
@@ -1011,7 +1083,11 @@ static inline void bpv(device const int *S, device const long *cmax, device cons
 	int pmax = base + t0 + BRV - 1;
 	int k0c = c * KC, k1c = min(k0c + KC, pmax + 1);
 	int ez = a.ez;
-	for (int i = tid; i < ez; i += 256) {
+	if (!cvis(k0c, k0c + KC, base + t0 + 1, a.win, a.sink)) {
+		return;
+	}
+	int ezs = min(ez, ETS); // the first ETS entries from threadgroup memory, any later ones from the device
+	for (int i = tid; i < ezs; i += 256) {
 		et[i] = (ushort)expa[i];
 	}
 	if (tid < (uint)BRV) {
@@ -1019,7 +1095,9 @@ static inline void bpv(device const int *S, device const long *cmax, device cons
 		device const long *cm = cmax + ((long)(t0 + tid) * a.nq + h) * a.nchmax;
 		long m = LMIN;
 		for (int i = 0; i < nch; i++) {
-			m = max(m, cm[i]);
+			if (cvis(i * KC, i * KC + KC, p + 1, a.win, a.sink)) {
+				m = max(m, cm[i]);
+			}
 		}
 		Ms[tid] = m;
 		zs[tid] = 0;
@@ -1050,10 +1128,13 @@ static inline void bpv(device const int *S, device const long *cmax, device cons
 			int r = sg * RPS + lane / KT + 8 * RPS * i;
 			int t = k0 + key, p = base + t0 + r;
 			int w = 0;
-			if (t <= p && t0 + r < R) { // rows past the batch's end hold stale scores: their indices could be anything
-				long d = Ms[r] - S[((long)(t0 + r) * a.nq + h) * a.smax + t];
-				if (d >= 0 && d < ez) {
+			// rows past the batch's end hold stale scores: their indices could be anything
+			if (t <= p && t0 + r < R && kvis(t, p + 1, a.win, a.sink)) {
+				long d = Ms[r] - S[SIDX(t0 + r, h, t, a)];
+				if (d >= 0 && d < ezs) {
 					w = et[d];
+				} else if (d >= ezs && d < ez) {
+					w = expa[d];
 				}
 			}
 			wt[r * KT + key] = (ushort)w;
@@ -1128,7 +1209,7 @@ static inline void bpv(device const int *S, device const long *cmax, device cons
 	}
 }
 
-#define BPV(NAME, HD, KT)                                                                                                  \
+#define BPV(NAME, HD, KT, ETS)                                                                                             \
 	kernel void NAME(device const int *S [[buffer(0)]], device const long *cmax [[buffer(1)]],                            \
 	                 device const int *Vc [[buffer(2)]], device const int *expa [[buffer(3)]], device long *zp [[buffer(4)]], \
 	                 device long *op [[buffer(5)]], device const IntParams *pr [[buffer(6)]],                            \
@@ -1138,13 +1219,14 @@ static inline void bpv(device const int *S, device const long *cmax, device cons
 		threadgroup ushort wt[(256 / (HD / 4)) * 4 * KT];                                                                  \
 		threadgroup long Ms[(256 / (HD / 4)) * 4];                                                                         \
 		threadgroup long zs[(256 / (HD / 4)) * 4];                                                                         \
-		threadgroup ushort et[ETN];                                                                                        \
+		threadgroup ushort et[ETS];                                                                                        \
 		threadgroup int nz;                                                                                                \
 		threadgroup uchar z8[(256 / (HD / 4)) / 2 * KT];                                                                   \
-		bpv<HD, KT>(S, cmax, Vc, expa, zp, op, pr->pos, pr->tok, a, tg3, tid, vs, wt, Ms, zs, et, &nz, z8);                         \
+		bpv<HD, KT, ETS>(S, cmax, Vc, expa, zp, op, pr->pos, pr->tok, a, tg3, tid, vs, wt, Ms, zs, et, &nz, z8);          \
 	}
-BPV(int_bpv64, 64, 16)
-BPV(int_bpv128, 128, 8)
+// hd 64: 32-key tiles (half the barriers per key of 16), which leave room for 9,216 of EXPA's entries
+BPV(int_bpv64, 64, 16, ETN)
+BPV(int_bpv128, 128, 8, ETN)
 
 // pass 3: a threadgroup per (query head, row), hd threads: sum the row's chunk partials, o = O / Z (e = -24).
 kernel void int_bcomb(device const long *zp [[buffer(0)]], device const long *op [[buffer(1)]], device long *o [[buffer(2)]],
@@ -1154,8 +1236,10 @@ kernel void int_bcomb(device const long *zp [[buffer(0)]], device const long *op
 	long pi = ((long)row * a.nq + h) * a.nchmax;
 	long Z = 0, O = 0;
 	for (int c = 0; c < nch; c++) {
-		Z += zp[pi + c];
-		O += op[(pi + c) * a.hd + d];
+		if (cvis(c * KC, c * KC + KC, p + 1, a.win, a.sink)) {
+			Z += zp[pi + c];
+			O += op[(pi + c) * a.hd + d];
+		}
 	}
 	long aO = iabs(O), hi = udivx(aO, Z);
 	long r = (hi << 12) + udivx((aO - hi * Z) << 12, Z);
@@ -1199,9 +1283,9 @@ kernel void int_mlpb(device const long *acc [[buffer(0)]], device const int *sig
 		p[i] = v;
 		mx = max(mx, iabs(v));
 	}
-	int sh = max(0, bitlen(tg_max(mx, tg, tid)) - 15);
+	int sh = max(0, bitlen(tg_max(mx, tg, tid)) - (AQ - 1));
 	for (int i = tid; i < I; i += TG) {
-		m[i] = (short)clamp(rsh(p[i], sh), -32767L, 32767L);
+		m[i] = (short)clamp(rsh(p[i], sh), -LIMB(AQ), LIMB(AQ));
 	}
 	if (tid == 0) {
 		ex[2] = -16 + sh;

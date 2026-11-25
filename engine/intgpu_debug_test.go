@@ -18,7 +18,7 @@ func i32s(b []byte, n int) []int32 { return unsafe.Slice((*int32)(unsafe.Pointer
 // TestIntGPUStages compares the GPU's buffers with the CPU's for token 0, kernel by kernel, through layer 0.
 func TestIntGPUStages(t *testing.T) {
 	m := loadIntDev(t, "0.5B", "auto")
-	gs, err := m.gpu.newState(m, 8)
+	gs, err := m.gpu.newState(m, 8, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +33,7 @@ func TestIntGPUStages(t *testing.T) {
 	B := func(i int) []byte { return gs.g.dev.host(gs.bufs[i]) }
 	D, I := m.D, m.I
 	// CPU reference, stage by stage
-	st := m.newState(8)
+	st := m.newState(8, 0, 0)
 	q, sc := m.emb.q[m.bos*D:(m.bos+1)*D], m.emb.s[m.bos*(D/64):(m.bos+1)*(D/64)]
 	h := make([]int64, D)
 	for k := 0; k < D; k++ {
@@ -85,13 +85,18 @@ func TestIntGPUStages(t *testing.T) {
 	st.rope(kv, nkv)
 	gs.ds = all[:4]
 	run(4)
-	gk, gv := i32s(B(7), nkv*8*hd), i32s(B(8), nkv*8*hd)
+	// K: KQ-bit mantissas [nkv][maxlen=8][hd] (int16), then shifts [nkv][maxlen]; V: VQ-bit values, shifted back
+	gkm := unsafe.Slice((*int16)(unsafe.Pointer(&B(7)[0])), nkv*8*hd)
+	gks := i32s(B(7)[2*nkv*8*hd:], nkv*8)
+	gv := i32s(B(8), nkv*8*hd)
+	wk, wv := make([]int32, hd), make([]int32, hd)
 	for j := 0; j < nkv; j++ {
+		cacheVec(wk, kv[j*hd:(j+1)*hd], intKBits)
+		cacheVec(wv, vv[j*hd:(j+1)*hd], intVBits)
 		for d := 0; d < hd; d++ {
-			wk := int32(min(max(irsh(kv[j*hd+d], 12), -intLimKV), intLimKV))
-			wv := int32(min(max(irsh(vv[j*hd+d], 12), -intLimKV), intLimKV))
-			if gk[j*8*hd+d] != wk || gv[j*8*hd+d] != wv {
-				t.Fatalf("kv head %d d %d: gpu k %d v %d, cpu k %d v %d", j, d, gk[j*8*hd+d], gv[j*8*hd+d], wk, wv)
+			gk := int32(gkm[j*8*hd+d]) << gks[j*8]
+			if gk != wk[d] || gv[j*8*hd+d] != wv[d] {
+				t.Fatalf("kv head %d d %d: gpu k %d v %d, cpu k %d v %d", j, d, gk, gv[j*8*hd+d], wk[d], wv[d])
 			}
 		}
 	}
@@ -102,12 +107,13 @@ func TestIntGPUStages(t *testing.T) {
 		for d := 0; d < hd; d++ {
 			mx = max(mx, abs64(qv[i*hd+d]*m.sc))
 		}
-		sh := max(0, bitlen(mx)-15)
+		sh := max(0, bitlen(mx)-(intQBits-1))
 		if int(gsh[i]) != sh {
 			t.Fatalf("q head %d shift: gpu %d, cpu %d", i, gsh[i], sh)
 		}
 		for d := 0; d < hd; d++ {
-			w := min(max(irsh(qv[i*hd+d]*m.sc, sh), -32767), 32767)
+			lim := int64(1)<<(intQBits-1) - 1
+			w := min(max(irsh(qv[i*hd+d]*m.sc, sh), -lim), lim)
 			if int64(gmq[i*hd+d]) != w {
 				t.Fatalf("q head %d d %d: gpu %d, cpu %d", i, d, gmq[i*hd+d], w)
 			}
@@ -121,8 +127,9 @@ func TestIntGPUStages(t *testing.T) {
 	grp := nq / nkv
 	for i := 0; i < nq; i++ {
 		j := i / grp
+		cacheVec(wv, vv[j*hd:(j+1)*hd], intVBits)
 		for d := 0; d < hd; d++ {
-			want := int64(min(max(irsh(vv[j*hd+d], 12), -intLimKV), intLimKV)) << 12
+			want := int64(wv[d]) << 12
 			if go_[i*hd+d] != want {
 				t.Fatalf("attn head %d d %d: gpu %d, cpu %d", i, d, go_[i*hd+d], want)
 			}
@@ -146,7 +153,7 @@ func TestIntGPUProfile(t *testing.T) {
 		size = "0.5B"
 	}
 	m := loadIntDev(t, size, "auto")
-	gs, err := m.gpu.newState(m, 32768)
+	gs, err := m.gpu.newState(m, 32768, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +213,7 @@ func TestIntGPUProfile(t *testing.T) {
 // TestIntGPUFloor: the cost of a dependent dispatch, and each matvec's bandwidth.
 func TestIntGPUFloor(t *testing.T) {
 	m := loadIntDev(t, "0.5B", "auto")
-	gs, err := m.gpu.newState(m, 1024)
+	gs, err := m.gpu.newState(m, 1024, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +240,7 @@ func TestIntGPUFloor(t *testing.T) {
 		}
 		return r
 	}
-	for _, k := range []string{"int_blockf", "int_norm", "int_qkv", "int_mlp", "int_table1", "int_table2", "int_table3", "int_table4", "int_attn1", "int_attn2", "int_attn3"} {
+	for _, k := range []string{"int_blockf", "int_norm", "int_qkv", "int_mlpb", "int_table1", "int_table2", "int_table3", "int_table4", "int_attn1", "int_attn2", "int_attn3"} {
 		d := byName[k][0]
 		t.Logf("%-12s x200: %.1f us each", k, tm(rep(d, 200))/200)
 	}
@@ -250,7 +257,7 @@ func TestIntGPUFloor(t *testing.T) {
 // TestIntGPUEncode: how long encoding a token's dispatches takes, against the GPU's own time.
 func TestIntGPUEncode(t *testing.T) {
 	m := loadIntDev(t, "0.5B", "auto")
-	gs, err := m.gpu.newState(m, 1024)
+	gs, err := m.gpu.newState(m, 1024, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +280,7 @@ func TestIntGPUEncode(t *testing.T) {
 // TestIntGPUAttnLong times the attention passes at long positions.
 func TestIntGPUAttnLong(t *testing.T) {
 	m := loadIntDev(t, "0.5B", "auto")
-	gs, err := m.gpu.newState(m, 32768)
+	gs, err := m.gpu.newState(m, 32768, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +315,7 @@ func TestIntGPUAttnLong(t *testing.T) {
 // TestIntBatchProfile: GPU time of one full batch at several positions, and per kernel.
 func TestIntBatchProfile(t *testing.T) {
 	m := loadIntDev(t, "0.5B", "auto")
-	gs, err := m.gpu.newState(m, 32768)
+	gs, err := m.gpu.newState(m, 32768, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +375,7 @@ func TestIntBatchBisect(t *testing.T) {
 		t.Skip("set INTBISECT=<launches>")
 	}
 	m := loadIntDev(t, "0.5B", "auto")
-	gs, err := m.gpu.newState(m, 4096)
+	gs, err := m.gpu.newState(m, 4096, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,7 +448,7 @@ func TestIntStepNcu(t *testing.T) {
 	if !ok {
 		t.Skip("CUDA only")
 	}
-	gs, err := m.gpu.newState(m, at+1)
+	gs, err := m.gpu.newState(m, at+1, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
