@@ -84,6 +84,9 @@ func (s *intGPUState) newBatch() (*intBatch, error) {
 	} else if hd != 64 {
 		return nil, errUnsupportedHD
 	}
+	if md, ok := g.dev.(*metalIntDev); ok && md.pvBR[0] > 0 { // gpu_int_sga.metal's weights x V blocks
+		b.pvBR = md.pvBR[hd/128]
+	}
 	var h, mb, ex, acc, mq, shq, o, p, lg, sc, cmax, zp, op ibuf
 	var err error
 	for _, x := range []struct {

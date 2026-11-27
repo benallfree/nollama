@@ -19,6 +19,9 @@ var metalIntSource string
 //go:embed gpu_int_sg.metal
 var metalIntSGSource string
 
+//go:embed gpu_int_sga.metal
+var metalIntSGASource string
+
 // intKernels are the integer models' kernels, the same names in gpu_int.metal and gpu_int.cu.
 var intKernels = []string{"int_embed", "int_norm", "int_matvec", "int_qkv", "int_blockf", "int_mlp", "int_table1",
 	"int_table2", "int_table3", "int_table4", "int_attn1", "int_attn2", "int_attn3", "int_gemm", "int_attnb64", "int_attnb128",
@@ -29,6 +32,7 @@ type metalIntDev struct {
 	ps    map[string]*metal.Pipeline
 	buf   []metal.Dispatch // run's scratch
 	chunk int              // dispatches per command buffer (0: the package's default)
+	pvBR  [2]int           // rows per block of int_bpv64, int_bpv128 when they aren't gpu_int.metal's (64, 32)
 }
 
 // metalBigModel: models at least this big (file bytes) commit a command buffer every metalBigChunk dispatches. A
@@ -71,12 +75,29 @@ func openIntMetal(m *IntModel) (intDev, ibuf, error) {
 			ps["int_gemm"] = sp["int_gemm_sg"]
 		}
 	}
+	// batched attention through simdgroup matrices (gpu_int_sga.metal): the same integers; NOLLAMA_INT_NOSGA=1 keeps
+	// the plain kernels. Its weights x V kernels take 32-row blocks at head size 64, 16 at 128 (pvBR).
+	pvBR := [2]int{}
+	if os.Getenv("NOLLAMA_INT_NOSGA") == "" {
+		names := []string{"int_bscores_sg64", "int_bscores_sg128", "int_bpv_sg64", "int_bpv_sg128"}
+		if sp, err := dev.Compile(metalIntSource+"\n"+metalIntSGASource, names...); err == nil {
+			ok := true
+			for _, k := range names {
+				ok = ok && sp[k].MaxThreads >= 256
+			}
+			if ok {
+				ps["int_bscores64"], ps["int_bscores128"] = sp["int_bscores_sg64"], sp["int_bscores_sg128"]
+				ps["int_bpv64"], ps["int_bpv128"] = sp["int_bpv_sg64"], sp["int_bpv_sg128"]
+				pvBR = [2]int{32, 16}
+			}
+		}
+	}
 	w, err := dev.Wrap(m.g.data)
 	if err != nil {
 		dev.Close()
 		return nil, nil, err
 	}
-	d := &metalIntDev{dev: dev, ps: ps}
+	d := &metalIntDev{dev: dev, ps: ps, pvBR: pvBR}
 	if int64(len(m.g.data)) >= metalBigModel {
 		d.chunk = metalBigChunk
 	}
